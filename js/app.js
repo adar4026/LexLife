@@ -7,6 +7,8 @@
    ========================================================= */
 
 import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup } from './services/storage.js';
+import { createStatsEngine, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay } from './services/analytics.js';
+import { lineChart, barChart as svgBarChart } from './ui/charts.js';
 
 /* ---------- DOM-помощники ---------- */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -1731,6 +1733,518 @@ async function CalendarScreen() {
   return screen;
 }
 
+/* =========================================================
+   Статистика (#/stats) — аналитика по сохранённым записям.
+   Расчёты — services/analytics.js (чистые функции, модель периода мемоизирована),
+   графики — ui/charts.js. Экран ничего не пишет в медицинские данные;
+   выбранный период — UI-настройка STATS_PERIOD_KEY (вне DATA_KEYS и бэкапа).
+   ========================================================= */
+const STATS_PERIOD_KEY = 'lexlife_stats_period';
+function loadStatsPeriod() {
+  try { const v = localStorage.getItem(STATS_PERIOD_KEY); return PERIOD_KEYS.includes(v) ? v : DEFAULT_PERIOD; } catch { return DEFAULT_PERIOD; }
+}
+function saveStatsPeriod(v) { try { localStorage.setItem(STATS_PERIOD_KEY, v); } catch { /* не критично */ } }
+
+/* подписи, точность и минимальный размах оси для показателей статистики */
+const ST = {
+  weight: { name: 'Вес', gen: 'веса', unit: 'кг', d: 1, minSpan: 2 },
+  sys: { name: 'Систолическое давление', gen: 'систолического давления', unit: 'mmHg', d: 0 },
+  dia: { name: 'Диастолическое давление', gen: 'диастолического давления', unit: 'mmHg', d: 0 },
+  pulse: { name: 'Пульс', gen: 'пульса', unit: 'уд/мин', d: 0, minSpan: 10 },
+  temperature: { name: 'Температура', gen: 'температуры', unit: '°C', d: 1, minSpan: 1 },
+  spo2: { name: 'Сатурация', gen: 'сатурации', unit: '%', d: 0, minSpan: 4 },
+  glucose: { name: 'Глюкоза', gen: 'глюкозы', unit: 'ммоль/л', d: 1, minSpan: 2 },
+  water: { name: 'Потребление воды', gen: 'потребления воды', unit: 'мл', d: 0 },
+  activityMin: { name: 'Время активности', gen: 'времени активности', unit: 'мин', d: 0 },
+  steps: { name: 'Количество шагов', gen: 'количества шагов', unit: 'шагов', d: 0 },
+};
+const POINT_KEYS = ['weight', 'pulse', 'temperature', 'spo2', 'glucose'];
+const EXTRA_KEYS = ['spo2', 'glucose', 'temperature'];
+
+const fmtN = (v, d = 0) => (v == null ? '—' : v.toLocaleString(RU, { minimumFractionDigits: d, maximumFractionDigits: d }));
+const fmtSigned = (v, d = 0) => {
+  const r = Number(v.toFixed(d));
+  return r === 0 ? fmtN(0, d) : `${r > 0 ? '+' : '−'}${fmtN(Math.abs(r), d)}`;
+};
+/* изменение без фиксированной точности (анализы): +0,5 / −12 / 0 */
+const fmtDelta = (v) => `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v).toLocaleString(RU, { maximumFractionDigits: 2 })}`;
+const fmtDay = (day) => fmtDate(isoOfDay(day));
+const fmtDayShort = (day) => new Date(isoOfDay(day) + 'T00:00:00').toLocaleDateString(RU, { day: 'numeric', month: 'short' });
+const daysWord = (n) => plural(n, 'день', 'дня', 'дней');
+const daysDat = (n) => plural(n, 'дню', 'дням', 'дням');
+/* разница средних по отображаемым (округлённым) значениям — «68 против 68» даёт 0, а не −1 */
+const roundedDelta = (cur, prev, d = 0) => Number(cur.toFixed(d)) - Number(prev.toFixed(d));
+function lastLabel(point, today) {
+  const n = today - point.day;
+  if (n <= 0) return 'сегодня';
+  if (n === 1) return 'вчера';
+  if (n <= 60) return `${n} ${daysWord(n)} назад`;
+  return fmtDate(point.date);
+}
+const pressureTxt = (s, d) => (s && d ? `${fmtN(s, 0)}/${fmtN(d, 0)}` : '—');
+
+async function StatsScreen() {
+  const [metricsLog, metricsConfig, activityDays, activityGoals, tests, medLog, meds] = await Promise.all([
+    Storage.getMetricsLog(), Storage.getMetricsConfig(), Storage.getAllActivity(), Storage.getGoals(),
+    Storage.getTests(), Storage.getAllMedLog(), Storage.getMeds(),
+  ]);
+  const engine = createStatsEngine({ metricsLog, metricsConfig, activityDays, activityGoals, tests, medLog, meds, testFields: TEST_FIELDS }, dateKey());
+  const screen = el('<div class="stats"></div>');
+  let period = loadStatsPeriod();
+  let actMode = null;
+
+  screen.addEventListener('click', (e) => {
+    const sc = e.target.closest('[data-scroll]');
+    if (sc) { const t = document.getElementById(sc.dataset.scroll); if (t) t.scrollIntoView({ behavior: 'smooth', block: 'start' }); return; }
+    const p = e.target.closest('[data-period]');
+    if (p) { if (p.dataset.period !== period) { period = p.dataset.period; saveStatsPeriod(period); paint(); } return; }
+    onRouteClick(e);
+  });
+
+  function paint() {
+    const m = engine.forPeriod(period);
+    screen.innerHTML = '';
+    screen.appendChild(backHeader('Статистика', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(el(`
+      <div class="st-period" role="tablist" aria-label="Период">
+        ${PERIODS.map((p) => `<button class="st-period__btn ${p.key === period ? 'is-active' : ''}" type="button" role="tab" aria-selected="${p.key === period}" data-period="${p.key}" title="${esc(p.title)}">${esc(p.label)}</button>`).join('')}
+      </div>
+    `));
+    const sameYear = isoOfDay(m.range.start).slice(0, 4) === isoOfDay(m.range.end).slice(0, 4);
+    screen.appendChild(el(`<p class="st-range">${esc(sameYear ? fmtDayShort(m.range.start) : fmtDay(m.range.start))} — ${esc(fmtDay(m.range.end))} · ${m.range.days} ${daysWord(m.range.days)}</p>`));
+
+    if (!m.hasAny) {
+      screen.appendChild(el(`
+        <div class="card st-empty st-empty--all">
+          <div class="placeholder__emoji">📈</div>
+          <p class="st-empty__title">Пока нет данных для статистики</p>
+          <p class="st-empty__sub">Статистика строится только по вашим записям. Добавьте первые измерения — и здесь появятся графики, тренды и сравнение периодов.</p>
+          <div class="st-empty__actions">
+            <button class="btn-ghost" type="button" data-route="metric/weight">⚖️ Вес</button>
+            <button class="btn-ghost" type="button" data-route="metric/pressure">🩸 Давление</button>
+            <button class="btn-ghost" type="button" data-route="metric/water">💧 Вода</button>
+            <button class="btn-ghost" type="button" data-route="activity">🏃 Активность</button>
+          </div>
+        </div>
+      `));
+      return;
+    }
+
+    screen.appendChild(summarySection(m));
+    const att = attentionSection(m);
+    if (att) screen.appendChild(att);
+    screen.appendChild(trendsSection(m));
+    screen.appendChild(compareSection(m));
+    screen.appendChild(pointSection(m, 'weight', '⚖️'));
+    screen.appendChild(pressureSection(m));
+    screen.appendChild(pointSection(m, 'pulse', '❤️'));
+    screen.appendChild(waterSection(m));
+    screen.appendChild(activitySection(m));
+    EXTRA_KEYS.forEach((k) => { if (m[k].points.length) screen.appendChild(pointSection(m, k, METRICS[k].emoji)); });
+    if (m.tests.total) screen.appendChild(testsSection(m));
+    screen.appendChild(dataSection(m));
+    screen.appendChild(el('<p class="st-disclaimer">Статистика рассчитана только по вашим записям в LexLife. Это математическая сводка, а не медицинское заключение: диагноз и лечение определяет врач.</p>'));
+  }
+
+  /* ---------- Сводка ---------- */
+  function changeLine(key, b) {
+    const t = ST[key];
+    if (!b.points.length) return b.totalDays ? 'нет измерений за период' : 'Недостаточно данных';
+    if (!b.change) return 'Для анализа динамики нужно больше измерений';
+    const { delta, spanDays } = b.change;
+    if (Math.abs(delta) < MIN_DELTA[key]) return `→ без заметного изменения за ${spanDays} ${daysWord(spanDays)}`;
+    return `${delta > 0 ? '↑' : '↓'} ${fmtN(Math.abs(delta), t.d)} ${t.unit} за ${spanDays} ${daysWord(spanDays)}`;
+  }
+  function card({ id, emoji, name, val, unit, sub }) {
+    return `<button class="mcard scard" type="button" data-scroll="${id}">
+      <div class="mcard__top"><span class="mcard__emoji">${emoji}</span><span class="mcard__name">${esc(name)}</span></div>
+      <div class="mcard__val">${esc(val)}${val !== '—' && unit ? `<span class="mcard__unit">${esc(unit)}</span>` : ''}</div>
+      <div class="scard__sub">${esc(sub)}</div>
+    </button>`;
+  }
+  function summarySection(m) {
+    const cards = [];
+    const w = m.weight;
+    cards.push(card({ id: 'st-weight', emoji: '⚖️', name: 'Вес', val: w.stats.last ? fmtN(w.stats.last.value, 1) : '—', unit: 'кг', sub: changeLine('weight', w) }));
+    const { sys, dia } = m.pressure;
+    const lastDia = sys.stats.last ? dia.points.find((p) => p.day === sys.stats.last.day) : null;
+    cards.push(card({
+      id: 'st-pressure', emoji: '🩸', name: 'Давление',
+      val: sys.stats.last && lastDia ? pressureTxt(sys.stats.last.value, lastDia.value) : '—', unit: 'mmHg',
+      sub: sys.points.length ? `среднее ${pressureTxt(sys.stats.avg, dia.stats.avg)} · ${sys.stats.count} изм.` : (sys.totalDays ? 'нет измерений за период' : 'Недостаточно данных'),
+    }));
+    const p = m.pulse;
+    cards.push(card({
+      id: 'st-pulse', emoji: '❤️', name: 'Пульс', val: p.stats.last ? fmtN(p.stats.last.value, 0) : '—', unit: 'уд/мин',
+      sub: p.points.length > 1 ? `среднее ${fmtN(p.stats.avg, 0)} · ${p.stats.count} изм.` : changeLine('pulse', p),
+    }));
+    const wa = m.water, gc = wa.goalCompletion;
+    cards.push(card({
+      id: 'st-water', emoji: '💧', name: 'Вода', val: wa.points.length ? fmtN(wa.stats.avg, 0) : '—', unit: 'мл/день',
+      sub: !wa.points.length ? (wa.totalDays ? 'нет записей за период' : 'Недостаточно данных')
+        : gc ? `цель в ${fmtN(gc.pct * 100, 0)}% дней с записями` : `по ${wa.points.length} ${daysDat(wa.points.length)} с записями`,
+    }));
+    const a = m.activity, am = a.minutes, as = a.steps;
+    const useSteps = !am.points.length && as.points.length;
+    const actGoal = useSteps ? as.goalCompletion : a.bike.goalCompletion;
+    cards.push(card({
+      id: 'st-activity', emoji: '🏃', name: 'Активность',
+      val: am.points.length ? fmtN(am.stats.avg, 0) : as.points.length ? fmtN(as.stats.avg, 0) : '—',
+      unit: useSteps ? 'шагов/день' : 'мин/день',
+      sub: !a.recordedDays ? (a.totalDays ? 'нет записей за период' : 'Недостаточно данных')
+        : `активных дней: ${a.activeDays}${actGoal && actGoal.daysWithData ? ` · цель ${useSteps ? 'шагов' : 'вело'}: ${fmtN(actGoal.pct * 100, 0)}%` : ''}`,
+    }));
+    EXTRA_KEYS.forEach((k) => {
+      const b = m[k];
+      if (!b.totalDays) return;
+      cards.push(card({ id: `st-${k}`, emoji: METRICS[k].emoji, name: ST[k].name, val: b.stats.last ? fmtN(b.stats.last.value, ST[k].d) : '—', unit: ST[k].unit, sub: changeLine(k, b) }));
+    });
+    return el(`<section class="section"><div class="section__head"><h2 class="section__title">Сводка</h2></div><div class="mcard-grid">${cards.join('')}</div></section>`);
+  }
+
+  /* ---------- Обратить внимание (только факты и справочные диапазоны из конфигурации) ---------- */
+  function attentionSection(m) {
+    const items = [];
+    m.tests.fields.forEach((f) => {
+      const st = evaluate(f.field, f.value);
+      if (st === 'warn' || st === 'danger') {
+        const ref = REFERENCE[f.field];
+        items.push({ icon: `<span class="dot-status dot-status--${st}"></span>`, title: `${ref.label}: ${fmtNum(f.value)} ${ref.unit}`, sub: `значение выходит за установленный справочный диапазон · анализ от ${fmtDate(f.date)}` });
+      }
+    });
+    [['weight', m.weight, 'Вес'], ['sys', m.pressure.sys, 'Давление'], ['pulse', m.pulse, 'Пульс']].forEach(([, b, name]) => {
+      if (b.totalDays >= 3 && b.coverage.daysSinceLast > 30) {
+        items.push({ icon: '<span class="row__icon">⏱</span>', title: `${name}: последнее измерение ${lastLabel(b.lastAll, m.todayDay)}`, sub: 'новых записей давно не было — статистика может быть неполной' });
+      }
+    });
+    if (!items.length) return null;
+    return el(`<section class="section"><div class="section__head"><h2 class="section__title">Обратить внимание</h2></div><div class="list-card">
+      ${items.map((i) => `<div class="row">${i.icon}<div class="row__body"><p class="row__title">${esc(i.title)}</p><p class="row__sub">${esc(i.sub)}</p></div></div>`).join('')}
+    </div></section>`);
+  }
+
+  /* ---------- Тренды (линейная регрессия, см. analytics.calculateTrend) ---------- */
+  function trendRow(key, tr, unitPerWeek) {
+    const t = ST[key];
+    if (tr.status === 'insufficient') {
+      return { icon: '·', title: `${t.name}: недостаточно данных для определения тенденции`, sub: `есть ${tr.n} ${plural(tr.n, 'день', 'дня', 'дней')} с данными; нужно от ${TREND_MIN_POINTS} дней на отрезке от ${TREND_MIN_SPAN + 1} дней` };
+    }
+    const basis = `по ${tr.n} ${daysDat(tr.n)} с данными за ${tr.spanDays + 1} ${daysWord(tr.spanDays + 1)}`;
+    if (tr.status === 'flat') return { icon: '→', title: `За выбранный период выраженного изменения ${t.gen} не видно`, sub: basis };
+    return {
+      icon: tr.status === 'up' ? '↗' : '↘',
+      title: `${t.name} имеет тенденцию к ${tr.status === 'up' ? 'росту' : 'снижению'}`,
+      sub: `≈ ${fmtSigned(tr.perWeek, t.d === 0 && Math.abs(tr.perWeek) < 10 ? 1 : t.d)} ${unitPerWeek || t.unit} в неделю · ${basis}`,
+    };
+  }
+  function trendsSection(m) {
+    const rows = [];
+    const add = (key, b, unit) => { if (b.points.length) rows.push(trendRow(key, b.trend, unit)); };
+    add('weight', m.weight);
+    add('sys', m.pressure.sys);
+    add('dia', m.pressure.dia);
+    add('pulse', m.pulse);
+    add('water', m.water, 'мл/день');
+    if (m.activity.minutes.points.length) add('activityMin', m.activity.minutes, 'мин/день');
+    else add('steps', m.activity.steps, 'шагов/день');
+    EXTRA_KEYS.forEach((k) => add(k, m[k]));
+    /* регулярность измерений относительно предыдущего периода */
+    [['веса', m.weight], ['давления', m.pressure.sys], ['пульса', m.pulse]].forEach(([gen, b]) => {
+      const c = b.compare;
+      if (!c) return;
+      if (c.regularity === 'more') rows.push({ icon: '＋', title: `Измерения ${gen} стали регулярнее`, sub: `${c.cur.count} против ${c.prev.count} в предыдущем периоде` });
+      if (c.regularity === 'less') rows.push({ icon: '－', title: `Измерений ${gen} стало меньше`, sub: `${c.cur.count} против ${c.prev.count} в предыдущем периоде` });
+    });
+    const sec = el('<section class="section"><div class="section__head"><h2 class="section__title">Тренды</h2></div><div class="list-card"></div></section>');
+    const box = $('.list-card', sec);
+    if (!rows.length) box.appendChild(el('<div class="empty">За выбранный период нет записей — недостаточно данных для определения тенденций</div>'));
+    rows.forEach((r) => box.appendChild(el(`<div class="row"><span class="st-trend-icon" aria-hidden="true">${esc(r.icon)}</span><div class="row__body"><p class="row__title">${esc(r.title)}</p><p class="row__sub">${esc(r.sub)}</p></div></div>`)));
+    return sec;
+  }
+
+  /* ---------- Сравнение с предыдущим периодом ---------- */
+  function compareSection(m) {
+    const sec = el('<section class="section"><div class="section__head"><h2 class="section__title">Сравнение периодов</h2></div><div class="list-card"></div></section>');
+    const box = $('.list-card', sec);
+    if (!m.prev) {
+      box.appendChild(el('<div class="empty">Для периода «Всё время» нет предыдущего периода такой же длины — сравнение не выполняется</div>'));
+      return sec;
+    }
+    sec.querySelector('.section__head').appendChild(el(`<span class="st-head-note">${esc(fmtDayShort(m.prev.start))} — ${esc(fmtDayShort(m.prev.end))}</span>`));
+    const rows = [];
+    const avgTitle = { weight: 'Средний вес', pulse: 'Средний пульс', temperature: 'Средняя температура', spo2: 'Средняя сатурация', glucose: 'Средняя глюкоза' };
+    POINT_KEYS.forEach((k) => {
+      const c = m[k].compare, t = ST[k];
+      if (!c.cur.count && !c.prev.count) return;
+      const counts = `измерений ${c.cur.count} против ${c.prev.count}`;
+      if (c.deltaAvg != null) rows.push([avgTitle[k], `${fmtN(c.cur.avg, t.d)} против ${fmtN(c.prev.avg, t.d)} ${t.unit} · ${counts}`, `${fmtSigned(roundedDelta(c.cur.avg, c.prev.avg, t.d), t.d)} ${t.unit}`]);
+      else rows.push([avgTitle[k], c.cur.count ? `в предыдущем периоде измерений нет · ${counts}` : `в этом периоде измерений нет · ${counts}`, c.cur.count ? `${fmtN(c.cur.avg, t.d)} ${t.unit}` : '—']);
+    });
+    const cs = m.pressure.sys.compare, cd = m.pressure.dia.compare;
+    if (cs.cur.count || cs.prev.count) {
+      const counts = `измерений ${cs.cur.count} против ${cs.prev.count}`;
+      if (cs.deltaAvg != null && cd.deltaAvg != null) rows.push(['Среднее давление', `${pressureTxt(cs.cur.avg, cd.cur.avg)} против ${pressureTxt(cs.prev.avg, cd.prev.avg)} mmHg · ${counts}`, `${fmtSigned(roundedDelta(cs.cur.avg, cs.prev.avg))}/${fmtSigned(roundedDelta(cd.cur.avg, cd.prev.avg))}`]);
+      else rows.push(['Среднее давление', cs.cur.count ? `в предыдущем периоде измерений нет · ${counts}` : `в этом периоде измерений нет · ${counts}`, cs.cur.count ? pressureTxt(cs.cur.avg, cd.cur.avg) : '—']);
+    }
+    const wc = m.water.compare;
+    if (wc.cur.count || wc.prev.count) {
+      const g = m.water.goalCompletion, pg = m.water.prevGoalCompletion;
+      const goalTxt = g && pg && g.daysWithData && pg.daysWithData ? ` · цель в ${fmtN(g.pct * 100, 0)}% против ${fmtN(pg.pct * 100, 0)}% дней` : '';
+      const daysTxt = `записи за ${wc.cur.days} против ${wc.prev.days} дн.`;
+      if (wc.deltaAvg != null) rows.push(['Среднее потребление воды', `${fmtN(wc.cur.avg)} против ${fmtN(wc.prev.avg)} мл/день · ${daysTxt}${goalTxt}`, `${fmtSigned(roundedDelta(wc.cur.avg, wc.prev.avg))} мл/день`]);
+      else rows.push(['Среднее потребление воды', `${wc.cur.count ? 'в предыдущем периоде записей нет' : 'в этом периоде записей нет'} · ${daysTxt}`, wc.cur.count ? `${fmtN(wc.cur.avg)} мл/день` : '—']);
+    }
+    const a = m.activity;
+    if (a.recordedDays || a.prevRecordedDays) {
+      const mc = a.minutes.compare;
+      const minTxt = mc.deltaAvg != null ? ` · в среднем ${fmtN(mc.cur.avg)} против ${fmtN(mc.prev.avg)} мин/день` : '';
+      rows.push(['Активных дней', `записи за ${a.recordedDays} против ${a.prevRecordedDays} дн.${minTxt}`, `${a.activeDays} против ${a.prevActiveDays}`]);
+    }
+    if (m.tests.inPeriod || m.tests.prevInPeriod) rows.push(['Анализов', '', `${m.tests.inPeriod} против ${m.tests.prevInPeriod}`]);
+    if (!rows.length) box.appendChild(el('<div class="empty">Нет записей ни в текущем, ни в предыдущем периоде</div>'));
+    rows.forEach(([title, sub, trailing]) => box.appendChild(el(`<div class="row"><div class="row__body"><p class="row__title">${esc(title)}</p>${sub ? `<p class="row__sub">${esc(sub)}</p>` : ''}</div><span class="row__trailing st-delta">${esc(trailing)}</span></div>`)));
+    return sec;
+  }
+
+  /* ---------- общие блоки секций показателей ---------- */
+  function sectionShell(id, title, route) {
+    return el(`<section class="section st-sec" id="${id}"><div class="section__head"><h2 class="section__title">${esc(title)}</h2>${route ? `<button class="section__action" type="button" data-route="${route}">+ Добавить</button>` : ''}</div></section>`);
+  }
+  function emptyState(b, route, word = 'измерений') {
+    const text = b.totalDays && b.lastAll ? `За выбранный период ${word} нет. Последняя запись — ${fmtDate(b.lastAll.date)}.` : 'Записей пока нет.';
+    return el(`<div class="card st-empty"><p class="st-empty__title">Пока недостаточно данных</p><p class="st-empty__sub">${esc(text)}</p><button class="btn-ghost" type="button" data-route="${route}">Добавить измерение</button></div>`);
+  }
+  function singleState(value, unit, date) {
+    return el(`<div class="card st-single"><div class="st-single__val">${esc(value)} <span>${esc(unit)}</span></div><div class="st-single__date">${esc(fmtDate(date))}</div><p class="st-single__note">Для анализа динамики нужно больше измерений.</p></div>`);
+  }
+  const tiles = (items) => `<div class="sgrid">${items.map(([label, value, sub]) => `<div class="sgrid__item"><div class="sgrid__label">${esc(label)}</div><div class="sgrid__val">${esc(value)}</div>${sub ? `<div class="sgrid__sub">${esc(sub)}</div>` : ''}</div>`).join('')}</div>`;
+  /* табличный вид (все значения периода) — строится только при раскрытии */
+  function tableView(count, rowsFn) {
+    const d = el(`<details class="st-table"><summary>Все значения за период · ${count}</summary><div class="list-card"></div></details>`);
+    d.addEventListener('toggle', () => {
+      const box = $('.list-card', d);
+      if (!d.open || box.childElementCount) return;
+      box.innerHTML = rowsFn().map(([left, right]) => `<div class="row st-table__row"><div class="row__body"><p class="row__sub">${esc(left)}</p></div><span class="row__trailing">${esc(right)}</span></div>`).join('');
+    });
+    return d;
+  }
+  const newestFirst = (pts) => pts.slice().reverse();
+
+  /* ---------- Точечный показатель: вес / пульс / температура / SpO2 / глюкоза ---------- */
+  function pointSection(m, key, emoji) {
+    const b = m[key], t = ST[key];
+    const sec = sectionShell(`st-${key}`, `${emoji} ${t.name}`, `metric/${key}`);
+    if (!b.points.length) { sec.appendChild(emptyState(b, `metric/${key}`)); return sec; }
+    if (b.points.length === 1) { const p = b.points[0]; sec.appendChild(singleState(fmtN(p.value, t.d), t.unit, p.date)); return sec; }
+    const byDay = new Map(b.points.map((p) => [p.day, p]));
+    const goal = key === 'weight' && b.goal ? b.goal : null;
+    const cardEl = el('<div class="card st-card"></div>');
+    cardEl.appendChild(lineChart({
+      range: m.range,
+      series: [{ key, label: t.name, color: 'var(--viz-1)', points: b.points }],
+      goals: goal ? [{ value: goal, label: `цель ${fmtN(goal, t.d)}` }] : [],
+      trend: b.trend.status !== 'insufficient' ? b.trend.line : null,
+      minSpan: t.minSpan,
+      ariaLabel: `${t.name} за период: ${b.stats.count} измерений, от ${fmtN(b.stats.min.value, t.d)} до ${fmtN(b.stats.max.value, t.d)} ${t.unit}`,
+      readout: (day) => { const p = byDay.get(day); return `<span class="chart__rv">${esc(fmtN(p.value, t.d))} <small>${esc(t.unit)}</small></span><span class="chart__rd">${esc(fmtDate(p.date))}${p.n > 1 ? ` · среднее из ${p.n} изм.` : ''}</span>`; },
+    }));
+    const s = b.stats, ch = b.change;
+    const items = [
+      ['Изменение', `${fmtSigned(ch.delta, t.d)} ${t.unit}`, `${fmtDayShort(ch.first.day)} → ${fmtDayShort(ch.last.day)}`],
+      ['Среднее', `${fmtN(s.avg, t.d)} ${t.unit}`, `${s.count} изм.`],
+      ['Минимум', `${fmtN(s.min.value, t.d)} ${t.unit}`, fmtDayShort(s.min.day)],
+      ['Максимум', `${fmtN(s.max.value, t.d)} ${t.unit}`, fmtDayShort(s.max.day)],
+      ['Первое', `${fmtN(s.first.value, t.d)} ${t.unit}`, fmtDayShort(s.first.day)],
+      ['Последнее', `${fmtN(s.last.value, t.d)} ${t.unit}`, fmtDayShort(s.last.day)],
+    ];
+    if (key === 'pulse' && b.compare && b.compare.deltaAvg != null) items.push(['К пред. периоду', `${fmtSigned(roundedDelta(b.compare.cur.avg, b.compare.prev.avg), 0)} ${t.unit}`, `среднее было ${fmtN(b.compare.prev.avg, 0)}`]);
+    if (goal) items.push(['Цель', `${fmtN(goal, t.d)} ${t.unit}`, `до цели ${fmtSigned(goal - s.last.value, t.d)} ${t.unit}`]);
+    cardEl.appendChild(el(tiles(items)));
+    sec.appendChild(cardEl);
+    sec.appendChild(tableView(b.points.length, () => newestFirst(b.points).map((p) => [fmtDate(p.date), `${fmtN(p.value, t.d)} ${t.unit}`])));
+    return sec;
+  }
+
+  /* ---------- Давление: SYS и DIA на одном графике ---------- */
+  function pressureSection(m) {
+    const { sys, dia, goal } = m.pressure;
+    const sec = sectionShell('st-pressure', '🩸 Давление', 'metric/pressure');
+    if (!sys.points.length) { sec.appendChild(emptyState(sys, 'metric/pressure')); return sec; }
+    const diaBy = new Map(dia.points.map((p) => [p.day, p]));
+    const sysBy = new Map(sys.points.map((p) => [p.day, p]));
+    if (sys.points.length === 1) {
+      const p = sys.points[0];
+      sec.appendChild(singleState(pressureTxt(p.value, diaBy.get(p.day)?.value), 'mmHg', p.date));
+      return sec;
+    }
+    const goals = [];
+    if (goal && goal.systolic > 0) goals.push({ value: goal.systolic, label: `цель SYS ${goal.systolic}` });
+    if (goal && goal.diastolic > 0) goals.push({ value: goal.diastolic, label: `цель DIA ${goal.diastolic}` });
+    const cardEl = el('<div class="card st-card"></div>');
+    cardEl.appendChild(lineChart({
+      range: m.range,
+      series: [
+        { key: 'sys', label: 'SYS · систолическое', color: 'var(--viz-1)', points: sys.points },
+        { key: 'dia', label: 'DIA · диастолическое', color: 'var(--viz-2)', points: dia.points },
+      ],
+      goals,
+      goalLegend: goal && goal.systolic && goal.diastolic ? `цель ${goal.systolic}/${goal.diastolic}` : '',
+      minSpan: 20,
+      ariaLabel: `Давление за период: ${sys.stats.count} измерений, среднее ${pressureTxt(sys.stats.avg, dia.stats.avg)} mmHg`,
+      readout: (day) => {
+        const s = sysBy.get(day), d = diaBy.get(day), pulse = engine.pulseOn(day);
+        return `<span class="chart__rv">${esc(pressureTxt(s?.value, d?.value))} <small>mmHg</small></span><span class="chart__rd">${esc(fmtDate(isoOfDay(day)))} · SYS ${esc(fmtN(s?.value))} · DIA ${esc(fmtN(d?.value))}${pulse != null ? ` · пульс в этот день ${esc(fmtN(pulse))}` : ''}</span>`;
+      },
+    }));
+    const items = [
+      ['Среднее SYS', `${fmtN(sys.stats.avg)} mmHg`, `${sys.stats.count} изм.`],
+      ['Среднее DIA', `${fmtN(dia.stats.avg)} mmHg`, `${dia.stats.count} изм.`],
+      ['SYS мин–макс', `${fmtN(sys.stats.min.value)}–${fmtN(sys.stats.max.value)}`, 'mmHg'],
+      ['DIA мин–макс', `${fmtN(dia.stats.min.value)}–${fmtN(dia.stats.max.value)}`, 'mmHg'],
+      ['Последнее', pressureTxt(sys.stats.last.value, diaBy.get(sys.stats.last.day)?.value), fmtDayShort(sys.stats.last.day)],
+      ['Измерений', String(sys.stats.count), `${sys.stats.days} ${daysWord(sys.stats.days)} с данными`],
+    ];
+    if (goal && goal.systolic && goal.diastolic) items.push(['Цель', `${goal.systolic}/${goal.diastolic}`, 'из настроек показателя']);
+    cardEl.appendChild(el(tiles(items)));
+    sec.appendChild(cardEl);
+    sec.appendChild(tableView(sys.points.length, () => newestFirst(sys.points).map((p) => [fmtDate(p.date), `${pressureTxt(p.value, diaBy.get(p.day)?.value)} mmHg`])));
+    return sec;
+  }
+
+  /* ---------- Столбцы по дням / неделям: общий readout ---------- */
+  function bucketReadout(bar, unit, size, extra) {
+    const range = size === 1 ? fmtDay(bar.start) : `${fmtDayShort(bar.start)} — ${fmtDayShort(bar.end)}`;
+    if (bar.value == null) return `<span class="chart__rv chart__rv--muted">нет данных</span><span class="chart__rd">${esc(range)}</span>`;
+    if (size === 1) {
+      const zero = bar.value === 0 ? ' · записано' : '';
+      return `<span class="chart__rv">${esc(fmtN(bar.value))} <small>${esc(unit)}</small></span><span class="chart__rd">${esc(range)}${zero}${extra ? esc(extra(bar.value)) : ''}</span>`;
+    }
+    return `<span class="chart__rv">${esc(fmtN(bar.value))} <small>${esc(unit)}/день</small></span><span class="chart__rd">среднее · ${esc(range)} · записи за ${bar.days} из ${bar.size} дн.</span>`;
+  }
+  const aggNote = (size) => (size === 1 ? '' : size === 7 ? 'Столбец — среднее за неделю по дням с записями.' : 'Столбец — среднее за 30 дней по дням с записями.');
+
+  /* ---------- Вода ---------- */
+  function waterSection(m) {
+    const w = m.water;
+    const sec = sectionShell('st-water', '💧 Вода', 'metric/water');
+    if (!w.points.length) { sec.appendChild(emptyState(w, 'metric/water', 'записей')); return sec; }
+    const g = w.goalCompletion, goal = w.goal;
+    const cardEl = el('<div class="card st-card"></div>');
+    cardEl.appendChild(svgBarChart({
+      range: m.range,
+      bars: w.buckets,
+      goal: goal ? { value: goal, label: `цель ${fmtN(goal)}` } : null,
+      minSpan: 500,
+      ariaLabel: `Вода за период: среднее ${fmtN(w.stats.avg)} мл в день, записи за ${w.stats.days} из ${m.range.days} дней`,
+      readout: (bar) => bucketReadout(bar, 'мл', m.bucketSize, goal ? (v) => (v >= goal ? ' · цель достигнута' : ` · ${fmtN((v / goal) * 100)}% цели`) : null),
+    }));
+    const note = aggNote(m.bucketSize);
+    if (note) cardEl.appendChild(el(`<p class="st-note">${esc(note)}</p>`));
+    const items = [
+      ['Среднее в день', `${fmtN(w.stats.avg)} мл`, `по ${w.stats.days} ${daysDat(w.stats.days)} с записями`],
+      ['Цель', goal ? `${fmtN(goal)} мл` : '—', g && g.avgPctOfGoal != null ? `в среднем ${fmtN(g.avgPctOfGoal * 100)}% цели` : ''],
+      ['Выполнение цели', g ? `${fmtN(g.pct * 100)}%` : '—', 'дней с записями'],
+      ['Дней с целью', g ? `${g.daysMet} из ${g.daysWithData}` : '—', `записей нет: ${m.range.days - w.stats.days} дн.`],
+      ['Текущая серия', g ? `${g.currentStreak} ${daysWord(g.currentStreak)}` : '—', 'подряд с целью'],
+      ['Лучшая серия', g ? `${g.bestStreak} ${daysWord(g.bestStreak)}` : '—', 'за период'],
+    ];
+    cardEl.appendChild(el(tiles(items)));
+    sec.appendChild(cardEl);
+    sec.appendChild(tableView(w.points.length, () => newestFirst(w.points).map((p) => [fmtDate(p.date), `${fmtN(p.value)} мл${p.value === 0 ? ' (записано)' : ''}`])));
+    return sec;
+  }
+
+  /* ---------- Активность ---------- */
+  function activitySection(m) {
+    const a = m.activity;
+    const sec = sectionShell('st-activity', '🏃 Активность', 'activity');
+    const hasMin = a.minutes.points.length > 0, hasSteps = a.steps.points.length > 0;
+    if (!hasMin && !hasSteps) {
+      sec.appendChild(emptyState({ totalDays: a.totalDays, lastAll: a.lastAll }, 'activity', 'записей активности'));
+      return sec;
+    }
+    if (!actMode || (actMode === 'min' && !hasMin) || (actMode === 'steps' && !hasSteps)) actMode = hasMin ? 'min' : 'steps';
+    const cardEl = el('<div class="card st-card"></div>');
+    if (hasMin && hasSteps) {
+      const seg = el(`<div class="seg st-subseg"><button class="seg__btn ${actMode === 'min' ? 'is-active' : ''}" data-a="min" type="button">Минуты</button><button class="seg__btn ${actMode === 'steps' ? 'is-active' : ''}" data-a="steps" type="button">Шаги</button></div>`);
+      seg.addEventListener('click', (e) => { const btn = e.target.closest('[data-a]'); if (btn && btn.dataset.a !== actMode) { actMode = btn.dataset.a; sec.replaceWith(activitySection(m)); } });
+      cardEl.appendChild(seg);
+    }
+    const b = actMode === 'min' ? a.minutes : a.steps;
+    const unit = actMode === 'min' ? 'мин' : 'шагов';
+    const goal = actMode === 'steps' && a.steps.goal ? a.steps.goal : null;
+    cardEl.appendChild(svgBarChart({
+      range: m.range,
+      bars: b.buckets,
+      goal: goal ? { value: goal, label: `цель ${fmtN(goal)}` } : null,
+      minSpan: actMode === 'min' ? 30 : 2000,
+      color: 'var(--viz-1)',
+      ariaLabel: `Активность за период: ${a.activeDays} активных дней`,
+      readout: (bar) => bucketReadout(bar, unit, m.bucketSize),
+    }));
+    if (actMode === 'min') cardEl.appendChild(el('<p class="st-note">Минуты = велотренажёр + другое упражнение + планка.</p>'));
+    const note = aggNote(m.bucketSize);
+    if (note) cardEl.appendChild(el(`<p class="st-note">${esc(note)}</p>`));
+    const items = [
+      ['Среднее', b.points.length ? `${fmtN(b.stats.avg)} ${unit}` : '—', `по ${b.stats.days} ${daysDat(b.stats.days)} с записями`],
+      ['Активных дней', String(a.activeDays), `записи за ${a.recordedDays} из ${m.range.days} дн.`],
+      ['Лучший день', b.best ? `${fmtN(b.best.value)} ${unit}` : '—', b.best ? fmtDayShort(b.best.day) : ''],
+    ];
+    const bg = a.bike.goalCompletion;
+    if (bg && bg.daysWithData) items.push([`Вело ≥ ${a.bike.goal} мин`, `${bg.daysMet} из ${bg.daysWithData}`, `${fmtN(bg.pct * 100)}% дней с записью`]);
+    const sg = a.steps.goalCompletion;
+    if (sg && sg.daysWithData) items.push([`Шаги ≥ ${fmtN(a.steps.goal)}`, `${sg.daysMet} из ${sg.daysWithData}`, `${fmtN(sg.pct * 100)}% дней с записью`]);
+    cardEl.appendChild(el(tiles(items)));
+    sec.appendChild(cardEl);
+    sec.appendChild(tableView(b.points.length, () => newestFirst(b.points).map((p) => [fmtDate(p.date), `${fmtN(p.value)} ${unit}`])));
+    return sec;
+  }
+
+  /* ---------- Анализы: последний анализ, изменение к предыдущему, справочные диапазоны ---------- */
+  function testsSection(m) {
+    const T = m.tests;
+    const sec = sectionShell('st-tests', '🩸 Анализы', 'tests');
+    sec.querySelector('[data-route]').textContent = 'Все';
+    const box = el(`<div class="list-card"><div class="row"><div class="row__body"><p class="row__title">Последний анализ: ${esc(fmtDate(T.latest.date))}</p><p class="row__sub">за период: ${T.inPeriod} · всего: ${T.total}</p></div></div></div>`);
+    T.fields.forEach((f) => {
+      const ref = REFERENCE[f.field];
+      const st = evaluate(f.field, f.value);
+      const outTxt = st === 'warn' || st === 'danger' ? 'вне справочного диапазона · ' : '';
+      const prevTxt = f.prev ? `пред.: ${fmtNum(f.prev.value)} (${fmtDate(f.prev.date)}) · изменение ${fmtDelta(f.delta)}` : 'первое значение';
+      box.appendChild(el(`<div class="row"><span class="dot-status dot-status--${st}"></span><div class="row__body"><p class="row__title">${esc(ref.label)}</p><p class="row__sub">${esc(outTxt + prevTxt)}</p></div><span class="row__trailing">${esc(fmtNum(f.value))} ${esc(ref.unit)}</span></div>`));
+    });
+    sec.appendChild(box);
+    return sec;
+  }
+
+  /* ---------- Данные (насколько статистика репрезентативна) ---------- */
+  function dataSection(m) {
+    const rows = [];
+    const pointRow = (name, b, always) => {
+      if (!b.totalDays && !always) return;
+      if (!b.totalDays) { rows.push([name, 'нет данных', '']); return; }
+      const c = b.coverage;
+      rows.push([name, `${c.count} ${plural(c.count, 'измерение', 'измерения', 'измерений')} за период · последнее: ${lastLabel(c.last, m.todayDay)}`, `${c.days} из ${m.range.days} дн.`]);
+    };
+    pointRow('Вес', m.weight, true);
+    pointRow('Давление', m.pressure.sys, true);
+    pointRow('Пульс', m.pulse, true);
+    const w = m.water;
+    rows.push(['Вода', w.totalDays ? `записи за ${w.stats.days} ${daysWord(w.stats.days)} из ${m.range.days} · последняя: ${lastLabel(w.lastAll, m.todayDay)}` : 'нет данных', w.totalDays ? `${w.stats.days} из ${m.range.days} дн.` : '']);
+    const a = m.activity;
+    rows.push(['Активность', a.totalDays ? `записи за ${a.recordedDays} ${daysWord(a.recordedDays)} из ${m.range.days} · последняя: ${lastLabel(a.lastAll, m.todayDay)}` : 'нет данных', a.totalDays ? `${a.recordedDays} из ${m.range.days} дн.` : '']);
+    EXTRA_KEYS.forEach((k) => pointRow(ST[k].name, m[k], false));
+    if (m.tests.total) rows.push(['Анализы', `${m.tests.inPeriod} за период · последний: ${fmtDate(m.tests.latest.date)}`, '']);
+    if (m.meds.count) rows.push(['Лекарства', `отметки приёма в ${m.meds.markedDays} ${plural(m.meds.markedDays, 'дне', 'днях', 'днях')} из ${m.range.days}`, '']);
+    return el(`<section class="section"><div class="section__head"><h2 class="section__title">Данные</h2></div><div class="list-card">
+      ${rows.map(([t, s, tr]) => `<div class="row"><div class="row__body"><p class="row__title">${esc(t)}</p><p class="row__sub">${esc(s)}</p></div>${tr ? `<span class="row__trailing">${esc(tr)}</span>` : ''}</div>`).join('')}
+    </div></section>`);
+  }
+
+  paint();
+  return screen;
+}
+
 /* заглушка */
 function Stub(emoji, title) {
   const screen = el('<div></div>');
@@ -1891,7 +2405,7 @@ const SCREENS = {
   profile: ProfileScreen, activity: ActivityScreen, visits: VisitsScreen,
   settings: SettingsScreen, export: ExportScreen, theme: ThemeScreen,
   notifications: NotificationsScreen, goals: () => Stub('🎯', 'Цели'),
-  calendar: CalendarScreen, stats: () => Stub('📈', 'Статистика'),
+  calendar: CalendarScreen, stats: StatsScreen,
   security: () => Stub('🔒', 'Безопасность'),
 };
 

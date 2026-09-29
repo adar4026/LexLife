@@ -6,7 +6,7 @@
    Меняйте CACHE_VERSION при обновлении ассетов.
    ========================================================= */
 
-const CACHE_VERSION = 'lexlife-v22';
+const CACHE_VERSION = 'lexlife-v23';
 const FONT_CACHE = 'lexlife-fonts-v1';
 
 const APP_SHELL = [
@@ -15,6 +15,8 @@ const APP_SHELL = [
   './css/styles.css',
   './js/app.js',
   './js/services/storage.js',
+  './js/services/analytics.js',
+  './js/ui/charts.js',
   './manifest.json',
   './icons/lexlife-icon-192.png',
 ];
@@ -23,7 +25,8 @@ self.addEventListener('install', (event) => {
   event.waitUntil(
     caches
       .open(CACHE_VERSION)
-      .then((cache) => cache.addAll(APP_SHELL))
+      /* cache: 'reload' — мимо HTTP-кэша браузера, чтобы новая версия не смешалась со старыми файлами */
+      .then((cache) => cache.addAll(APP_SHELL.map((u) => new Request(u, { cache: 'reload' }))))
       .then(() => self.skipWaiting())
   );
 });

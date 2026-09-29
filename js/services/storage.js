@@ -874,6 +874,10 @@ class StorageService {
     const all = await this._read(KEYS.medLog, {});
     return all[day] || [];
   }
+  /* весь журнал приёма (только чтение — для статистики) */
+  async getAllMedLog() {
+    return this._read(KEYS.medLog, {});
+  }
   async toggleMedTaken(name, day = dateKey()) {
     const all = await this._read(KEYS.medLog, {});
     const list = all[day] || [];
