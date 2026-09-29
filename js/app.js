@@ -8,6 +8,7 @@
 
 import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup } from './services/storage.js';
 import { createStatsEngine, evaluateWaterPlan, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay } from './services/analytics.js';
+import { parseWaterMinderCsv, assignImportKeys, buildWaterImportPlan, applyWaterImportPlan, applyTodayWaterImport } from './services/waterImport.js';
 import { lineChart, barChart as svgBarChart } from './ui/charts.js';
 
 /* ---------- DOM-помощники ---------- */
@@ -1098,6 +1099,219 @@ function plural(n, one, few, many) {
   return many;
 }
 
+/* =========================================================
+   Импорт истории воды из CSV WaterMinder (разовый перенос, #/water-import).
+   Файл читается локально (никуда не отправляется). Каждая запись переносится
+   отдельно, со своими датой/временем (без UTC/ISO-преобразований), включая
+   внешне одинаковые повторы — они не схлопываются (см. services/waterImport.js).
+   Перед записью данных создаётся резервная копия; существующие записи не
+   удаляются и не перезаписываются. Сегодняшний день — отдельное действие:
+   в LexLife к моменту импорта уже могут быть внесены сегодняшние записи вручную.
+   ========================================================= */
+async function backupBeforeImport() {
+  let b;
+  try {
+    b = await Storage.createBackup();
+  } catch {
+    await showDialog({
+      title: 'Не удалось создать резервную копию',
+      body: '<p>Импорт отменён, данные не изменены.</p>',
+      actions: [{ label: 'Понятно', value: true, kind: 'primary' }],
+    });
+    return false;
+  }
+  let res = await saveBackupFile(b.json, b.fileName);
+  if (res === 'need-tap') {
+    res = await new Promise((resolve) => {
+      showDialog({
+        title: 'Резервная копия готова',
+        body: `<p>${esc(b.fileName)}</p><p class="dialog__muted">Нажмите «Сохранить», затем выберите «Сохранить в Файлы» или другое место.</p>`,
+        actions: [
+          { label: 'Отмена', value: 'cancelled' },
+          { label: 'Сохранить', kind: 'primary', value: null, onClick: () => { saveBackupFile(b.json, b.fileName).then(resolve); } },
+        ],
+      }).then((v) => { if (v) resolve(v); });
+    });
+  }
+  if (res === 'shared' || res === 'downloaded') {
+    await Storage.markBackupCreated(b.createdAt);
+    return true;
+  }
+  return false; // cancelled — импорт не продолжаем
+}
+
+async function WaterImportScreen() {
+  const screen = el('<div></div>');
+  screen.appendChild(backHeader('Импорт истории воды', { label: 'Назад', onBack: goBack }));
+
+  screen.appendChild(el(`
+    <div class="input-card">
+      <p class="backup-note">Перенос истории приёмов воды из экспорта WaterMinder (CSV). Каждая запись переносится отдельно, со своими датой и временем — без пересчёта в UTC и без привязки к пунктам плана.</p>
+      <p class="backup-note">Перед переносом LexLife создаёт резервную копию текущих данных. Существующие записи не удаляются и не изменяются. Повторный импорт того же файла не создаёт дублей.</p>
+    </div>
+  `));
+
+  const pickCard = el('<div class="input-card"></div>');
+  const pickLabel = el('<label class="btn-ghost">Выбрать CSV-файл WaterMinder<input type="file" accept=".csv,text/csv" hidden></label>');
+  const fileInput = $('input', pickLabel);
+  pickCard.appendChild(pickLabel);
+  const fileNameEl = el('<p class="backup-note" style="margin-top:8px"></p>');
+  pickCard.appendChild(fileNameEl);
+  screen.appendChild(pickCard);
+
+  const previewHost = el('<div></div>');
+  screen.appendChild(previewHost);
+
+  let state = null; // { parsed, planInfo }
+
+  async function computePlan(rows) {
+    const withKeys = assignImportKeys(rows);
+    const existingLog = await Storage.getWaterLog();
+    const today = dateKey();
+    return { withKeys, plan: buildWaterImportPlan(withKeys, existingLog, today), today };
+  }
+
+  function renderPreview(parsed, planInfo) {
+    previewHost.innerHTML = '';
+    const { rows, errors, totalLines } = parsed;
+    const { plan, today } = planInfo;
+    const importDays = Object.keys(plan.additionsByDay).sort();
+
+    const rangeLine = plan.minDate && plan.maxDate ? `${esc(fmtDate(plan.minDate))} – ${esc(fmtDate(plan.maxDate))}` : '—';
+    const card = el('<div class="input-card"></div>');
+    card.appendChild(el(`
+      <ul class="dialog__list">
+        <li><span>Строк в файле</span><span>${totalLines}</span></li>
+        <li><span>Распознано</span><span>${rows.length}</span></li>
+        ${errors.length ? `<li><span>Не удалось разобрать</span><span>${errors.length}</span></li>` : ''}
+        <li><span>Период в файле</span><span>${rangeLine}</span></li>
+        <li><span>Будет добавлено</span><span>${plan.addedCount}</span></li>
+        <li><span>Уже импортировано ранее (дубли)</span><span>${plan.duplicateCount}</span></li>
+        ${plan.csvTodayCount ? `<li><span>Сегодня, ${esc(fmtDate(today))}</span><span>${plan.csvTodayCount} в файле · ${plan.existingTodayManualCount} ручных уже в LexLife</span></li>` : ''}
+      </ul>
+    `));
+    previewHost.appendChild(card);
+
+    const actions = el('<div class="backup-actions"></div>');
+    const mainBtn = el('<button class="btn-primary" type="button"></button>');
+    if (importDays.length) {
+      mainBtn.textContent = `Импортировать ${fmtDate(importDays[0])} – ${fmtDate(importDays[importDays.length - 1])} (${plan.addedCount})`;
+    } else {
+      mainBtn.textContent = 'Нечего импортировать';
+      mainBtn.disabled = true;
+    }
+    mainBtn.addEventListener('click', async () => {
+      const go = await showDialog({
+        title: 'Импорт истории воды',
+        body: `
+          <p>Будет добавлено <b>${plan.addedCount}</b> ${plural(plan.addedCount, 'запись', 'записи', 'записей')} за ${importDays.length} ${plural(importDays.length, 'день', 'дня', 'дней')} (${esc(fmtDate(importDays[0]))} – ${esc(fmtDate(importDays[importDays.length - 1]))}).</p>
+          ${plan.duplicateCount ? `<p class="dialog__muted">${plan.duplicateCount} ${plural(plan.duplicateCount, 'запись', 'записи', 'записей')} уже были импортированы ранее и будут пропущены.</p>` : ''}
+          <p class="dialog__muted">Сегодняшняя дата (${esc(fmtDate(today))}) в этот импорт не входит — для неё отдельная кнопка ниже.</p>
+          <p class="dialog__muted">Перед импортом будет создана резервная копия текущих данных.</p>
+        `,
+        actions: [{ label: 'Отмена', value: false }, { label: 'Создать копию и импортировать', value: true, kind: 'primary' }],
+      });
+      if (!go) return;
+      mainBtn.classList.add('is-busy');
+      try {
+        if (!(await backupBeforeImport())) return;
+        const res = await applyWaterImportPlan(Storage, plan);
+        await showDialog({
+          title: 'Импорт завершён',
+          body: `
+            <ul class="dialog__list">
+              <li><span>Добавлено</span><span>${res.importedCount}</span></li>
+              <li><span>Пропущено как дубли</span><span>${plan.duplicateCount}</span></li>
+              <li><span>Дней</span><span>${res.days.length} (${esc(fmtDate(res.days[0]))} – ${esc(fmtDate(res.days[res.days.length - 1]))})</span></li>
+            </ul>
+          `,
+          actions: [{ label: 'Готово', value: true, kind: 'primary' }],
+        });
+        flash('Импорт завершён ✓');
+        await refresh();
+      } catch (err) {
+        await showDialog({ title: 'Не удалось импортировать', body: `<p>${esc((err && err.message) || 'Попробуйте ещё раз.')}</p>`, actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+      } finally {
+        mainBtn.classList.remove('is-busy');
+      }
+    });
+    actions.appendChild(mainBtn);
+
+    if (plan.csvTodayCount) {
+      const todayBtn = el('<button class="btn-ghost" type="button"></button>');
+      todayBtn.textContent = plan.todayAdditions.length
+        ? `Импортировать записи WaterMinder за сегодня (${plan.todayAdditions.length})`
+        : 'Записи за сегодня уже импортированы';
+      todayBtn.disabled = !plan.todayAdditions.length;
+      todayBtn.addEventListener('click', async () => {
+        const go = await showDialog({
+          title: 'Записи WaterMinder за сегодня',
+          body: `
+            <p class="dialog__warn">Сегодня, ${esc(fmtDate(today))}, в LexLife уже есть <b>${plan.existingTodayManualCount}</b> ${plural(plan.existingTodayManualCount, 'ручная запись', 'ручные записи', 'ручных записей')} воды.</p>
+            <p>В файле WaterMinder за сегодня — <b>${plan.csvTodayCount}</b> ${plural(plan.csvTodayCount, 'запись', 'записи', 'записей')}, новых из них — <b>${plan.todayAdditions.length}</b>.</p>
+            <p class="dialog__muted">Импортируйте, только если эти объёмы ещё не внесены в LexLife вручную — иначе сегодняшняя вода задвоится.</p>
+          `,
+          actions: [{ label: 'Отмена', value: false }, { label: 'Всё равно импортировать', value: true, kind: 'danger' }],
+        });
+        if (!go) return;
+        todayBtn.classList.add('is-busy');
+        try {
+          if (!(await backupBeforeImport())) return;
+          const res = await applyTodayWaterImport(Storage, plan);
+          await showDialog({ title: 'Импорт за сегодня завершён', body: `<p>Добавлено: <b>${res.importedCount}</b></p>`, actions: [{ label: 'Готово', value: true, kind: 'primary' }] });
+          flash('Импорт завершён ✓');
+          await refresh();
+        } catch (err) {
+          await showDialog({ title: 'Не удалось импортировать', body: `<p>${esc((err && err.message) || 'Попробуйте ещё раз.')}</p>`, actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+        } finally {
+          todayBtn.classList.remove('is-busy');
+        }
+      });
+      actions.appendChild(todayBtn);
+    }
+    previewHost.appendChild(actions);
+
+    if (errors.length) {
+      previewHost.appendChild(el(`<p class="empty" style="padding-top:10px">Пропущено ${errors.length} ${plural(errors.length, 'строка', 'строки', 'строк')} с нераспознанной датой/временем/объёмом — они не импортируются.</p>`));
+    }
+  }
+
+  async function refresh() {
+    if (!state) return;
+    const planInfo = await computePlan(state.parsed.rows);
+    state = { parsed: state.parsed, planInfo };
+    renderPreview(state.parsed, planInfo);
+  }
+
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
+    fileNameEl.textContent = file.name;
+    pickLabel.classList.add('is-busy');
+    try {
+      const text = await file.text();
+      let parsed;
+      try {
+        parsed = parseWaterMinderCsv(text);
+      } catch (err) {
+        await showDialog({ title: 'Не удалось прочитать файл', body: `<p>${esc(err.message)}</p>`, actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+        return;
+      }
+      if (!parsed.rows.length) {
+        await showDialog({ title: 'Нет данных для импорта', body: '<p>В файле не найдено ни одной распознанной записи.</p>', actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+        return;
+      }
+      const planInfo = await computePlan(parsed.rows);
+      state = { parsed, planInfo };
+      renderPreview(parsed, planInfo);
+    } finally {
+      pickLabel.classList.remove('is-busy');
+    }
+  });
+
+  return screen;
+}
+
 async function ThemeScreen() {
   const screen = el('<div></div>');
   function paint() {
@@ -1125,6 +1339,7 @@ async function SettingsScreen() {
   [
     { route: 'theme', icon: '🌙', title: 'Тема оформления' },
     { route: 'export', icon: '💾', title: 'Резервная копия' },
+    { route: 'water-import', icon: '📥', title: 'Импорт истории воды' },
     { route: 'security', icon: '🔒', title: 'Безопасность' },
   ].forEach((m) => {
     const row = el(`<div class="row" role="button" data-route="${m.route}"><span class="row__icon">${m.icon}</span><div class="row__body"><p class="row__title">${esc(m.title)}</p></div><span class="row__chevron">›</span></div>`);
@@ -2297,7 +2512,7 @@ function flash(text) {
   let n = $('#flash');
   if (!n) {
     n = el('<div id="flash"></div>');
-    Object.assign(n.style, { position: 'fixed', left: '50%', bottom: 'calc(var(--tab-h) + 20px)', transform: 'translateX(-50%)', background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--text)', padding: '10px 18px', borderRadius: '999px', fontSize: '14px', fontWeight: '700', zIndex: '400', boxShadow: '0 8px 24px rgba(0,0,0,0.5)', transition: 'opacity .2s' });
+    Object.assign(n.style, { position: 'fixed', left: '50%', bottom: 'calc(var(--tab-h) + 20px)', transform: 'translateX(-50%)', background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--text)', padding: '10px 18px', borderRadius: '999px', fontSize: '14px', fontWeight: '700', zIndex: '400', boxShadow: '0 8px 24px rgba(0,0,0,0.5)', transition: 'opacity .2s', pointerEvents: 'none' });
     document.body.appendChild(n);
   }
   n.textContent = text; n.style.opacity = '1';
@@ -2408,7 +2623,7 @@ const TAB_ROUTES = ['home', 'metrics', 'meds', 'tests'];
 const SCREENS = {
   home: HomeScreen, metrics: MetricsScreen, meds: MedsScreen, tests: TestsScreen,
   profile: ProfileScreen, activity: ActivityScreen, visits: VisitsScreen,
-  settings: SettingsScreen, export: ExportScreen, theme: ThemeScreen,
+  settings: SettingsScreen, export: ExportScreen, 'water-import': WaterImportScreen, theme: ThemeScreen,
   notifications: NotificationsScreen, goals: () => Stub('🎯', 'Цели'),
   calendar: CalendarScreen, stats: StatsScreen,
   security: () => Stub('🔒', 'Безопасность'),

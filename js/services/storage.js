@@ -461,7 +461,7 @@ class LocalStorageDriver {
 
 /* Драйвер в памяти — песочница для подготовки restore: бэкап загружается сюда,
    прогоняется через те же MIGRATIONS и проверяется, не касаясь реальной базы. */
-class MemoryDriver {
+export class MemoryDriver {
   constructor() { this.map = new Map(); }
   async get(key) { return this.map.has(key) ? this.map.get(key) : null; }
   async set(key, value) { this.map.set(key, String(value)); }
@@ -601,7 +601,7 @@ const MIGRATIONS = [
    StorageService — единый слой (§6.1)
    ========================================================= */
 
-class StorageService {
+export class StorageService {
   constructor(driver) {
     this.driver = driver;
     this.KEYS = KEYS;
@@ -786,6 +786,28 @@ class StorageService {
     cur.entries.splice(idx, 1);
     cur.total = cur.entries.reduce((s, e) => s + e.ml, 0);
     all.water = { ...all.water, [day]: cur };
+    await this._write(KEYS.metricsLog, all);
+  }
+  /* Массовый импорт приёмов воды за много дней одной записью (например, разовый
+     перенос истории из другого приложения). Только добавляет — существующие записи
+     не удаляются и не перезаписываются; доп. поля записи (key/drink/hydrationMl и т.п.)
+     проходят как есть, модель этого не ограничивает (см. METRIC_VALUE_OK.water).
+     entriesByDay: { "ГГГГ-ММ-ДД": [{t, ml, ...}] }. extra сохраняет «безразрывный»
+     старый total дня, если он был больше суммы его entries (легаси-данные без разбивки
+     по приёмам) — приёмы добавляются поверх, старое значение не теряется. */
+  async bulkAddWaterEntries(entriesByDay) {
+    const all = await this.getMetricsLog();
+    all.water = { ...(all.water || {}) };
+    for (const [day, list] of Object.entries(entriesByDay || {})) {
+      if (!Array.isArray(list) || !list.length) continue;
+      const cur = all.water[day] || { total: 0, entries: [] };
+      const priorEntries = cur.entries || [];
+      const priorSum = priorEntries.reduce((s, e) => s + (Number(e && e.ml) || 0), 0);
+      const extra = Math.max(0, (Number(cur.total) || 0) - priorSum);
+      const entries = [...priorEntries, ...list].sort((a, b) => a.t.localeCompare(b.t));
+      const total = entries.reduce((s, e) => s + (Number(e.ml) || 0), 0) + extra;
+      all.water[day] = { total, entries };
+    }
     await this._write(KEYS.metricsLog, all);
   }
   /* рекорд дня за всё время: { date, total } | null */
