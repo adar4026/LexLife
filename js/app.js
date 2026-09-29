@@ -7,7 +7,7 @@
    ========================================================= */
 
 import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup } from './services/storage.js';
-import { createStatsEngine, evaluateWaterPlan, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay } from './services/analytics.js';
+import { createStatsEngine, evaluateWaterPlan, waterGoalDays, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay } from './services/analytics.js';
 import { parseWaterMinderCsv, assignImportKeys, buildWaterImportPlan, applyWaterImportPlan, applyTodayWaterImport, isWaterMinderKey } from './services/waterImport.js';
 import { lineChart, barChart as svgBarChart } from './ui/charts.js';
 
@@ -490,7 +490,7 @@ async function ensureNotifyPermission() {
 
 async function WaterScreen() {
   const screen = el('<div></div>');
-  let period = 'day';
+  let period = 'year'; // 'week' | 'month' | 'year' — по умолчанию «Год», как у графика
   let editingGoal = false;
 
   async function paint() {
@@ -554,12 +554,14 @@ async function WaterScreen() {
     /* 8. Статистика */
     const L = (ml) => fmtNum(Math.round(ml / 100) / 10);
     screen.appendChild(el(`
-      <div class="stat-row" style="margin-top:14px">
+      <div class="stat-row" style="margin-top:14px; margin-bottom:6px">
         <div class="stat"><div class="stat__num">${record ? L(record.total) : '0'}</div><div class="stat__label">рекорд дня, л</div></div>
         <div class="stat"><div class="stat__num">${loggedStreak} 🔥</div><div class="stat__label">дни с водой подряд</div></div>
-        <div class="stat"><div class="stat__num">${goalStreak}</div><div class="stat__label">цель выполнена подряд, дн.</div></div>
+        <div class="stat"><div class="stat__num">${goalStreak}</div><div class="stat__label">текущая серия цели, дней</div></div>
       </div>
     `));
+    screen.appendChild(el('<p class="plan-hint" style="margin:0 0 14px">Текущая серия — дни подряд по сегодня с итогом не меньше цели. Пока сегодня цель не выполнена, серия считается по вчера.</p>'));
+    screen.appendChild(goalPeriodStats(log, goal));
     screen.appendChild(averagesBlock(log));
 
     /* 9. Настройки напоминаний */
@@ -697,6 +699,48 @@ async function WaterScreen() {
     }
     svg.innerHTML = inner;
     return sec;
+  }
+
+  /* Календарные дни выбранного периода — те же, что на графике: неделя — 7 дней,
+     месяц — 30 дней, год — с 1-го числа месяца 11 месяцев назад; всё по сегодня. */
+  function periodDayKeys(p) {
+    const today = new Date();
+    const start = p === 'week' || p === 'month'
+      ? new Date(today.getFullYear(), today.getMonth(), today.getDate() - (p === 'week' ? 6 : 29))
+      : new Date(today.getFullYear(), today.getMonth() - 11, 1);
+    const keys = [];
+    for (const d = start; dateKey(d) <= dateKey(today); d.setDate(d.getDate() + 1)) keys.push(dateKey(d));
+    return keys;
+  }
+  /* Выполнение цели за выбранный период: всего дней с целью (не обязательно подряд) и лучшая серия.
+     Пересчитывается из журнала при каждой отрисовке — после добавления, правки, переноса и удаления. */
+  function goalPeriodStats(log, goal) {
+    const keys = periodDayKeys(period);
+    const g = waterGoalDays(log, goal, keys);
+    const name = period === 'week' ? 'неделя' : period === 'month' ? 'месяц' : 'год';
+    const range = `${fmtDate(keys[0])} – ${fmtDate(keys[keys.length - 1])}`;
+    const box = el(`
+      <div>
+        <div style="font-size:12px; color:var(--text2); margin-bottom:8px">за период: ${name} · ${esc(range)}</div>
+        <div class="stat-row">
+          <div class="stat stat--link" role="button" tabindex="0" aria-label="Цель выполнена, дней: ${g.count}. Показать даты"><div class="stat__num">${g.count}</div><div class="stat__label">цель выполнена, дней ›</div></div>
+          <div class="stat"><div class="stat__num">${g.bestStreak}</div><div class="stat__label">лучшая серия цели, дней</div></div>
+        </div>
+      </div>
+    `);
+    const card = $('.stat--link', box);
+    const open = () => {
+      const list = g.days.slice().reverse().map((x) => `<li><span>${esc(fmtDate(x.date))}</span><span>${fmtMl(x.total)} мл</span></li>`).join('');
+      showDialog({
+        title: `Цель выполнена: ${g.count} ${plural(g.count, 'день', 'дня', 'дней')}`,
+        body: `<p class="dialog__muted">Период: ${name}, ${esc(range)} (${keys.length} ${plural(keys.length, 'день', 'дня', 'дней')}). Засчитан день с итогом от ${fmtMl(goal)} мл — по текущей цели.</p>${
+          g.count ? `<ul class="dialog__list">${list}</ul>` : '<p>За этот период нет дней с выполненной целью.</p>'}`,
+        actions: [{ label: 'Закрыть', value: true }],
+      });
+    };
+    card.addEventListener('click', open);
+    card.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+    return box;
   }
 
   /* средний суточный объём за последние n дней (по дням с записями) */
@@ -2590,8 +2634,8 @@ async function StatsScreen() {
       ['Цель', goal ? `${fmtN(goal)} мл` : '—', g && g.avgPctOfGoal != null ? `в среднем ${fmtN(g.avgPctOfGoal * 100)}% цели` : ''],
       ['Выполнение цели', g ? `${fmtN(g.pct * 100)}%` : '—', 'дней с записями'],
       ['Дней с целью', g ? `${g.daysMet} из ${g.daysWithData}` : '—', `записей нет: ${m.range.days - w.stats.days} дн.`],
-      ['Цель выполнена подряд', g ? `${g.currentStreak} ${daysWord(g.currentStreak)}` : '—', 'текущая серия'],
-      ['Лучшая серия с целью', g ? `${g.bestStreak} ${daysWord(g.bestStreak)}` : '—', 'за период'],
+      ['Текущая серия цели', g ? `${g.currentStreak} ${daysWord(g.currentStreak)}` : '—', 'дни подряд по сегодня'],
+      ['Лучшая серия цели', g ? `${g.bestStreak} ${daysWord(g.bestStreak)}` : '—', 'подряд за период'],
     ];
     cardEl.appendChild(el(tiles(items)));
     sec.appendChild(cardEl);

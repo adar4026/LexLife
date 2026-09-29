@@ -276,6 +276,24 @@ export function calculateGoalCompletion(points, goal, { todayDay = null, allPoin
   };
 }
 
+/* Дни с выполненной целью воды за период (экран «Вода»): итог дня ≥ goal.
+   dayKeys — все календарные дни периода по порядку ('YYYY-MM-DD'). Дни не обязаны идти подряд;
+   bestStreak — самая длинная серия подряд идущих дней периода с выполненной целью
+   (день без записей или с недобором прерывает серию). Журнал не меняется. */
+export function waterGoalDays(log, goal, dayKeys) {
+  const days = [];
+  let best = 0, run = 0;
+  for (const k of dayKeys) {
+    const total = pickWater(log ? log[k] : null) || 0;
+    if (isNum(goal) && goal > 0 && total >= goal) {
+      days.push({ date: k, total });
+      run += 1;
+      if (run > best) best = run;
+    } else run = 0;
+  }
+  return { count: days.length, days, bestStreak: best };
+}
+
 /* ---------- качество данных ---------- */
 export function calculateDataCoverage(points, range, todayDay, allPoints = points) {
   const past = allPoints.filter((p) => p.day <= todayDay);
