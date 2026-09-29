@@ -15,6 +15,9 @@ const APP_ID = 'lexlife';
    принимаем их на импорт, чтобы не терять совместимость с уже сделанными бэкапами. */
 const LEGACY_APP_IDS = ['moe-zdorovie'];
 export const CURRENT_SCHEMA_VERSION = 8;
+/* Версия приложения (UI/маркетинг) — отдельно от CURRENT_SCHEMA_VERSION (схема данных).
+   Меняется при релизах, не влияет на миграции/хранение. */
+export const APP_VERSION = '1.0.0';
 
 /* Ключи: health_metrics (v2, теперь конфиг) + metrics_log (v4, единая история) */
 export const KEYS = {

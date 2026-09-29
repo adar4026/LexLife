@@ -6,7 +6,7 @@
    Показатели — единая модель: каждый показатель = модуль #/metric/<key>.
    ========================================================= */
 
-import Storage, { REFERENCE, TEST_FIELDS, dateKey, CURRENT_SCHEMA_VERSION } from './services/storage.js';
+import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION } from './services/storage.js';
 
 /* ---------- DOM-помощники ---------- */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -968,7 +968,7 @@ async function SettingsScreen() {
   });
   $('.list-card', danger).appendChild(reset);
   screen.appendChild(danger);
-  screen.appendChild(el(`<p class="empty">LexLife · MVP 1.0 · схема v${esc(String(CURRENT_SCHEMA_VERSION))}</p>`));
+  screen.appendChild(el(`<p class="empty">LexLife • версия ${esc(APP_VERSION)}</p>`));
   return screen;
 }
 

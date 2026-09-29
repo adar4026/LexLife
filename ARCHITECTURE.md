@@ -14,7 +14,7 @@ PWA без фреймворков (чистый HTML/CSS/ES-модули), вс�
 | Платформа | PWA, устанавливается «на экран Домой» |
 | Код | Чистый HTML / CSS / JS (ES-модули), без сборки и зависимостей |
 | Хранение | `localStorage` через единый `StorageService` (async-first) |
-| Офлайн | Service Worker, кэш app-shell (`lexlife-v18`) |
+| Офлайн | Service Worker, кэш app-shell (`lexlife-v19`) |
 | Навигация | Hash-роутер (`#/route`, `#/metric/<key>`, `#/visit/<id>`) |
 | Тема | Тёмная/светлая, переключаемая (ключ `app_theme`) |
 
@@ -296,7 +296,7 @@ fallback → home
 ## 9. Тема, профиль, офлайн
 - **Тема** — `app_theme` в `localStorage`, `applyTheme()` ставит `data-theme` на `<html>`; светлая палитра в `[data-theme="light"]`.
 - **Профиль** — имя + аватар (фото сжимается в 200×200 JPEG, хранится data-URL).
-- **Service Worker** `lexlife-v18` — предкэш оболочки (HTML/CSS/JS/manifest/иконка) + кэш Google Fonts (stale-while-revalidate) + обработчик `notificationclick` (фокус/открытие приложения). Обновление ассетов — инкремент `CACHE_VERSION`.
+- **Service Worker** `lexlife-v19` — предкэш оболочки (HTML/CSS/JS/manifest/иконка) + кэш Google Fonts (stale-while-revalidate) + обработчик `notificationclick` (фокус/открытие приложения). Обновление ассетов — инкремент `CACHE_VERSION`.
 
 ---
 
@@ -331,4 +331,4 @@ fallback → home
 
 ---
 
-_Документ отражает фактический код на момент схемы v8 (SW `lexlife-v18`)._
+_Документ отражает фактический код на момент схемы v8 (SW `lexlife-v19`)._
