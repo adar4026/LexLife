@@ -6,7 +6,7 @@
    Меняйте CACHE_VERSION при обновлении ассетов.
    ========================================================= */
 
-const CACHE_VERSION = 'lexlife-v19';
+const CACHE_VERSION = 'lexlife-v20';
 const FONT_CACHE = 'lexlife-fonts-v1';
 
 const APP_SHELL = [

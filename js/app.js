@@ -6,7 +6,7 @@
    Показатели — единая модель: каждый показатель = модуль #/metric/<key>.
    ========================================================= */
 
-import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION } from './services/storage.js';
+import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, CURRENT_SCHEMA_VERSION, BackupError, parseBackup } from './services/storage.js';
 
 /* ---------- DOM-помощники ---------- */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -853,7 +853,7 @@ async function ProfileScreen() {
     const p = await Storage.getProfile();
     screen.innerHTML = '';
     screen.appendChild(backHeader('Профиль', { label: 'Назад', onBack: goBack }));
-    const avatar = p.photo ? `<img class="profile-avatar" src="${p.photo}" alt="">` : `<div class="profile-avatar profile-avatar--ph">👤</div>`;
+    const avatar = p.photo ? `<img class="profile-avatar" src="${esc(p.photo)}" alt="">` : `<div class="profile-avatar profile-avatar--ph">👤</div>`;
     const card = el(`
       <div class="input-card" style="text-align:center">
         ${avatar}
@@ -895,35 +895,199 @@ function readImage(file) {
   });
 }
 
+/* =========================================================
+   Резервная копия (#/export): создать файл / восстановить из файла.
+   Файл остаётся только у пользователя — LexLife никуда его не отправляет.
+   ========================================================= */
+const fmtDateTime = (iso) => new Date(iso).toLocaleString(RU, { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+/* Сохранить JSON-файл: Share Sheet iOS («Сохранить в Файлы», iCloud Drive, AirDrop),
+   если Web Share API умеет файлы; иначе — обычное скачивание Blob.
+   → 'shared' | 'downloaded' | 'cancelled' | 'need-tap' (share требует нового касания) */
+async function saveBackupFile(json, fileName) {
+  const file = new File([json], fileName, { type: 'application/json' });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file] });
+      return 'shared';
+    } catch (err) {
+      if (err && err.name === 'AbortError') return 'cancelled';
+      if (err && err.name === 'NotAllowedError') return 'need-tap';
+      /* иная ошибка share → запасной путь через скачивание */
+    }
+  }
+  const url = URL.createObjectURL(file);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  return 'downloaded';
+}
+
 async function ExportScreen() {
   const screen = el('<div></div>');
-  screen.appendChild(backHeader('Экспорт данных', { label: 'Назад', onBack: goBack }));
-  const card = el('<div class="input-card"><p class="row__sub" style="margin-bottom:12px">Полная резервная копия всех данных в JSON.</p></div>');
-  const exp = el('<button class="btn-primary" type="button">Скачать резервную копию</button>');
+  screen.appendChild(backHeader('Резервная копия', { label: 'Назад', onBack: goBack }));
+
+  const lastCard = el('<div class="input-card"><p class="backup-last"></p></div>');
+  async function paintLast() {
+    const last = await Storage.getLastBackupAt();
+    $('.backup-last', lastCard).innerHTML = last
+      ? `Последняя копия создана: <b>${esc(fmtDateTime(last))}</b>`
+      : 'На этом устройстве резервная копия ещё не создавалась.';
+  }
+  await paintLast();
+  screen.appendChild(lastCard);
+
+  screen.appendChild(el(`
+    <div class="input-card">
+      <p class="backup-note">Резервная копия — один JSON-файл со всеми данными LexLife: показатели и их история, вода, лекарства, анализы, врачи и визиты, уведомления, цели, профиль и настройки.</p>
+      <p class="backup-note">С помощью этого файла данные можно восстановить на этом или другом устройстве.</p>
+    </div>
+  `));
+  screen.appendChild(el(`
+    <div class="input-card backup-warn">
+      <p class="backup-note"><b>🔒 Файл содержит личные данные о здоровье и не зашифрован.</b> Храните его в надёжном месте (например, «Файлы» → iCloud Drive) и не пересылайте посторонним.</p>
+      <p class="backup-note">LexLife никуда не отправляет резервную копию — файл остаётся только у вас.</p>
+    </div>
+  `));
+
+  const actions = el('<div class="backup-actions"></div>');
+  const exp = el('<button class="btn-primary" type="button">Создать резервную копию</button>');
   exp.addEventListener('click', async () => {
-    const backup = await Storage.exportBackup();
-    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `lexlife-backup-${dateKey()}.json`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-    flash('Файл сформирован ✓');
-  });
-  card.appendChild(exp);
-  const impLabel = el('<label class="btn-ghost" style="display:block;text-align:center;margin-top:10px;cursor:pointer">Восстановить из файла<input type="file" accept="application/json" hidden id="imp"></label>');
-  $('#imp', impLabel).addEventListener('change', async (e) => {
-    const file = e.target.files[0]; if (!file) return;
+    exp.classList.add('is-busy');
     try {
-      const data = JSON.parse(await file.text());
-      await Storage.importBackup(data, 'replace');
-      flash('Импортировано ✓');
-      setTimeout(() => location.reload(), 600);
-    } catch (err) { flash('Ошибка импорта'); }
+      const b = await Storage.createBackup();
+      if (!b.verified) {
+        const go = await showDialog({
+          title: 'Проверка копии',
+          body: '<p>Копия создана, но самопроверка обнаружила нестандартные данные — восстановить её может не получиться. Всё равно сохранить файл?</p>',
+          actions: [{ label: 'Отмена', value: false }, { label: 'Сохранить', value: true, kind: 'primary' }],
+        });
+        if (!go) return;
+      }
+      let res = await saveBackupFile(b.json, b.fileName);
+      if (res === 'need-tap') {
+        /* iOS требует, чтобы Share Sheet открывался прямо из касания — даём кнопку */
+        res = await new Promise((resolve) => {
+          showDialog({
+            title: 'Резервная копия готова',
+            body: `<p>${esc(b.fileName)}</p><p class="dialog__muted">Нажмите «Сохранить», затем выберите «Сохранить в Файлы» или другое место.</p>`,
+            actions: [
+              { label: 'Отмена', value: 'cancelled' },
+              { label: 'Сохранить', kind: 'primary', value: null, onClick: () => { saveBackupFile(b.json, b.fileName).then(resolve); } },
+            ],
+          }).then((v) => { if (v) resolve(v); });
+        });
+      }
+      if (res === 'shared' || res === 'downloaded') {
+        await Storage.markBackupCreated(b.createdAt);
+        await paintLast();
+        flash(res === 'shared' ? 'Резервная копия создана ✓' : 'Файл резервной копии сформирован ✓');
+      }
+    } catch (err) {
+      await showDialog({ title: 'Не удалось создать копию', body: '<p>Попробуйте ещё раз.</p>', actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+    } finally {
+      exp.classList.remove('is-busy');
+    }
   });
-  card.appendChild(impLabel);
-  screen.appendChild(card);
+  actions.appendChild(exp);
+
+  const impLabel = el('<label class="btn-ghost">Восстановить из копии<input type="file" accept=".json,application/json" hidden></label>');
+  const input = $('input', impLabel);
+  input.addEventListener('change', async () => {
+    const file = input.files && input.files[0];
+    input.value = ''; // тот же файл можно выбрать повторно
+    if (!file) return;
+    impLabel.classList.add('is-busy');
+    try {
+      await restoreFlow(file);
+    } finally {
+      impLabel.classList.remove('is-busy');
+    }
+  });
+  actions.appendChild(impLabel);
+  screen.appendChild(actions);
+
+  screen.appendChild(el('<p class="empty" style="padding-top:14px">Перед восстановлением LexLife делает защитную копию текущих данных и при любой ошибке автоматически возвращает их.</p>'));
   return screen;
+}
+
+/* Выбор файла → проверка → предпросмотр → (подтверждение) → атомарное восстановление */
+async function restoreFlow(file) {
+  const fail = (msg) => showDialog({
+    title: 'Восстановление невозможно',
+    body: `<p>${esc(msg)}</p><p class="dialog__muted">Текущие данные не изменены.</p>`,
+    actions: [{ label: 'Понятно', value: true, kind: 'primary' }],
+  });
+  let prepared;
+  try {
+    if (file.size > 10 * 1024 * 1024) throw new BackupError('TOO_LARGE', 'Файл слишком большой для резервной копии LexLife.');
+    prepared = await Storage.prepareRestore(parseBackup(await file.text()));
+  } catch (err) {
+    await fail(err instanceof BackupError ? err.message : 'Не удалось прочитать файл резервной копии.');
+    return;
+  }
+
+  const { info, summary } = prepared;
+  const rows = [
+    ['Показатели', `${summary.metrics} ${plural(summary.metrics, 'запись', 'записи', 'записей')}`],
+    ['Лекарства', summary.meds],
+    ['Анализы', summary.tests],
+    ['Визиты', summary.visits],
+    ['Уведомления', summary.notifications],
+    ['Дни активности', summary.activityDays],
+  ];
+  const schemaLine = info.migrated ? `${info.schemaVersion} → будет обновлена до ${CURRENT_SCHEMA_VERSION}` : String(info.schemaVersion);
+  const skipped = prepared.ignoredKeys.length + prepared.strippedKeys;
+  const body = `
+    <ul class="dialog__list">
+      <li><span>Дата создания</span><span>${esc(info.createdAt ? fmtDateTime(info.createdAt) : 'неизвестна')}</span></li>
+      <li><span>Версия приложения</span><span>${esc(info.appVersion || 'неизвестна')}</span></li>
+      <li><span>Версия схемы</span><span>${esc(schemaLine)}</span></li>
+    </ul>
+    <ul class="dialog__list">
+      ${rows.map(([k, v]) => `<li><span>${esc(k)}</span><span>${esc(v)}</span></li>`).join('')}
+    </ul>
+    ${skipped ? `<p class="dialog__muted">Пропущено неизвестных разделов: ${skipped}.</p>` : ''}
+    <p class="dialog__warn">Восстановление заменит текущие данные LexLife данными из выбранной резервной копии.</p>
+  `;
+  const go = await showDialog({
+    title: 'Резервная копия LexLife',
+    body,
+    actions: [{ label: 'Отмена', value: false }, { label: 'Восстановить', value: true, kind: 'danger' }],
+  });
+  if (!go) { flash('Восстановление отменено'); return; }
+
+  try {
+    await Storage.restoreBackup(prepared);
+  } catch (err) {
+    await showDialog({
+      title: 'Ошибка восстановления',
+      body: `<p>${esc(err instanceof BackupError ? err.message : 'Не удалось восстановить данные.')}</p>`,
+      actions: [{ label: 'Понятно', value: true, kind: 'primary' }],
+    });
+    return;
+  }
+  applyTheme(getTheme());
+  await showDialog({
+    title: 'Готово',
+    body: '<p>Данные успешно восстановлены</p>',
+    actions: [{ label: 'Продолжить', value: true, kind: 'primary' }],
+  });
+  /* запись завершена и проверена — перезапуск, чтобы все экраны и напоминания перечитали базу */
+  location.hash = '#/home';
+  location.reload();
+}
+
+function plural(n, one, few, many) {
+  const m10 = n % 10, m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return one;
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+  return many;
 }
 
 async function ThemeScreen() {
@@ -952,7 +1116,7 @@ async function SettingsScreen() {
   const box = $('.list-card', list);
   [
     { route: 'theme', icon: '🌙', title: 'Тема оформления' },
-    { route: 'export', icon: '📤', title: 'Экспорт данных' },
+    { route: 'export', icon: '💾', title: 'Резервная копия' },
     { route: 'security', icon: '🔒', title: 'Безопасность' },
   ].forEach((m) => {
     const row = el(`<div class="row" role="button" data-route="${m.route}"><span class="row__icon">${m.icon}</span><div class="row__body"><p class="row__title">${esc(m.title)}</p></div><span class="row__chevron">›</span></div>`);
@@ -962,9 +1126,14 @@ async function SettingsScreen() {
   screen.appendChild(list);
 
   const danger = el('<section class="section"><div class="list-card"></div></section>');
-  const reset = el('<div class="row" role="button"><span class="row__icon">🗑️</span><div class="row__body"><p class="row__title" style="color:var(--red)">Сбросить все данные</p><p class="row__sub">Вернуться к чистой базе</p></div></div>');
+  const reset = el('<div class="row" role="button"><span class="row__icon">🗑️</span><div class="row__body"><p class="row__title" style="color:var(--red)">Сбросить все данные</p><p class="row__sub">Удалить все данные LexLife с этого устройства</p></div></div>');
   reset.addEventListener('click', async () => {
-    if (confirm('Сбросить все данные и начать с чистой базы?')) { await Storage.clearAll(); location.reload(); }
+    const ok = await showDialog({
+      title: 'Сбросить все данные',
+      body: '<p>Удалить все данные LexLife с этого устройства? Это действие нельзя отменить, если у вас нет резервной копии.</p>',
+      actions: [{ label: 'Отмена', value: false }, { label: 'Удалить данные', value: true, kind: 'danger' }],
+    });
+    if (ok) { await Storage.clearAll(); location.hash = '#/home'; location.reload(); }
   });
   $('.list-card', danger).appendChild(reset);
   screen.appendChild(danger);
@@ -995,7 +1164,7 @@ async function ActivityScreen() {
     const bike = el(`
       <div class="input-card">
         <div class="input-card__head"><span class="input-card__emoji">🚴</span><span class="input-card__title">Велотренажёр</span></div>
-        <div class="field"><label class="field__label">Длительность (минуты), цель ${goals.bike_minutes}</label><input class="input" type="number" inputmode="numeric" id="a-bike" value="${cur.bike ?? ''}" placeholder="0"></div>
+        <div class="field"><label class="field__label">Длительность (минуты), цель ${goals.bike_minutes}</label><input class="input" type="number" inputmode="numeric" id="a-bike" value="${esc(cur.bike ?? '')}" placeholder="0"></div>
         <label class="field__label">Интенсивность</label><div class="seg" id="a-intensity"></div>
       </div>
     `);
@@ -1006,10 +1175,10 @@ async function ActivityScreen() {
       seg.appendChild(b);
     });
     screen.appendChild(bike);
-    screen.appendChild(el(`<div class="input-card"><div class="input-card__head"><span class="input-card__emoji">👟</span><span class="input-card__title">Шаги</span></div><div class="field" style="margin:0"><label class="field__label">Количество, цель ${goals.steps}</label><input class="input" type="number" inputmode="numeric" id="a-steps" value="${cur.steps ?? ''}" placeholder="0"></div></div>`));
+    screen.appendChild(el(`<div class="input-card"><div class="input-card__head"><span class="input-card__emoji">👟</span><span class="input-card__title">Шаги</span></div><div class="field" style="margin:0"><label class="field__label">Количество, цель ${goals.steps}</label><input class="input" type="number" inputmode="numeric" id="a-steps" value="${esc(cur.steps ?? '')}" placeholder="0"></div></div>`));
     const plank = cur.plank || [];
     screen.appendChild(el(`<div class="input-card"><div class="input-card__head"><span class="input-card__emoji">🧘</span><span class="input-card__title">Планка</span></div><div class="field"><label class="field__label">Подходов</label><input class="input" type="number" inputmode="numeric" id="a-plank-sets" value="${plank.length || ''}" placeholder="0"></div><div class="field" style="margin:0"><label class="field__label">Секунд в подходе, цель ${goals.plank_seconds}</label><input class="input" type="number" inputmode="numeric" id="a-plank-sec" value="${plank[0] ?? ''}" placeholder="0"></div></div>`));
-    screen.appendChild(el(`<div class="input-card"><div class="input-card__head"><span class="input-card__emoji">➕</span><span class="input-card__title">Другое упражнение</span></div><div class="field"><label class="field__label">Тип</label><input class="input" type="text" id="a-other-type" value="${esc(cur.otherType ?? '')}" placeholder="напр. плавание"></div><div class="field" style="margin:0"><label class="field__label">Длительность (минуты)</label><input class="input" type="number" inputmode="numeric" id="a-other-min" value="${cur.otherMin ?? ''}" placeholder="0"></div></div>`));
+    screen.appendChild(el(`<div class="input-card"><div class="input-card__head"><span class="input-card__emoji">➕</span><span class="input-card__title">Другое упражнение</span></div><div class="field"><label class="field__label">Тип</label><input class="input" type="text" id="a-other-type" value="${esc(cur.otherType ?? '')}" placeholder="напр. плавание"></div><div class="field" style="margin:0"><label class="field__label">Длительность (минуты)</label><input class="input" type="number" inputmode="numeric" id="a-other-min" value="${esc(cur.otherMin ?? '')}" placeholder="0"></div></div>`));
     const save = el('<button class="btn-primary" type="button">Сохранить день</button>');
     save.addEventListener('click', onSave);
     screen.appendChild(save);
@@ -1046,7 +1215,7 @@ async function VisitsScreen() {
     const box = $('.list-card', sec);
     arr.forEach((v) => {
       const row = el(`
-        <div class="row" role="button" data-id="${v.id}" style="align-items:flex-start">
+        <div class="row" role="button" data-id="${esc(v.id)}" style="align-items:flex-start">
           <span class="row__icon">🩺</span>
           <div class="row__body">
             <p class="row__title">${esc(v.doctor || 'Визит')}</p>
@@ -1154,7 +1323,7 @@ async function VisitFormScreen(id) {
     const box = $('.vpick', sec);
     items.forEach((it) => {
       const on = sel.includes(it.id);
-      const b = el(`<button class="vpick__chip ${on ? 'is-on' : ''}" type="button" data-id="${it.id}">${render(it)}</button>`);
+      const b = el(`<button class="vpick__chip ${on ? 'is-on' : ''}" type="button" data-id="${esc(it.id)}">${render(it)}</button>`);
       b.addEventListener('click', () => { b.classList.toggle('is-on'); });
       box.appendChild(b);
     });
@@ -1569,6 +1738,28 @@ function backHeader(title, { label = 'Назад', onBack } = {}) {
 }
 function goBack() { if (history.length > 1) history.back(); else location.hash = '#/home'; }
 
+/* Модальный диалог: body — готовый HTML (данные экранируются вызывающим через esc).
+   actions: [{ label, value, kind: 'primary'|'danger', onClick }] — onClick вызывается
+   синхронно в обработчике касания (нужно для Share Sheet на iOS). → Promise<value> */
+function showDialog({ title, body = '', actions }) {
+  return new Promise((resolve) => {
+    const wrap = el('<div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-title"><div class="dialog__card"><h2 class="dialog__title" id="dlg-title"></h2><div class="dialog__body"></div><div class="dialog__actions"></div></div></div>');
+    $('.dialog__title', wrap).textContent = title;
+    $('.dialog__body', wrap).innerHTML = body;
+    const close = (v) => { document.removeEventListener('keydown', onKey); wrap.remove(); resolve(v); };
+    const onKey = (e) => { if (e.key === 'Escape') close(actions[0].value); };
+    actions.forEach((a) => {
+      const b = el(`<button type="button" class="dialog__btn${a.kind ? ` dialog__btn--${a.kind}` : ''}"></button>`);
+      b.textContent = a.label;
+      b.addEventListener('click', () => { if (a.onClick) a.onClick(); close(a.value); });
+      $('.dialog__actions', wrap).appendChild(b);
+    });
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(wrap);
+    $('.dialog__btn', wrap).focus();
+  });
+}
+
 let flashTimer;
 function flash(text) {
   let n = $('#flash');
@@ -1599,7 +1790,7 @@ const DRAWER_SECTIONS = [
   ],
   [
     { route: 'settings', icon: '⚙️', title: 'Настройки' },
-    { route: 'export', icon: '📤', title: 'Экспорт данных' },
+    { route: 'export', icon: '💾', title: 'Резервная копия' },
     { route: 'security', icon: '🔒', title: 'Безопасность' },
     { route: 'theme', icon: '🌙', title: 'Тема оформления' },
   ],
@@ -1608,7 +1799,7 @@ const DRAWER_SECTIONS = [
 async function buildDrawer() {
   const drawer = $('#drawer');
   const p = await Storage.getProfile();
-  const avatar = p.photo ? `<img class="drawer-avatar" src="${p.photo}" alt="">` : `<div class="drawer-avatar drawer-avatar--ph">👤</div>`;
+  const avatar = p.photo ? `<img class="drawer-avatar" src="${esc(p.photo)}" alt="">` : `<div class="drawer-avatar drawer-avatar--ph">👤</div>`;
   drawer.innerHTML = '';
   const head = el(`
     <button class="drawer-head" type="button" data-route="profile">

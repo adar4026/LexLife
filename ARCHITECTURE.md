@@ -14,7 +14,7 @@ PWA без фреймворков (чистый HTML/CSS/ES-модули), вс�
 | Платформа | PWA, устанавливается «на экран Домой» |
 | Код | Чистый HTML / CSS / JS (ES-модули), без сборки и зависимостей |
 | Хранение | `localStorage` через единый `StorageService` (async-first) |
-| Офлайн | Service Worker, кэш app-shell (`lexlife-v19`) |
+| Офлайн | Service Worker, кэш app-shell (`lexlife-v20`) |
 | Навигация | Hash-роутер (`#/route`, `#/metric/<key>`, `#/visit/<id>`) |
 | Тема | Тёмная/светлая, переключаемая (ключ `app_theme`) |
 
@@ -55,7 +55,7 @@ LexLife/
 ──────────────
 🏃 Активность   💧 Вода   🩺 Врачи и визиты
 ──────────────
-⚙️ Настройки   📤 Экспорт данных   🔒 Безопасность   🌙 Тема оформления
+⚙️ Настройки   💾 Резервная копия   🔒 Безопасность   🌙 Тема оформления
 ```
 Любой переход закрывает Drawer (`render()` вызывает `closeDrawer()`).
 
@@ -96,7 +96,7 @@ fallback → home
 | 🔔 Уведомления | `notifications` | Drawer | Центр уведомлений: 6 типов, вкл/выкл, время, периодичность, текст, «следующее срабатывание» (см. §8.5) |
 | 📅 Календарь | `calendar` | Drawer | Календарь здоровья: Месяц/Неделя/Список, агрегатор событий (см. §8.6) |
 | ⚙️ Настройки | `settings` | Drawer | Ссылки (Тема/Экспорт/Безопасность) + сброс данных + версия схемы |
-| 📤 Экспорт данных | `export` | Drawer | Скачать/восстановить JSON-бэкап |
+| 💾 Резервная копия | `export` | Drawer/Настройки | Создать JSON-бэкап (Share Sheet / скачивание) · восстановить с проверкой, предпросмотром и откатом (§7.1) |
 | 🌙 Тема оформления | `theme` | Drawer | Тёмная / Светлая |
 | 🎯/📈/🔒 | `goals` `stats` `security` | Drawer | Заглушки «Скоро» |
 
@@ -104,7 +104,7 @@ fallback → home
 
 ## 5. Модели данных
 
-Ключи `localStorage` (все пользовательские входят в бэкап `DATA_KEYS`, кроме служебного `health_meta` и `app_theme`).
+Ключи `localStorage`: все пользовательские входят в бэкап (`DATA_KEYS` → `data`, `app_theme` → `settings.theme`). Не входят: служебный `health_meta` (версия схемы — в заголовке бэкапа) и технические `lexlife_restore_rollback` (временная защитная копия на время restore), `lexlife_last_backup_at` (дата последнего созданного файла).
 
 ### 5.1 `health_meta` — служебное
 ```jsonc
@@ -212,7 +212,7 @@ fallback → home
 ```
 
 ### 5.10 Прочее
-- `app_theme` (`'dark'|'light'`) — UI-настройка, отдельно от данных, не в бэкапе.
+- `app_theme` (`'dark'|'light'`) — UI-настройка, отдельно от данных; в бэкапе — `settings.theme`.
 - Поле `attachments` на анализах/визитах — каркас (метаданные; бинарь — после `IndexedDbDriver`, §7).
 - **Календарь здоровья не имеет собственной модели** — это агрегатор поверх §5.6/5.8/5.7/5.4 (см. §8.6).
 
@@ -240,11 +240,33 @@ fallback → home
 1. **Единая точка доступа** — все экраны только через `Storage`.
 2. **Драйвер-адаптер (async-first)** — активен `LocalStorageDriver`; `IndexedDbDriver` — точка расширения (для больших данных и бинарных вложений). Публичный API возвращает `Promise`, экраны используют `await`.
 3. **`schemaVersion` + конвейер миграций** (§6).
-4. **Экспорт/импорт** — `exportBackup()` / `importBackup(json, mode)` (UI на экране «Экспорт данных»).
+4. **Резервная копия** — `createBackup/exportBackup` → `parseBackup` → `prepareRestore` → `restoreBackup` (UI на экране «Резервная копия», §7.1).
 5. **ISO-даты** — календарные `ГГГГ-ММ-ДД`, метки времени — полный ISO; локализация только в UI.
 6. **Вложения** — метаданные в записи; бинарь — через будущий `IndexedDbDriver`.
 
-Ключевые методы: показатели (`getMetricsConfig/getMetricConfig/getMetricGoal/setMetricGoal`, `getMetricLog/getMetricLatest/getMetricValue/setMetricValue/addMetricValue`), вода (`getWater/setWater/addWaterEntry/removeWaterEntry/getWaterRecord/getWaterStreak`), гидратация (`getHydration/setHydration`), профиль (`getProfile/setProfile`), визиты (`getVisits/getVisit/addVisit/updateVisit/removeVisit`), уведомления (`getNotifications/updateNotification`), плюс показатели здоровья (alerts/tests/meds), активность, лог лекарств, `exportBackup/importBackup`, `clearAll`.
+### 7.1 Резервная копия и восстановление
+
+Формат файла `LexLife-backup-ГГГГ-ММ-ДД-ЧЧММ.json` (не привязан к устройству):
+```jsonc
+{
+  "app": "lexlife",               // принимается также legacy "moe-zdorovie"
+  "backupFormatVersion": 2,       // 1 = ранний формат (без поля, дата в exportedAt)
+  "appVersion": "1.0.0",
+  "schemaVersion": 8,
+  "createdAt": "ISO",
+  "settings": { "theme": "dark" },
+  "data": { /* все 12 DATA_KEYS */ },
+  "blobs": {}                     // задел под вложения (§6.6)
+}
+```
+Конвейер (файл — недоверенный ввод):
+1. `parseBackup(text)` — только `JSON.parse`, лимит 10 МБ.
+2. `prepareRestore(raw)` — **ничего не пишет в базу**: проверка `app`, `backupFormatVersion`, `schemaVersion` (новее текущей → отказ «создана более новой версией LexLife»), `data`; whitelist ключей (неизвестные игнорируются); `__proto__/prototype/constructor` отбрасываются на любой глубине. Затем данные загружаются в песочницу (`MemoryDriver`), старая схема проходит те же `MIGRATIONS` (флаг `noDemoData` — без демо-истории), недостающие разделы получают значения по умолчанию, результат проверяется по структуре схемы v8 (`KEY_VALIDATORS`: типы, даты, время, безопасные id, фото только `data:image/...;base64`). Возвращает сводку для предпросмотра.
+3. `restoreBackup(prepared)` — атомарно: снимок текущих ключей → одна защитная копия `lexlife_restore_rollback` (+ в памяти) → запись → перечитывание и `verifyIntegrity()` → успех: копия удаляется; ошибка: откат из снимка. Если приложение закрылось посреди записи, `init()` откатывает при следующем запуске.
+
+Шифрование паролем — будущий формат с полем `encryption` вместо открытого `data`; расшифровка встанет между шагами 1 и 2. Текущая версия такие файлы отклоняет с понятным сообщением.
+
+Ключевые методы: показатели (`getMetricsConfig/getMetricConfig/getMetricGoal/setMetricGoal`, `getMetricLog/getMetricLatest/getMetricValue/setMetricValue/addMetricValue`), вода (`getWater/setWater/addWaterEntry/removeWaterEntry/getWaterRecord/getWaterStreak`), гидратация (`getHydration/setHydration`), профиль (`getProfile/setProfile`), визиты (`getVisits/getVisit/addVisit/updateVisit/removeVisit`), уведомления (`getNotifications/updateNotification`), плюс показатели здоровья (alerts/tests/meds), активность, лог лекарств, `createBackup/exportBackup/prepareRestore/restoreBackup/importBackup`, `clearAll`.
 
 ---
 
@@ -296,7 +318,7 @@ fallback → home
 ## 9. Тема, профиль, офлайн
 - **Тема** — `app_theme` в `localStorage`, `applyTheme()` ставит `data-theme` на `<html>`; светлая палитра в `[data-theme="light"]`.
 - **Профиль** — имя + аватар (фото сжимается в 200×200 JPEG, хранится data-URL).
-- **Service Worker** `lexlife-v19` — предкэш оболочки (HTML/CSS/JS/manifest/иконка) + кэш Google Fonts (stale-while-revalidate) + обработчик `notificationclick` (фокус/открытие приложения). Обновление ассетов — инкремент `CACHE_VERSION`.
+- **Service Worker** `lexlife-v20` — предкэш оболочки (HTML/CSS/JS/manifest/иконка) + кэш Google Fonts (stale-while-revalidate) + обработчик `notificationclick` (фокус/открытие приложения). Обновление ассетов — инкремент `CACHE_VERSION`.
 
 ---
 
@@ -331,4 +353,4 @@ fallback → home
 
 ---
 
-_Документ отражает фактический код на момент схемы v8 (SW `lexlife-v19`)._
+_Документ отражает фактический код на момент схемы v8 (SW `lexlife-v20`)._

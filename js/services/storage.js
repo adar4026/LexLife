@@ -42,6 +42,41 @@ const DATA_KEYS = [
   KEYS.activityDays, KEYS.activityGoals, KEYS.medLog,
 ];
 
+/* UI-настройка темы: хранится строкой (не JSON), живёт вне DATA_KEYS, но входит в бэкап (settings.theme) */
+const THEME_KEY = 'app_theme';
+const THEMES = ['dark', 'light'];
+
+/* ---------- Резервная копия (§6.4) ----------
+   Формат 1 — ранний (без backupFormatVersion, дата в exportedAt).
+   Формат 2 — текущий: метаданные + data (whitelist DATA_KEYS) + settings + blobs.
+   Задел под шифрование: зашифрованная копия будет отдельным форматом с полем
+   `encryption` и шифротекстом вместо `data`; расшифровка встанет между
+   parseBackup() и prepareRestore(), остальной конвейер не меняется. */
+export const BACKUP_FORMAT_VERSION = 2;
+const SUPPORTED_BACKUP_FORMATS = [1, 2];
+const BACKUP_MAX_BYTES = 10 * 1024 * 1024;
+/* Технические ключи (не пользовательские данные, в бэкап не входят) */
+const ROLLBACK_KEY = 'lexlife_restore_rollback'; // единственная временная копия на время restore
+const LAST_BACKUP_KEY = 'lexlife_last_backup_at'; // дата последнего созданного файла
+const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+
+/* Человекочитаемые названия разделов (сообщения об ошибках валидации) */
+const KEY_LABELS = {
+  [KEYS.alerts]: 'Предупреждения', [KEYS.tests]: 'Анализы', [KEYS.meds]: 'Лекарства', [KEYS.visits]: 'Визиты',
+  [KEYS.metrics]: 'Цели показателей', [KEYS.metricsLog]: 'История показателей', [KEYS.profile]: 'Профиль',
+  [KEYS.hydration]: 'План воды', [KEYS.notifications]: 'Уведомления', [KEYS.activityDays]: 'Активность',
+  [KEYS.activityGoals]: 'Цели активности', [KEYS.medLog]: 'Журнал приёма лекарств',
+};
+
+/* Ошибка бэкапа с кодом — UI показывает message как есть */
+export class BackupError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = 'BackupError';
+    this.code = code;
+  }
+}
+
 /* Референсные значения для цветовой индикации (из ТЗ) */
 export const REFERENCE = {
   chol: { good: 200, warn: 239, unit: 'mg/dl', label: 'Холестерин общий' },
@@ -70,6 +105,11 @@ export function dateKey(date = new Date()) {
   const m = String(date.getMonth() + 1).padStart(2, '0');
   const d = String(date.getDate()).padStart(2, '0');
   return `${y}-${m}-${d}`;
+}
+/* Имя файла бэкапа: LexLife-backup-ГГГГ-ММ-ДД-ЧЧММ.json (локальное время создания) */
+export function backupFileName(date = new Date()) {
+  const hm = `${String(date.getHours()).padStart(2, '0')}${String(date.getMinutes()).padStart(2, '0')}`;
+  return `LexLife-backup-${dateKey(date)}-${hm}.json`;
 }
 /* §6.5 — метка времени в полном ISO (UTC) */
 const nowISO = () => new Date().toISOString();
@@ -223,6 +263,176 @@ function normalizeVisit(v) {
 }
 
 /* =========================================================
+   §6.4 Валидация резервной копии — чистые функции, ничего не пишут.
+   Бэкап — недоверенный ввод: только whitelist ключей, строгие типы,
+   без опасных ключей (__proto__/prototype/constructor), без исполнения кода.
+   ========================================================= */
+
+const isPlainObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+const isNumOrNull = (v) => v == null || isNum(v);
+const isStrOrNull = (v) => v == null || typeof v === 'string';
+const isDateStr = (v) => typeof v === 'string' && (v === '' || /^\d{4}-\d{2}-\d{2}$/.test(v));
+const isDateOrNull = (v) => v == null || isDateStr(v);
+const isTimeStr = (v) => typeof v === 'string' && (v === '' || /^\d{2}:\d{2}$/.test(v));
+const isTimeOrNull = (v) => v == null || isTimeStr(v);
+const isSafeId = (v) => isNum(v) || (typeof v === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(v));
+const isIdList = (v) => v == null || (Array.isArray(v) && v.every(isSafeId));
+const PHOTO_RE = /^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/]+={0,2}$/;
+
+/* Глубокая копия JSON-значения: опасные ключи отбрасываются (не присваиваются —
+   сеттер __proto__ не вызывается), глубина ограничена. stats.stripped — счётчик. */
+function sanitizeJson(value, stats, depth = 0) {
+  if (depth > 24) throw new BackupError('CORRUPT', 'Резервная копия повреждена: слишком глубокая структура данных.');
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (Array.isArray(value)) return value.map((x) => sanitizeJson(x, stats, depth + 1));
+  if (typeof value === 'object') {
+    const out = {};
+    for (const k of Object.keys(value)) {
+      if (FORBIDDEN_KEYS.has(k)) { stats.stripped += 1; continue; }
+      out[k] = sanitizeJson(value[k], stats, depth + 1);
+    }
+    return out;
+  }
+  return null; // undefined/function/symbol в JSON не бывают — на всякий случай
+}
+
+const listOf = (pred) => (v) => Array.isArray(v) && v.every((x) => isPlainObj(x) && pred(x));
+const mapOf = (pred) => (v) => isPlainObj(v) && Object.entries(v).every(([k, x]) => pred(x, k));
+
+const METRIC_VALUE_OK = {
+  pressure: (x) => x == null || (isPlainObj(x) && isNumOrNull(x.systolic) && isNumOrNull(x.diastolic)),
+  water: (x) => x == null || (isPlainObj(x) && isNumOrNull(x.total) && (x.entries == null
+    || (Array.isArray(x.entries) && x.entries.every((e) => isPlainObj(e) && isTimeStr(e.t) && isNum(e.ml))))),
+};
+const metricValueOk = (m, x) => (METRIC_VALUE_OK[m] || isNumOrNull)(x);
+const NOTIF_TYPE_LIST = ['meds', 'water', 'pressure', 'weight', 'tests', 'visits'];
+
+/* Структура каждого ключа финальной схемы (CURRENT_SCHEMA_VERSION).
+   Поля, которые UI подставляет в разметку без экранирования (id, фото, числа, время),
+   проверяются строго; свободный текст — только тип string. */
+const KEY_VALIDATORS = {
+  [KEYS.alerts]: listOf((a) => a.id == null || isSafeId(a.id)),
+  [KEYS.tests]: listOf((t) => isDateStr(t.date) && (t.id == null || isSafeId(t.id)) && isStrOrNull(t.note)
+    && TEST_FIELDS.every((f) => isNumOrNull(t[f])) && (t.attachments == null || Array.isArray(t.attachments))),
+  [KEYS.meds]: listOf((m) => typeof m.name === 'string' && (m.id == null || isSafeId(m.id))
+    && isTimeOrNull(m.reminder_time) && isNumOrNull(m.every_days) && isDateOrNull(m.start) && isStrOrNull(m.end)
+    && isStrOrNull(m.icon) && isStrOrNull(m.dose) && isStrOrNull(m.purpose)),
+  [KEYS.visits]: listOf((v) => isSafeId(v.id) && isDateStr(v.date) && isDateOrNull(v.nextDate)
+    && ['doctor', 'specialty', 'clinic', 'reason', 'conclusion', 'recommendations', 'status'].every((f) => isStrOrNull(v[f]))
+    && (v.attachments == null || Array.isArray(v.attachments))
+    && (v.links == null || (isPlainObj(v.links) && isIdList(v.links.testIds) && isIdList(v.links.medIds) && isIdList(v.links.reminderIds)))),
+  [KEYS.metrics]: mapOf((c, m) => METRIC_KEYS.includes(m) && isPlainObj(c) && isStrOrNull(c.unit)
+    && (m === 'pressure' ? c.goal == null || (isPlainObj(c.goal) && isNumOrNull(c.goal.systolic) && isNumOrNull(c.goal.diastolic)) : isNumOrNull(c.goal))),
+  [KEYS.metricsLog]: mapOf((log, m) => METRIC_KEYS.includes(m) && mapOf((x, d) => isDateStr(d) && d !== '' && metricValueOk(m, x))(log)),
+  [KEYS.profile]: (p) => isPlainObj(p) && isStrOrNull(p.name) && (p.photo == null || (typeof p.photo === 'string' && PHOTO_RE.test(p.photo))),
+  [KEYS.hydration]: (h) => isPlainObj(h) && isTimeOrNull(h.wakeStart) && isTimeOrNull(h.wakeEnd) && isNumOrNull(h.slotMinutes)
+    && (h.notify == null || typeof h.notify === 'boolean'),
+  [KEYS.notifications]: listOf((n) => isSafeId(n.id) && NOTIF_TYPE_LIST.includes(n.type) && isTimeOrNull(n.time)
+    && isTimeOrNull(n.startTime) && isTimeOrNull(n.endTime) && isDateOrNull(n.date) && isNumOrNull(n.intervalMinutes)
+    && isStrOrNull(n.text) && isStrOrNull(n.repeat) && isStrOrNull(n.channel) && isStrOrNull(n.lastFiredAt)
+    && (n.enabled == null || typeof n.enabled === 'boolean')
+    && (n.days == null || (Array.isArray(n.days) && n.days.every((d) => Number.isInteger(d) && d >= 0 && d <= 6)))
+    && (n.ref == null || isPlainObj(n.ref))),
+  [KEYS.activityDays]: mapOf((a, d) => isDateStr(d) && d !== '' && isPlainObj(a) && isNumOrNull(a.bike) && isNumOrNull(a.steps)
+    && isNumOrNull(a.otherMin) && isStrOrNull(a.bikeIntensity) && isStrOrNull(a.otherType)
+    && (a.plank == null || (Array.isArray(a.plank) && a.plank.every(isNumOrNull)))),
+  [KEYS.activityGoals]: mapOf((x) => isNumOrNull(x)),
+  [KEYS.medLog]: mapOf((list, d) => isDateStr(d) && d !== '' && Array.isArray(list) && list.every((x) => typeof x === 'string')),
+};
+
+/* Проверка набора данных финальной схемы; бросает BackupError с названием раздела */
+function validateData(data) {
+  for (const k of DATA_KEYS) {
+    if (!KEY_VALIDATORS[k](data[k])) {
+      throw new BackupError('CORRUPT', `Резервная копия повреждена: некорректный раздел «${KEY_LABELS[k]}».`);
+    }
+  }
+}
+
+/* Ключи, допустимые во входном бэкапе конкретной схемы (whitelist).
+   water_log существовал в схемах v3 (до переноса в metrics_log в v4). */
+function allowedBackupKeys(schemaVersion) {
+  return schemaVersion < 4 ? [...DATA_KEYS, 'water_log'] : DATA_KEYS;
+}
+
+/* Краткая сводка для экрана предпросмотра */
+function summarize(data) {
+  const log = data[KEYS.metricsLog] || {};
+  const metricEntries = Object.values(log).reduce((s, byDay) => s + Object.keys(byDay || {}).length, 0);
+  return {
+    metrics: metricEntries,
+    meds: (data[KEYS.meds] || []).length,
+    tests: (data[KEYS.tests] || []).length,
+    visits: (data[KEYS.visits] || []).length,
+    notifications: (data[KEYS.notifications] || []).length,
+    activityDays: Object.keys(data[KEYS.activityDays] || {}).length,
+  };
+}
+
+/* Текст файла → объект. Только JSON.parse, никакого eval. */
+export function parseBackup(text) {
+  if (typeof text !== 'string' || !text.trim()) throw new BackupError('INVALID_JSON', 'Файл пуст или не является резервной копией LexLife.');
+  if (text.length > BACKUP_MAX_BYTES) throw new BackupError('TOO_LARGE', 'Файл слишком большой для резервной копии LexLife.');
+  let raw;
+  try { raw = JSON.parse(text); } catch {
+    throw new BackupError('INVALID_JSON', 'Файл повреждён: это не корректный JSON.');
+  }
+  if (!isPlainObj(raw)) throw new BackupError('INVALID_JSON', 'Файл не является резервной копией LexLife.');
+  return raw;
+}
+
+/* Проверка «конверта» бэкапа: приложение, формат, схема, data → нормализованная копия */
+function inspectBackup(raw) {
+  if (!isPlainObj(raw)) throw new BackupError('INVALID_JSON', 'Файл не является резервной копией LexLife.');
+  if (raw.app !== APP_ID && !LEGACY_APP_IDS.includes(raw.app)) {
+    throw new BackupError('NOT_LEXLIFE', 'Этот файл не является резервной копией LexLife.');
+  }
+  if (raw.encryption != null) {
+    throw new BackupError('ENCRYPTED', 'Зашифрованные резервные копии не поддерживаются этой версией LexLife. Обновите приложение.');
+  }
+  const format = raw.backupFormatVersion ?? 1;
+  if (!Number.isInteger(format)) throw new BackupError('UNSUPPORTED', 'Неизвестный формат резервной копии.');
+  const schema = raw.schemaVersion;
+  if (format > BACKUP_FORMAT_VERSION || (Number.isInteger(schema) && schema > CURRENT_SCHEMA_VERSION)) {
+    throw new BackupError('NEWER_VERSION', 'Эта резервная копия создана более новой версией LexLife. Обновите приложение перед восстановлением.');
+  }
+  if (!SUPPORTED_BACKUP_FORMATS.includes(format)) throw new BackupError('UNSUPPORTED', 'Неподдерживаемый формат резервной копии.');
+  if (!Number.isInteger(schema) || schema < 1) {
+    throw new BackupError('UNSUPPORTED', 'В резервной копии нет корректной версии схемы данных.');
+  }
+  if (!isPlainObj(raw.data)) throw new BackupError('NO_DATA', 'Резервная копия повреждена: нет раздела с данными.');
+
+  const stats = { stripped: 0 };
+  const allowed = allowedBackupKeys(schema);
+  const data = {};
+  const ignoredKeys = [];
+  for (const k of Object.keys(raw.data)) {
+    if (FORBIDDEN_KEYS.has(k)) { stats.stripped += 1; continue; }
+    if (!allowed.includes(k)) { ignoredKeys.push(k); continue; }
+    if (raw.data[k] == null) continue; // null = раздел не создавался — получит значение по умолчанию
+    data[k] = sanitizeJson(raw.data[k], stats);
+  }
+  if (!Object.keys(data).length) throw new BackupError('NO_DATA', 'Резервная копия не содержит данных LexLife.');
+
+  const createdAtRaw = raw.createdAt ?? raw.exportedAt ?? null;
+  const createdAt = typeof createdAtRaw === 'string' && !Number.isNaN(Date.parse(createdAtRaw)) ? createdAtRaw : null;
+  const theme = isPlainObj(raw.settings) && THEMES.includes(raw.settings.theme) ? raw.settings.theme : null;
+  return {
+    app: raw.app,
+    format,
+    schemaVersion: schema,
+    appVersion: typeof raw.appVersion === 'string' ? raw.appVersion.slice(0, 32) : null,
+    createdAt,
+    data,
+    theme,
+    ignoredKeys,
+    strippedKeys: stats.stripped,
+  };
+}
+
+/* =========================================================
    §6.2 Драйверы хранилища (адаптер). Единый интерфейс:
      get(key) -> string|null, set, remove, keys, clear
    Доменный слой не знает, какой драйвер активен.
@@ -246,6 +456,17 @@ class LocalStorageDriver {
   }
 }
 
+/* Драйвер в памяти — песочница для подготовки restore: бэкап загружается сюда,
+   прогоняется через те же MIGRATIONS и проверяется, не касаясь реальной базы. */
+class MemoryDriver {
+  constructor() { this.map = new Map(); }
+  async get(key) { return this.map.has(key) ? this.map.get(key) : null; }
+  async set(key, value) { this.map.set(key, String(value)); }
+  async remove(key) { this.map.delete(key); }
+  async keys() { return [...this.map.keys()]; }
+  async clear(prefixKeys) { (prefixKeys || [...this.map.keys()]).forEach((k) => this.map.delete(k)); }
+}
+
 /* Задел §6.2/§6.6: будущий драйвер для больших данных и бинарных вложений.
    В v1.0 не активен — оставлен как точка расширения интерфейса. */
 // eslint-disable-next-line no-unused-vars
@@ -267,7 +488,7 @@ const MIGRATIONS = [
   {
     to: 2,
     async run(svc) {
-      if ((await svc._read(KEYS.metrics, null)) == null) {
+      if (!svc.noDemoData && (await svc._read(KEYS.metrics, null)) == null) {
         await svc._write(KEYS.metrics, defaultVitals());
       }
     },
@@ -277,7 +498,7 @@ const MIGRATIONS = [
     to: 3,
     async run(svc) {
       if ((await svc._read('water_log', null)) == null) {
-        await svc._write('water_log', defaultWaterLog());
+        await svc._write('water_log', svc.noDemoData ? {} : defaultWaterLog());
       }
     },
   },
@@ -294,7 +515,7 @@ const MIGRATIONS = [
       if (oldWater && !mlog.water) mlog.water = oldWater;
 
       // 2) недостающим показателям — тестовая история
-      METRIC_KEYS.forEach((m) => { if (!mlog[m]) mlog[m] = genHistory(m); });
+      METRIC_KEYS.forEach((m) => { if (!mlog[m]) mlog[m] = svc.noDemoData ? {} : genHistory(m); });
 
       // 3) перенести текущие vitals из старого health_metrics в сегодняшнюю запись
       const oldHm = (await svc._read(KEYS.metrics, {})) || {};
@@ -383,6 +604,7 @@ class StorageService {
     this.KEYS = KEYS;
     this.dateKey = dateKey;
     this.uid = uid;
+    this.noDemoData = false; // true — песочница restore: миграции не добавляют демо-историю
   }
 
   /* ---- низкоуровневые (JSON поверх драйвера) ---- */
@@ -408,6 +630,7 @@ class StorageService {
   /* ---- инициализация: свежая установка → seed (финальная схема);
          существующие данные → конвейер миграций ---- */
   async init() {
+    await this._recoverInterruptedRestore();
     const meta = await this._read(KEYS.meta, null);
     if (!meta || !meta.seededAt) await this._seed();
     else await this._migrate();
@@ -434,6 +657,15 @@ class StorageService {
     const meta = await this._read(KEYS.meta, {});
     if (meta.seededAt) return;
 
+    await this._ensureDefaults();
+
+    meta.seededAt = nowISO();
+    meta.schemaVersion = CURRENT_SCHEMA_VERSION;
+    await this._write(KEYS.meta, meta);
+  }
+
+  /* недостающие разделы финальной схемы → значения по умолчанию (seed и restore) */
+  async _ensureDefaults() {
     if ((await this._read(KEYS.alerts, null)) == null) {
       await this._write(KEYS.alerts, []);
     }
@@ -457,10 +689,6 @@ class StorageService {
     if ((await this._read(KEYS.notifications, null)) == null) await this._write(KEYS.notifications, defaultNotifications());
     if ((await this._read(KEYS.activityDays, null)) == null) await this._write(KEYS.activityDays, {});
     if ((await this._read(KEYS.medLog, null)) == null) await this._write(KEYS.medLog, {});
-
-    meta.seededAt = nowISO();
-    meta.schemaVersion = CURRENT_SCHEMA_VERSION;
-    await this._write(KEYS.meta, meta);
   }
 
   /* ---- Предупреждения ---- */
@@ -756,62 +984,178 @@ class StorageService {
 
   /* =====================================================
      §6.4 Резервная копия JSON
+     Конвейер: exportBackup → файл → parseBackup → prepareRestore (проверка +
+     миграции в песочнице, без записи) → предпросмотр → restoreBackup (атомарно,
+     с защитной копией и откатом).
      ===================================================== */
   async exportBackup() {
     const data = {};
     for (const k of DATA_KEYS) data[k] = await this._read(k, null);
+    const theme = await this.driver.get(THEME_KEY);
     return {
       app: APP_ID,
+      backupFormatVersion: BACKUP_FORMAT_VERSION,
+      appVersion: APP_VERSION,
       schemaVersion: CURRENT_SCHEMA_VERSION,
-      exportedAt: nowISO(),
+      createdAt: nowISO(),
+      settings: { theme: THEMES.includes(theme) ? theme : null },
       data,
       blobs: {}, // §6.6: бинарные вложения добавятся вместе с IndexedDbDriver
     };
   }
 
-  async importBackup(backup, mode = 'replace') {
-    if (!backup || ![APP_ID, ...LEGACY_APP_IDS].includes(backup.app) || typeof backup.data !== 'object') {
-      throw new Error('Неверный формат резервной копии');
-    }
-    // §6.3: бэкап старой версии прогоняется через те же миграции
-    let from = backup.schemaVersion ?? 0;
-    for (const m of MIGRATIONS) {
-      if (m.to > from && m.to <= CURRENT_SCHEMA_VERSION) {
-        if (typeof m.runOnBackup === 'function') backup = m.runOnBackup(backup);
-        from = m.to;
-      }
-    }
-
-    for (const [key, value] of Object.entries(backup.data)) {
-      if (value == null || !DATA_KEYS.includes(key)) continue;
-      if (mode === 'merge') {
-        await this._mergeKey(key, value);
-      } else {
-        await this._write(key, value); // replace
-      }
-    }
-    const meta = await this._read(KEYS.meta, {});
-    meta.schemaVersion = CURRENT_SCHEMA_VERSION;
-    await this._write(KEYS.meta, meta);
-    return true;
+  /* Готовый файл бэкапа + самопроверка: созданную копию можно восстановить */
+  async createBackup() {
+    const backup = await this.exportBackup();
+    const json = JSON.stringify(backup, null, 2);
+    let verified = true;
+    try { await this.prepareRestore(parseBackup(json)); } catch { verified = false; }
+    return { json, fileName: backupFileName(new Date(backup.createdAt)), createdAt: backup.createdAt, verified };
   }
 
-  /* простое слияние: массивы — по id (новые добавляются), объекты-по-дате — assign */
-  async _mergeKey(key, incoming) {
-    const current = await this._read(key, Array.isArray(incoming) ? [] : {});
-    let merged;
-    if (Array.isArray(incoming)) {
-      const seen = new Set(current.map((x) => x.id));
-      merged = current.concat(incoming.filter((x) => !seen.has(x.id)));
-    } else {
-      merged = { ...current, ...incoming };
+  /* Дата последнего созданного файла (техническая отметка, в бэкап не входит) */
+  async getLastBackupAt() {
+    const v = await this.driver.get(LAST_BACKUP_KEY);
+    return v && !Number.isNaN(Date.parse(v)) ? v : null;
+  }
+  async markBackupCreated(iso = nowISO()) {
+    try { await this.driver.set(LAST_BACKUP_KEY, iso); } catch { /* не критично */ }
+  }
+
+  /* Проверка и подготовка к восстановлению — реальную базу НЕ трогает.
+     Бэкап загружается в песочницу (MemoryDriver), старая схема проходит через
+     те же MIGRATIONS, недостающие разделы получают значения по умолчанию,
+     результат проверяется по структуре финальной схемы. */
+  async prepareRestore(raw) {
+    const env = inspectBackup(raw);
+    const sandbox = new StorageService(new MemoryDriver());
+    sandbox.noDemoData = true; // в восстановленную базу не попадают демо-значения миграций
+    for (const [k, v] of Object.entries(env.data)) await sandbox.driver.set(k, JSON.stringify(v));
+    await sandbox.driver.set(KEYS.meta, JSON.stringify({ schemaVersion: env.schemaVersion }));
+    try {
+      if (env.schemaVersion < CURRENT_SCHEMA_VERSION) await sandbox._migrate();
+      await sandbox._ensureDefaults();
+    } catch {
+      throw new BackupError('MIGRATION_FAILED', 'Не удалось обновить данные из старой резервной копии: структура файла повреждена.');
     }
-    await this._write(key, merged);
+    const data = {};
+    for (const k of DATA_KEYS) data[k] = await sandbox._read(k, null);
+    validateData(data);
+    return {
+      info: {
+        app: env.app,
+        legacyApp: env.app !== APP_ID,
+        backupFormatVersion: env.format,
+        appVersion: env.appVersion,
+        schemaVersion: env.schemaVersion,
+        migrated: env.schemaVersion < CURRENT_SCHEMA_VERSION,
+        createdAt: env.createdAt,
+      },
+      data,
+      theme: env.theme,
+      summary: summarize(data),
+      ignoredKeys: env.ignoredKeys,
+      strippedKeys: env.strippedKeys,
+    };
+  }
+
+  /* Атомарное восстановление: либо новая база целиком, либо прежняя.
+     1) снимок текущих ключей → одна защитная копия (ROLLBACK_KEY) + в памяти;
+     2) запись всех ключей; 3) перечитывание и проверка;
+     4) ошибка → откат из снимка; успех → защитная копия удаляется.
+     Если приложение закрылось посреди записи — init() откатит при следующем запуске. */
+  async restoreBackup(prepared) {
+    if (!prepared || !isPlainObj(prepared.data)) throw new BackupError('INVALID', 'Нет подготовленной резервной копии.');
+    validateData(prepared.data);
+
+    const snapshot = {};
+    for (const k of [...DATA_KEYS, KEYS.meta, THEME_KEY]) snapshot[k] = await this.driver.get(k);
+    try {
+      await this.driver.set(ROLLBACK_KEY, JSON.stringify({ state: 'pending', createdAt: nowISO(), snapshot }));
+    } catch {
+      await this.driver.remove(ROLLBACK_KEY).catch(() => {});
+      throw new BackupError('NO_SPACE', 'Недостаточно места для защитной копии текущих данных. Восстановление отменено, данные не изменены.');
+    }
+
+    let curMeta = null;
+    try { curMeta = JSON.parse(snapshot[KEYS.meta]); } catch { /* нет или повреждён */ }
+    if (!isPlainObj(curMeta)) curMeta = {};
+    const plan = {};
+    for (const k of DATA_KEYS) plan[k] = JSON.stringify(prepared.data[k]);
+    plan[KEYS.meta] = JSON.stringify({
+      ...curMeta, schemaVersion: CURRENT_SCHEMA_VERSION, seededAt: curMeta.seededAt || nowISO(), restoredAt: nowISO(),
+    });
+    if (THEMES.includes(prepared.theme)) plan[THEME_KEY] = prepared.theme;
+
+    let summary;
+    try {
+      for (const [k, v] of Object.entries(plan)) await this.driver.set(k, v);
+      for (const [k, v] of Object.entries(plan)) {
+        if ((await this.driver.get(k)) !== v) throw new Error(`verify ${k}`);
+      }
+      summary = await this.verifyIntegrity();
+    } catch {
+      const rolledBack = await this._applySnapshot(snapshot);
+      if (rolledBack) await this.driver.remove(ROLLBACK_KEY).catch(() => {});
+      throw new BackupError('RESTORE_FAILED', rolledBack
+        ? 'Не удалось восстановить данные. Прежние данные возвращены без изменений.'
+        : 'Не удалось восстановить данные. Прежние данные будут возвращены при следующем запуске LexLife.');
+    }
+    await this.driver.remove(ROLLBACK_KEY);
+    return summary;
+  }
+
+  /* Перечитать базу через StorageService: схема, структура, основные геттеры */
+  async verifyIntegrity() {
+    const meta = await this._read(KEYS.meta, null);
+    if (!meta || meta.schemaVersion !== CURRENT_SCHEMA_VERSION) throw new Error('schemaVersion');
+    const data = {};
+    for (const k of DATA_KEYS) data[k] = await this._read(k, null);
+    validateData(data);
+    await Promise.all([
+      this.getTests(), this.getVisits(), this.getMeds(), this.getMetricsLog(), this.getMetricsConfig(),
+      this.getNotifications(), this.getProfile(), this.getHydration(), this.getAllActivity(), this.getGoals(),
+    ]);
+    return summarize(data);
+  }
+
+  /* Вернуть ключи из снимка (только управляемые ключи — не ключи из снимка) */
+  async _applySnapshot(snapshot) {
+    try {
+      for (const k of [...DATA_KEYS, KEYS.meta, THEME_KEY]) {
+        const v = snapshot[k];
+        if (typeof v === 'string') await this.driver.set(k, v);
+        else await this.driver.remove(k);
+      }
+      return true;
+    } catch (err) {
+      console.warn('[storage] откат не завершён', err && err.name);
+      return false;
+    }
+  }
+
+  /* Восстановление было прервано (закрытие приложения/сбой) — вернуть прежнюю базу */
+  async _recoverInterruptedRestore() {
+    let raw = null;
+    try { raw = await this.driver.get(ROLLBACK_KEY); } catch { return; }
+    if (raw == null) return;
+    let rb = null;
+    try { rb = JSON.parse(raw); } catch { /* повреждён — просто удалить */ }
+    if (rb && rb.state === 'pending' && isPlainObj(rb.snapshot)) {
+      if (!(await this._applySnapshot(rb.snapshot))) return; // повторим при следующем запуске
+      console.warn('[storage] прерванное восстановление отменено — возвращены прежние данные');
+    }
+    await this.driver.remove(ROLLBACK_KEY);
+  }
+
+  /* Совместимость со старым API: проверка + атомарная замена */
+  async importBackup(backup) {
+    return this.restoreBackup(await this.prepareRestore(backup));
   }
 
   /* полная очистка пользовательских данных (Настройки → сброс) */
   async clearAll() {
-    for (const k of [...DATA_KEYS, KEYS.meta]) await this.driver.remove(k);
+    for (const k of [...DATA_KEYS, KEYS.meta, ROLLBACK_KEY]) await this.driver.remove(k);
   }
 }
 

@@ -21,3 +21,8 @@
 # Logs / temp
 *.log
 .tmp/
+
+# LexLife backup files (personal health data — never commit)
+LexLife-backup-*.json
+lexlife-backup-*.json
+*.lexlife-backup.json
