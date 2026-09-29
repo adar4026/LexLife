@@ -8,7 +8,7 @@
 
 import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup } from './services/storage.js';
 import { createStatsEngine, evaluateWaterPlan, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay } from './services/analytics.js';
-import { parseWaterMinderCsv, assignImportKeys, buildWaterImportPlan, applyWaterImportPlan, applyTodayWaterImport } from './services/waterImport.js';
+import { parseWaterMinderCsv, assignImportKeys, buildWaterImportPlan, applyWaterImportPlan, applyTodayWaterImport, isWaterMinderKey } from './services/waterImport.js';
 import { lineChart, barChart as svgBarChart } from './ui/charts.js';
 
 /* ---------- DOM-помощники ---------- */
@@ -494,8 +494,8 @@ async function WaterScreen() {
   let editingGoal = false;
 
   async function paint() {
-    const [log, goal, record, streak, hyd] = await Promise.all([
-      Storage.getWaterLog(), Storage.getWaterGoal(), Storage.getWaterRecord(), Storage.getWaterStreak(), Storage.getHydration(),
+    const [log, goal, record, loggedStreak, goalStreak, hyd] = await Promise.all([
+      Storage.getWaterLog(), Storage.getWaterGoal(), Storage.getWaterRecord(), Storage.getWaterLoggedStreak(), Storage.getWaterStreak(), Storage.getHydration(),
     ]);
     const today = dateKey();
     const dayObj = log[today] || { total: 0, entries: [] };
@@ -556,7 +556,8 @@ async function WaterScreen() {
     screen.appendChild(el(`
       <div class="stat-row" style="margin-top:14px">
         <div class="stat"><div class="stat__num">${record ? L(record.total) : '0'}</div><div class="stat__label">рекорд дня, л</div></div>
-        <div class="stat"><div class="stat__num">${streak} 🔥</div><div class="stat__label">серия дней</div></div>
+        <div class="stat"><div class="stat__num">${loggedStreak} 🔥</div><div class="stat__label">дни с водой подряд</div></div>
+        <div class="stat"><div class="stat__num">${goalStreak}</div><div class="stat__label">цель выполнена подряд, дн.</div></div>
       </div>
     `));
     screen.appendChild(averagesBlock(log));
@@ -725,7 +726,8 @@ async function WaterScreen() {
 
   /* Журнал приёмов за сегодня (с удалением) */
   function journal(entries, day) {
-    const sec = el('<section class="section"><div class="section__head"><h2 class="section__title">Сегодня · приёмы</h2></div><div class="list-card" id="jbox"></div></section>');
+    const sec = el('<section class="section"><div class="section__head"><h2 class="section__title">Сегодня · приёмы</h2><button class="section__action" type="button" data-route="water-log">Все записи ›</button></div><div class="list-card" id="jbox"></div></section>');
+    $('.section__action', sec).addEventListener('click', onRouteClick);
     const box = $('#jbox', sec);
     if (!entries.length) { box.appendChild(el('<div class="empty">Пока нет приёмов</div>')); return sec; }
     entries.map((e, i) => ({ e, i })).sort((a, b) => b.e.t.localeCompare(a.e.t)).forEach(({ e, i }) => {
@@ -737,7 +739,7 @@ async function WaterScreen() {
         </div>
       `);
       $('.wdel', row).addEventListener('click', async () => {
-        if (confirm(`Удалить запись ${e.t} · ${e.ml} мл?`)) { await Storage.removeWaterEntry(i, day, { t: e.t, ml: e.ml }); await paint(); flash('Удалено'); }
+        if (confirm(`Удалить запись ${e.t} · ${e.ml} мл?`)) { await Storage.removeWaterEntry(i, day, { t: e.t, ml: e.ml, key: e.key ?? null }); await paint(); flash('Удалено'); }
       });
       box.appendChild(row);
     });
@@ -1108,14 +1110,14 @@ function plural(n, one, few, many) {
    удаляются и не перезаписываются. Сегодняшний день — отдельное действие:
    в LexLife к моменту импорта уже могут быть внесены сегодняшние записи вручную.
    ========================================================= */
-async function backupBeforeImport() {
+async function backupBeforeImport(cancelled = 'Импорт отменён') {
   let b;
   try {
     b = await Storage.createBackup();
   } catch {
     await showDialog({
       title: 'Не удалось создать резервную копию',
-      body: '<p>Импорт отменён, данные не изменены.</p>',
+      body: `<p>${esc(cancelled)}, данные не изменены.</p>`,
       actions: [{ label: 'Понятно', value: true, kind: 'primary' }],
     });
     return false;
@@ -1162,6 +1164,10 @@ async function WaterImportScreen() {
   const previewHost = el('<div></div>');
   screen.appendChild(previewHost);
 
+  const fixLink = el('<section class="section"><div class="list-card"><div class="row" role="button" data-route="water-log"><span class="row__icon">🗓️</span><div class="row__body"><p class="row__title">Журнал воды</p><p class="row__sub">Все записи по датам: добавить, изменить, перенести или удалить</p></div><span class="row__chevron">›</span></div></div></section>');
+  fixLink.addEventListener('click', onRouteClick);
+  screen.appendChild(fixLink);
+
   let state = null; // { parsed, planInfo }
 
   async function computePlan(rows) {
@@ -1187,6 +1193,7 @@ async function WaterImportScreen() {
         <li><span>Период в файле</span><span>${rangeLine}</span></li>
         <li><span>Будет добавлено</span><span>${plan.addedCount}</span></li>
         <li><span>Уже импортировано ранее (дубли)</span><span>${plan.duplicateCount}</span></li>
+        ${plan.removedByUserCount ? `<li><span>Удалены вами после импорта — не возвращаются</span><span>${plan.removedByUserCount}</span></li>` : ''}
         ${plan.csvTodayCount ? `<li><span>Сегодня, ${esc(fmtDate(today))}</span><span>${plan.csvTodayCount} в файле · ${plan.existingTodayManualCount} ручных уже в LexLife</span></li>` : ''}
       </ul>
     `));
@@ -1309,6 +1316,224 @@ async function WaterImportScreen() {
     }
   });
 
+  return screen;
+}
+
+/* =========================================================
+   Журнал воды (#/water-log[/ГГГГ-ММ | /ГГГГ-ММ-ДД]): все записи за все даты по месяцам,
+   сгруппированы по дням с итогом дня. Добавить запись (дата/время/объём), изменить
+   (в т.ч. перенести на другую дату), удалить. Правки адресуют запись по дню + индексу +
+   содержимому (+ ключу импорта), поэтому соседняя или внешне такая же запись не затрагивается.
+   Для дней с записями WaterMinder — массовое удаление «позже ЧЧ:ММ» с резервной копией.
+   ========================================================= */
+const WL_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const WL_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+async function WaterLogScreen(param) {
+  const screen = el('<div></div>');
+  const today = dateKey();
+  const curMonth = today.slice(0, 7);
+  let focusDay = WL_DATE_RE.test(param || '') ? param : null;
+  let month = focusDay ? focusDay.slice(0, 7) : (/^\d{4}-\d{2}$/.test(param || '') ? param : curMonth);
+  if (month > curMonth) month = curMonth;
+
+  const shiftMonth = (m, delta) => {
+    const [y, mo] = m.split('-').map(Number);
+    const d = new Date(y, mo - 1 + delta, 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  };
+  const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+  const monthTitle = (m) => { const [y, mo] = m.split('-').map(Number); return cap(new Date(y, mo - 1, 1).toLocaleDateString(RU, { month: 'long', year: 'numeric' })); };
+  const dayTitle = (d) => cap(new Date(`${d}T00:00:00`).toLocaleDateString(RU, { weekday: 'short', day: 'numeric', month: 'long' }));
+  const hasWater = (o) => !!o && (((o.entries || []).length > 0) || (o.total || 0) > 0);
+  const srcLabel = (e) => {
+    const drink = e.drink && e.drink !== 'Вода' ? ` · ${esc(e.drink)}${e.hydrationMl ? ` (${fmtMl(e.hydrationMl)} мл напитка)` : ''}` : '';
+    return `${isWaterMinderKey(e.key) ? 'WaterMinder' : 'вручную'}${drink}`;
+  };
+  const go = (m, d = null) => {
+    month = m;
+    focusDay = d;
+    history.replaceState(null, '', `#/water-log/${d || m}`);
+    paint();
+  };
+
+  async function paint() {
+    const log = await Storage.getWaterLog();
+    const days = Object.keys(log).filter((d) => d.startsWith(`${month}-`) && hasWater(log[d])).sort().reverse();
+    const monthEntries = days.reduce((s, d) => s + (log[d].entries || []).length, 0);
+    const monthTotal = days.reduce((s, d) => s + (log[d].total || 0), 0);
+    screen.innerHTML = '';
+    screen.appendChild(backHeader('Журнал воды', { label: 'Назад', onBack: goBack }));
+
+    const ctrl = el(`
+      <div class="input-card">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:8px">
+          <button class="btn-ghost" type="button" data-nav="-1" style="width:auto; margin:0; padding:8px 14px" aria-label="Предыдущий месяц">‹</button>
+          <b style="font-size:17px">${esc(monthTitle(month))}</b>
+          <button class="btn-ghost" type="button" data-nav="1" style="width:auto; margin:0; padding:8px 14px" aria-label="Следующий месяц" ${month >= curMonth ? 'disabled' : ''}>›</button>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:10px">
+          <label style="flex:1; min-width:0"><span class="field__label">Месяц</span><input class="input" type="month" id="wl-month" style="width:100%; min-width:0; box-sizing:border-box" value="${esc(month)}" max="${esc(curMonth)}"></label>
+          <label style="flex:1; min-width:0"><span class="field__label">Перейти к дате</span><input class="input" type="date" id="wl-goto" style="width:100%; min-width:0; box-sizing:border-box" max="${esc(today)}" value="${esc(focusDay || '')}"></label>
+        </div>
+        <p class="backup-note" style="margin-top:10px">За месяц: ${monthEntries} ${plural(monthEntries, 'запись', 'записи', 'записей')} · ${days.length} ${plural(days.length, 'день', 'дня', 'дней')} с водой · ${fmtMl(monthTotal)} мл</p>
+        <button class="btn-primary" type="button" id="wl-add" style="margin-top:6px">+ Добавить запись</button>
+      </div>
+    `);
+    ctrl.querySelectorAll('[data-nav]').forEach((b) => b.addEventListener('click', () => {
+      const m = shiftMonth(month, Number(b.dataset.nav));
+      if (m <= curMonth) go(m);
+    }));
+    $('#wl-month', ctrl).addEventListener('change', (ev) => { const v = ev.target.value; if (/^\d{4}-\d{2}$/.test(v) && v <= curMonth) go(v); });
+    $('#wl-goto', ctrl).addEventListener('change', (ev) => { const v = ev.target.value; if (WL_DATE_RE.test(v) && v <= today) go(v.slice(0, 7), v); });
+    $('#wl-add', ctrl).addEventListener('click', addEntry);
+    screen.appendChild(ctrl);
+
+    if (focusDay && !days.includes(focusDay)) {
+      screen.appendChild(el(`<p class="empty">${esc(fmtDate(focusDay))}: записей нет.</p>`));
+    }
+    if (!days.length) screen.appendChild(el('<p class="empty">В этом месяце записей воды нет.</p>'));
+
+    days.forEach((d) => {
+      const o = log[d];
+      const entries = (o.entries || []).map((e, i) => ({ e, i }));
+      const importedCount = entries.filter(({ e }) => isWaterMinderKey(e.key)).length;
+      const sec = el(`
+        <section class="section" id="wl-${d}">
+          <div class="section__head">
+            <h2 class="section__title" style="font-size:16px">${esc(dayTitle(d))}</h2>
+            <span style="display:flex; align-items:center; gap:6px"><b>${fmtMl(o.total || 0)} мл</b>${importedCount ? '<button class="section__action" type="button" data-bulk aria-label="Исправить ошибочную серию">⋯</button>' : ''}</span>
+          </div>
+          <div class="list-card"></div>
+        </section>
+      `);
+      if (d === focusDay) sec.style.outline = '2px solid var(--blue)';
+      const box = $('.list-card', sec);
+      if (!entries.length) box.appendChild(el('<div class="empty">Итог без разбивки по приёмам</div>'));
+      entries.forEach(({ e, i }) => {
+        const row = el(`
+          <div class="row">
+            <div class="row__body"><p class="row__title">${esc(e.t)} · +${fmtMl(e.ml)} мл</p><p class="row__sub">${srcLabel(e)}</p></div>
+            <button class="wdel" type="button" data-act="edit" aria-label="Редактировать запись ${esc(e.t)}">✎</button>
+            <button class="wdel" type="button" data-act="del" aria-label="Удалить запись ${esc(e.t)}">✕</button>
+          </div>
+        `);
+        $('[data-act="edit"]', row).addEventListener('click', () => editEntry(d, e, i));
+        $('[data-act="del"]', row).addEventListener('click', () => deleteEntry(d, e, i, o.total || 0));
+        box.appendChild(row);
+      });
+      const bulk = $('[data-bulk]', sec);
+      if (bulk) bulk.addEventListener('click', () => bulkRemoveImported(d, o));
+      screen.appendChild(sec);
+    });
+
+    if (focusDay) setTimeout(() => { const n = document.getElementById(`wl-${focusDay}`); if (n) n.scrollIntoView({ block: 'start' }); }, 60);
+  }
+
+  /* Форма записи: дату, фактическое время и объём задаёт пользователь */
+  async function entryForm(title, submit, v) {
+    let vals = null;
+    const ok = await showDialog({
+      title,
+      body: `
+        <label class="field__label" for="wl-d">Дата</label>
+        <input class="input" type="date" id="wl-d" value="${esc(v.date)}" max="${esc(today)}">
+        <label class="field__label" for="wl-t" style="margin-top:10px">Время</label>
+        <input class="input" type="time" id="wl-t" value="${esc(v.t)}">
+        <label class="field__label" for="wl-ml" style="margin-top:10px">Объём, мл</label>
+        <input class="input" type="number" id="wl-ml" min="1" max="5000" step="1" inputmode="numeric" value="${esc(v.ml)}">
+      `,
+      actions: [
+        { label: 'Отмена', value: false },
+        { label: submit, value: true, kind: 'primary', onClick: () => { vals = { date: $('#wl-d').value, t: $('#wl-t').value, ml: Number($('#wl-ml').value) }; } },
+      ],
+    });
+    if (!ok || !vals) return null;
+    if (!WL_DATE_RE.test(vals.date) || vals.date > today || !WL_TIME_RE.test(vals.t) || !(vals.ml > 0 && vals.ml <= 5000)) {
+      await showDialog({ title: 'Запись не сохранена', body: '<p>Укажите дату не позже сегодняшней, время ЧЧ:ММ и объём от 1 до 5000 мл.</p>', actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+      return null;
+    }
+    vals.ml = Math.round(vals.ml);
+    return vals;
+  }
+
+  async function addEntry() {
+    const now = new Date();
+    const t = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    const vals = await entryForm('Новая запись', 'Добавить', { date: focusDay || today, t, ml: 250 });
+    if (!vals) return;
+    await Storage.addWaterEntry(vals.ml, vals.date, vals.t);
+    flash(`+${fmtMl(vals.ml)} мл · ${fmtDate(vals.date)}`);
+    go(vals.date.slice(0, 7), vals.date);
+  }
+
+  async function editEntry(d, e, i) {
+    const vals = await entryForm('Редактировать запись', 'Сохранить', { date: d, t: e.t, ml: e.ml });
+    if (!vals) return;
+    const ok = await Storage.updateWaterEntry(d, i, { t: e.t, ml: e.ml, key: e.key ?? null }, vals);
+    if (!ok) {
+      await showDialog({ title: 'Запись не найдена', body: '<p>Данные изменились, пока была открыта форма. Ничего не изменено.</p>', actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+    } else {
+      flash(vals.date !== d ? `Перенесено на ${fmtDate(vals.date)}` : 'Сохранено ✓');
+    }
+    go(vals.date.slice(0, 7), vals.date);
+  }
+
+  async function deleteEntry(d, e, i, dayTotal) {
+    const ok = await showDialog({
+      title: 'Удалить запись?',
+      body: `<p>${esc(fmtDate(d))}, <b>${esc(e.t)} · ${fmtMl(e.ml)} мл</b> (${srcLabel(e)}).</p><p class="dialog__muted">Будет удалена только эта запись. Итог дня станет ${fmtMl(Math.max(0, dayTotal - e.ml))} мл.</p>`,
+      actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+    });
+    if (!ok) return;
+    const done = await Storage.removeWaterEntry(i, d, { t: e.t, ml: e.ml, key: e.key ?? null });
+    if (!done) {
+      await showDialog({ title: 'Запись не найдена', body: '<p>Данные изменились. Ничего не удалено.</p>', actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+    } else {
+      flash('Удалено');
+    }
+    go(month, d);
+  }
+
+  /* Массовое исправление: удалить импортированные записи дня позже ЧЧ:ММ (ручные не трогаем) */
+  async function bulkRemoveImported(d, o) {
+    const imported = (o.entries || []).filter((e) => isWaterMinderKey(e.key));
+    let after = null;
+    const ok = await showDialog({
+      title: 'Ошибочная серия из WaterMinder',
+      body: `
+        <p>${esc(fmtDate(d))}: удалить импортированные записи позже указанного времени. Ручные записи не затрагиваются.</p>
+        <label class="field__label" for="wl-after">Оставить записи до и включая</label>
+        <input class="input" type="time" id="wl-after" value="${esc(imported[imported.length - 1].t)}">
+      `,
+      actions: [{ label: 'Отмена', value: false }, { label: 'Далее', value: true, kind: 'primary', onClick: () => { after = $('#wl-after').value; } }],
+    });
+    if (!ok || !WL_TIME_RE.test(after || '')) return;
+    const victims = imported.filter((e) => e.t > after);
+    if (!victims.length) { flash(`Импортированных записей позже ${after} нет`); return; }
+    const sum = victims.reduce((s, e) => s + e.ml, 0);
+    const confirm2 = await showDialog({
+      title: 'Удалить ошибочные записи?',
+      body: `
+        <p>Будет удалено <b>${victims.length}</b> ${plural(victims.length, 'запись', 'записи', 'записей')} WaterMinder позже ${esc(after)} на ${fmtMl(sum)} мл.</p>
+        <p>Итог ${esc(fmtDate(d))}: ${fmtMl(o.total || 0)} → <b>${fmtMl((o.total || 0) - sum)} мл</b>.</p>
+        <p class="dialog__muted">Другие дни и ручные записи не затрагиваются. Повторный импорт CSV не вернёт удалённые записи. Перед удалением будет создана резервная копия.</p>
+      `,
+      actions: [{ label: 'Отмена', value: false }, { label: 'Создать копию и удалить', value: true, kind: 'danger' }],
+    });
+    if (!confirm2) return;
+    if (!(await backupBeforeImport('Удаление отменено'))) return;
+    const removed = await Storage.removeWaterEntriesWhere(d, (e) => isWaterMinderKey(e.key) && e.t > after);
+    const total = (await Storage.getWaterDay(d)).total || 0;
+    await showDialog({
+      title: 'Исправлено',
+      body: `<ul class="dialog__list"><li><span>Удалено записей</span><span>${removed.length}</span></li><li><span>Итог ${esc(fmtDate(d))}</span><span>${fmtMl(total)} мл</span></li></ul>`,
+      actions: [{ label: 'Готово', value: true, kind: 'primary' }],
+    });
+    go(month, d);
+  }
+
+  await paint();
   return screen;
 }
 
@@ -2365,8 +2590,8 @@ async function StatsScreen() {
       ['Цель', goal ? `${fmtN(goal)} мл` : '—', g && g.avgPctOfGoal != null ? `в среднем ${fmtN(g.avgPctOfGoal * 100)}% цели` : ''],
       ['Выполнение цели', g ? `${fmtN(g.pct * 100)}%` : '—', 'дней с записями'],
       ['Дней с целью', g ? `${g.daysMet} из ${g.daysWithData}` : '—', `записей нет: ${m.range.days - w.stats.days} дн.`],
-      ['Текущая серия', g ? `${g.currentStreak} ${daysWord(g.currentStreak)}` : '—', 'подряд с целью'],
-      ['Лучшая серия', g ? `${g.bestStreak} ${daysWord(g.bestStreak)}` : '—', 'за период'],
+      ['Цель выполнена подряд', g ? `${g.currentStreak} ${daysWord(g.currentStreak)}` : '—', 'текущая серия'],
+      ['Лучшая серия с целью', g ? `${g.bestStreak} ${daysWord(g.bestStreak)}` : '—', 'за период'],
     ];
     cardEl.appendChild(el(tiles(items)));
     sec.appendChild(cardEl);
@@ -2637,6 +2862,7 @@ function resolve() {
     if (rest.endsWith('/edit')) return { fn: () => VisitFormScreen(rest.slice(0, -5)), tab: null, main: false };
     return { fn: () => VisitDetailScreen(rest), tab: null, main: false };
   }
+  if (h === 'water-log' || h.startsWith('water-log/')) return { fn: () => WaterLogScreen(h.slice(10)), tab: 'metrics', main: false };
   if (h.startsWith('metric/')) {
     const k = h.slice(7);
     if (k === 'water') return { fn: WaterScreen, tab: 'metrics', main: true };

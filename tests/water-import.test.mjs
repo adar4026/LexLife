@@ -243,6 +243,151 @@ test('бэкап/восстановление остаются совмести�
   assert.equal(restoredLog['2026-09-18'].total, 900);
 });
 
+/* ---------- исправление ошибочной серии, журнал, серия дней ---------- */
+
+/* Синтетический «ошибочный день»: нормальная история до 22:41 (итог 2 900 мл), затем серия
+   повторных добавлений 23:xx (+3 000 мл), плюс ручная запись пользователя в 23:30. */
+const BAD_DAY = '2026-01-28';
+const BAD_DAY_CSV = [
+  HEADER,
+  'Вода,Кружка,"500","500",28/1/26,09:00,1%,"500","2.600"',
+  'Вода,Кружка,"800","800",28/1/26,13:00,1%,"1.300","2.600"',
+  'Вода,Кружка,"700","700",28/1/26,18:00,1%,"2.000","2.600"',
+  'Вода,Кружка,"650","650",28/1/26,22:10,1%,"2.650","2.600"',
+  'Вода,Кружка,"250","250",28/1/26,22:41,1%,"2.900","2.600"',
+  'Вода,Кружка,"250","250",28/1/26,23:08,1%,"3.150","2.600"',
+  'Вода,Кружка,"250","250",28/1/26,23:08,1%,"3.400","2.600"',
+  'Вода,Кружка,"250","250",28/1/26,23:08,1%,"3.650","2.600"',
+  'Вода,Кружка,"750","750",28/1/26,23:23,1%,"4.400","2.600"',
+  'Вода,Кружка,"1500","1500",28/1/26,23:34,1%,"5.900","2.600"',
+  'Вода,Кружка,"300","300",29/1/26,10:00,1%,"300","2.600"',
+  'Вода,Кружка,"3200","3200",27/9/25,12:00,1%,"3.200","2.600"', // «честный» рекорд в другом дне
+].join('\n');
+
+async function badDayScenario() {
+  const storage = new StorageService(new MemoryDriver());
+  await storage.init();
+  await storage.addWaterEntry(200, BAD_DAY, '23:30'); // ручная запись позже 22:41 — трогать нельзя
+  const rows = assignImportKeys(parseWaterMinderCsv(BAD_DAY_CSV).rows);
+  await applyWaterImportPlan(storage, buildWaterImportPlan(rows, await storage.getWaterLog(), TODAY));
+  return { storage, rows };
+}
+const isWm = (e) => typeof e.key === 'string' && e.key.startsWith('wm:');
+
+test('исправление дня: удаляются только импортированные записи позже 22:41, итог = 2 900 + ручная', async () => {
+  const { storage } = await badDayScenario();
+  assert.equal((await storage.getWaterDay(BAD_DAY)).total, 5900 + 200);
+  assert.equal((await storage.getWaterRecord()).date, BAD_DAY); // ошибочный день — «рекорд»
+
+  const removed = await storage.removeWaterEntriesWhere(BAD_DAY, (e) => isWm(e) && e.t > '22:41');
+  assert.equal(removed.length, 5);
+  const day = await storage.getWaterDay(BAD_DAY);
+  assert.equal(day.total, 2900 + 200);
+  assert.ok(day.entries.some((e) => e.t === '22:41' && e.ml === 250), 'запись 22:41 остаётся');
+  assert.ok(day.entries.some((e) => e.t === '23:30' && e.key == null), 'ручная запись 23:30 остаётся');
+  assert.equal((await storage.getWaterDay('2026-01-29')).total, 300, 'соседний день не тронут');
+  assert.deepEqual(await storage.getWaterRecord(), { date: '2025-09-27', total: 3200 }, 'рекорд пересчитан');
+});
+
+test('исправление дня: только импортированные — без ручной записи итог ровно 2 900', async () => {
+  const storage = new StorageService(new MemoryDriver());
+  await storage.init();
+  const rows = assignImportKeys(parseWaterMinderCsv(BAD_DAY_CSV).rows);
+  await applyWaterImportPlan(storage, buildWaterImportPlan(rows, await storage.getWaterLog(), TODAY));
+  await storage.removeWaterEntriesWhere(BAD_DAY, (e) => isWm(e) && e.t > '22:41');
+  assert.equal((await storage.getWaterDay(BAD_DAY)).total, 2900);
+});
+
+test('повторный импорт не возвращает удалённые пользователем записи', async () => {
+  const { storage, rows } = await badDayScenario();
+  await storage.removeWaterEntriesWhere(BAD_DAY, (e) => isWm(e) && e.t > '22:41');
+  const plan = buildWaterImportPlan(rows, await storage.getWaterLog(), TODAY);
+  assert.equal(plan.addedCount, 0);
+  assert.equal(plan.removedByUserCount, 5);
+  await applyWaterImportPlan(storage, plan);
+  assert.equal((await storage.getWaterDay(BAD_DAY)).total, 2900 + 200);
+});
+
+test('метки удаления переживают добавление ручной записи в тот же день и бэкап/восстановление', async () => {
+  const { storage, rows } = await badDayScenario();
+  await storage.removeWaterEntriesWhere(BAD_DAY, (e) => isWm(e) && e.t > '22:41');
+  await storage.addWaterEntry(100, BAD_DAY, '07:00');
+  const fresh = new StorageService(new MemoryDriver());
+  await fresh.restoreBackup(await fresh.prepareRestore(JSON.parse((await storage.createBackup()).json)));
+  const plan = buildWaterImportPlan(rows, await fresh.getWaterLog(), TODAY);
+  assert.equal(plan.addedCount, 0);
+  assert.equal(plan.removedByUserCount, 5);
+  assert.equal((await fresh.getWaterDay(BAD_DAY)).total, 2900 + 200 + 100);
+});
+
+test('удаление одной записи точное: из трёх одинаковых удаляется именно показанная', async () => {
+  const { storage, plan1 } = await runFullImportScenario();
+  await applyWaterImportPlan(storage, plan1);
+  const day = await storage.getWaterDay('2026-09-18');
+  const target = day.entries[1];
+  // устаревший индекс (0) + содержимое с ключом — удаляется запись с ключом :1
+  assert.equal(await storage.removeWaterEntry(0, '2026-09-18', { t: target.t, ml: target.ml, key: target.key }), true);
+  const keys = (await storage.getWaterDay('2026-09-18')).entries.map((e) => e.key).sort();
+  assert.deepEqual(keys, ['wm:2026-09-18|23:44|300|Вода:0', 'wm:2026-09-18|23:44|300|Вода:2']);
+  // запись, которой уже нет, — ничего не удаляется
+  assert.equal(await storage.removeWaterEntry(0, '2026-09-18', { t: '23:44', ml: 300, key: target.key }), false);
+  assert.equal((await storage.getWaterDay('2026-09-18')).entries.length, 2);
+  // ручная запись (key: null) не совпадает с импортированной того же времени/объёма
+  assert.equal(await storage.removeWaterEntry(0, '2026-09-18', { t: '23:44', ml: 300, key: null }), false);
+});
+
+test('редактирование: время/объём и перенос на другой день пересчитывают оба дня, ключ импорта сохраняется', async () => {
+  const { storage, withKeys, plan1 } = await runFullImportScenario();
+  await applyWaterImportPlan(storage, plan1);
+  const coffee = (await storage.getWaterDay('2026-09-20')).entries.find((e) => e.drink === 'Кофе');
+  const ok = await storage.updateWaterEntry('2026-09-20', 0, { t: coffee.t, ml: coffee.ml, key: coffee.key }, { date: '2026-09-21', t: '08:15', ml: 250 });
+  assert.equal(ok, true);
+  assert.equal((await storage.getWaterDay('2026-09-20')).total, 450);
+  const moved = (await storage.getWaterDay('2026-09-21')).entries[0];
+  assert.deepEqual({ t: moved.t, ml: moved.ml, key: moved.key, drink: moved.drink }, { t: '08:15', ml: 250, key: coffee.key, drink: 'Кофе' });
+  assert.equal((await storage.getWaterDay('2026-09-21')).total, 250);
+  // повторный импорт узнаёт перенесённую/исправленную запись — дубля нет
+  const plan2 = buildWaterImportPlan(withKeys, await storage.getWaterLog(), TODAY);
+  assert.equal(plan2.addedCount, 0);
+  // некорректный ввод отклоняется, данные не меняются
+  assert.equal(await storage.updateWaterEntry('2026-09-21', 0, { t: '08:15', ml: 250, key: coffee.key }, { t: '25:00', ml: 250 }), false);
+  assert.equal(await storage.updateWaterEntry('2026-09-21', 0, { t: '08:15', ml: 250, key: coffee.key }, { t: '08:15', ml: 0 }), false);
+});
+
+test('добавление записи с выбранной датой и временем попадает в свой день', async () => {
+  const storage = new StorageService(new MemoryDriver());
+  await storage.init();
+  await storage.addWaterEntry(330, '2026-03-15', '23:59');
+  await storage.addWaterEntry(120, '2026-03-16', '00:01');
+  assert.deepEqual((await storage.getWaterDay('2026-03-15')).entries, [{ t: '23:59', ml: 330 }]);
+  assert.equal((await storage.getWaterDay('2026-03-16')).total, 120);
+});
+
+test('серия учёта: дни подряд с хотя бы одной записью воды, независимо от цели', async () => {
+  const storage = new StorageService(new MemoryDriver());
+  await storage.init();
+  await storage.addWaterEntry(3000, '2026-09-26', '10:00');
+  await storage.addWaterEntry(200, '2026-09-28', '10:00'); // 27.09 — пусто
+  await storage.addWaterEntry(300, '2026-09-29', '10:00');
+  const today = new Date(2026, 8, 29, 22, 0);
+  assert.equal(await storage.getWaterLoggedStreak(today), 2);
+  // сегодня ещё нет записей — серия считается со вчера
+  assert.equal(await storage.getWaterLoggedStreak(new Date(2026, 8, 30, 8, 0)), 2);
+  // пропуск двух дней обнуляет серию
+  assert.equal(await storage.getWaterLoggedStreak(new Date(2026, 9, 1, 8, 0)), 0);
+});
+
+test('день, где удалены все приёмы, не считается днём с записью (средние/аналитика)', async () => {
+  const storage = new StorageService(new MemoryDriver());
+  await storage.init();
+  await storage.addWaterEntry(400, '2026-01-27', '21:15');
+  await storage.removeWaterEntry(0, '2026-01-27', { t: '21:15', ml: 400, key: null });
+  const day = await storage.getWaterDay('2026-01-27');
+  assert.equal(pickWater(day), null);
+  assert.equal(await storage.getWaterRecord(), null);
+  assert.equal(pickWater({ total: 1500, entries: [] }), 1500, 'легаси-итог без приёмов по-прежнему учитывается');
+});
+
 /* ---------- раннер ---------- */
 let passed = 0;
 let failed = 0;

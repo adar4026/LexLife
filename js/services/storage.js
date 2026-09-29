@@ -114,6 +114,26 @@ export function backupFileName(date = new Date()) {
   const hm = `${String(date.getHours()).padStart(2, '0')}${String(date.getMinutes()).padStart(2, '0')}`;
   return `LexLife-backup-${dateKey(date)}-${hm}.json`;
 }
+/* Вода: часть total дня без разбивки по приёмам (легаси-данные) — не теряется при правках */
+function waterExtra(day) {
+  const sum = (day.entries || []).reduce((s, e) => s + (Number(e && e.ml) || 0), 0);
+  return Math.max(0, (Number(day.total) || 0) - sum);
+}
+const sumMl = (entries) => entries.reduce((s, e) => s + (Number(e && e.ml) || 0), 0);
+/* Найти показанную на экране запись: сначала по индексу, затем по содержимому.
+   Если в expect есть key (null — ручная запись), он тоже должен совпасть. */
+function findWaterEntry(entries, idx, expect) {
+  const same = (e) => !!e && e.t === expect.t && e.ml === expect.ml
+    && (!('key' in expect) || (e.key ?? null) === (expect.key ?? null));
+  return same(entries[idx]) ? idx : entries.findIndex(same);
+}
+/* Ключи удалённых импортированных приёмов остаются в дне (removedKeys), чтобы повторный
+   импорт того же CSV не вернул запись, которую пользователь удалил сознательно. */
+function rememberRemovedKeys(day, removed) {
+  const keys = removed.map((e) => e && e.key).filter((k) => typeof k === 'string');
+  if (!keys.length) return;
+  day.removedKeys = [...new Set([...(Array.isArray(day.removedKeys) ? day.removedKeys : []), ...keys])];
+}
 /* §6.5 — метка времени в полном ISO (UTC) */
 const nowISO = () => new Date().toISOString();
 const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -766,27 +786,76 @@ export class StorageService {
     all.water = { ...(all.water || {}) };
     const cur = all.water[day] || { total: 0, entries: [] };
     const entries = [...(cur.entries || []), { t: time, ml: Math.round(ml) }].sort((a, b) => a.t.localeCompare(b.t));
-    const total = entries.reduce((s, e) => s + e.ml, 0);
-    all.water[day] = { total, entries };
+    const total = sumMl(entries) + waterExtra(cur);
+    all.water[day] = { ...cur, total, entries };
     await this._write(KEYS.metricsLog, all);
     return total;
   }
-  /* Удалить приём. expect ({ t, ml }) — какая запись показана на экране: если индекс
-     устарел (другая вкладка, смена суток), удаляется совпадающая запись, иначе ничего. */
+  /* Удалить приём. expect ({ t, ml[, key] }) — какая запись показана на экране: если индекс
+     устарел (другая вкладка, смена суток), удаляется совпадающая запись, иначе ничего.
+     С key совпадение точное: из внешне одинаковых импортированных записей удаляется именно
+     показанная. Удалённая импортированная запись запоминается (removedKeys). */
   async removeWaterEntry(idx, day = dateKey(), expect = null) {
     const all = await this.getMetricsLog();
     const cur = all.water && all.water[day];
-    if (!cur || !cur.entries) return;
-    const same = (e) => e && (!expect || (e.t === expect.t && e.ml === expect.ml));
-    if (!same(cur.entries[idx])) {
-      if (!expect) return; // неверный индекс без описания записи — ничего не удаляем
-      idx = cur.entries.findIndex(same);
-      if (idx < 0) return;
-    }
-    cur.entries.splice(idx, 1);
-    cur.total = cur.entries.reduce((s, e) => s + e.ml, 0);
+    if (!cur || !cur.entries) return false;
+    if (expect) idx = findWaterEntry(cur.entries, idx, expect);
+    if (idx < 0 || !cur.entries[idx]) return false;
+    const extra = waterExtra(cur);
+    const [removed] = cur.entries.splice(idx, 1);
+    cur.total = sumMl(cur.entries) + extra;
+    rememberRemovedKeys(cur, [removed]);
     all.water = { ...all.water, [day]: cur };
     await this._write(KEYS.metricsLog, all);
+    return true;
+  }
+  /* Удалить все записи дня, подходящие под pred(entry). Итог пересчитывается, «легаси»
+     остаток total (без разбивки по приёмам) сохраняется. → удалённые записи. */
+  async removeWaterEntriesWhere(day, pred) {
+    const all = await this.getMetricsLog();
+    const cur = all.water && all.water[day];
+    if (!cur || !Array.isArray(cur.entries)) return [];
+    const removed = cur.entries.filter(pred);
+    if (!removed.length) return [];
+    const extra = waterExtra(cur);
+    const entries = cur.entries.filter((e) => !pred(e));
+    const next = { ...cur, entries, total: sumMl(entries) + extra };
+    rememberRemovedKeys(next, removed);
+    all.water = { ...all.water, [day]: next };
+    await this._write(KEYS.metricsLog, all);
+    return removed;
+  }
+  /* Исправить приём: время, объём и (patch.date) дату — запись переносится в другой день
+     одной операцией записи. Прочие поля (key/drink/…) переезжают вместе с записью, поэтому
+     повторный импорт узнаёт её и не создаёт дубль. expect — как в removeWaterEntry.
+     → true, если запись найдена и сохранена. */
+  async updateWaterEntry(day, idx, expect, patch) {
+    const t = patch.t;
+    const ml = Math.round(Number(patch.ml));
+    const toDay = patch.date || day;
+    if (typeof t !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(t) || !(ml > 0)) return false;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(toDay)) return false;
+    const all = await this.getMetricsLog();
+    const water = { ...(all.water || {}) };
+    const cur = water[day];
+    if (!cur || !Array.isArray(cur.entries)) return false;
+    idx = findWaterEntry(cur.entries, idx, expect);
+    if (idx < 0) return false;
+    const byT = (a, b) => a.t.localeCompare(b.t);
+    const edited = { ...cur.entries[idx], t, ml };
+    const rest = cur.entries.filter((_, i) => i !== idx);
+    if (toDay === day) {
+      const entries = [...rest, edited].sort(byT);
+      water[day] = { ...cur, entries, total: sumMl(entries) + waterExtra(cur) };
+    } else {
+      water[day] = { ...cur, entries: rest, total: sumMl(rest) + waterExtra(cur) };
+      const dst = water[toDay] || { total: 0, entries: [] };
+      const entries = [...(dst.entries || []), edited].sort(byT);
+      water[toDay] = { ...dst, entries, total: sumMl(entries) + waterExtra(dst) };
+    }
+    all.water = water;
+    await this._write(KEYS.metricsLog, all);
+    return true;
   }
   /* Массовый импорт приёмов воды за много дней одной записью (например, разовый
      перенос истории из другого приложения). Только добавляет — существующие записи
@@ -806,7 +875,7 @@ export class StorageService {
       const extra = Math.max(0, (Number(cur.total) || 0) - priorSum);
       const entries = [...priorEntries, ...list].sort((a, b) => a.t.localeCompare(b.t));
       const total = entries.reduce((s, e) => s + (Number(e.ml) || 0), 0) + extra;
-      all.water[day] = { total, entries };
+      all.water[day] = { ...cur, total, entries };
     }
     await this._write(KEYS.metricsLog, all);
   }
@@ -819,6 +888,20 @@ export class StorageService {
       if (!best || t > best.total) best = { date: d, total: t };
     }
     return best && best.total > 0 ? best : null;
+  }
+  /* серия учёта: календарных дней подряд, в которые есть хотя бы одна запись воды
+     (включая сегодня; если сегодня записей ещё нет — считая со вчера) */
+  async getWaterLoggedStreak(today = new Date()) {
+    const log = await this.getMetricLog('water');
+    const has = (d) => {
+      const o = log[dateKey(d)];
+      return !!o && ((Array.isArray(o.entries) && o.entries.length > 0) || (o.total || 0) > 0);
+    };
+    let streak = 0;
+    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    if (!has(d)) d.setDate(d.getDate() - 1);
+    while (has(d)) { streak += 1; d.setDate(d.getDate() - 1); }
+    return streak;
   }
   /* серия: дней подряд с выполненной целью (включая/со вчера) */
   async getWaterStreak() {

@@ -118,9 +118,11 @@ export function toDailySeries(log, pick) {
 export const pickPoint = (x) => (isNum(x) && x > 0 ? x : null);
 export const pickSys = (x) => (isObj(x) && isNum(x.systolic) && x.systolic > 0 ? x.systolic : null);
 export const pickDia = (x) => (isObj(x) && isNum(x.diastolic) && x.diastolic > 0 ? x.diastolic : null);
-/* Вода: запись дня есть → total (включая реальный 0); без total — сумма приёмов */
+/* Вода: запись дня есть → total (включая реальный 0); без total — сумма приёмов.
+   День, где все приёмы удалены (entries: [] и total 0), — не измерение, а пустой день. */
 export const pickWater = (x) => {
   if (!isObj(x)) return null;
+  if (isNum(x.total) && x.total <= 0 && Array.isArray(x.entries) && !x.entries.length) return null;
   if (isNum(x.total)) return Math.max(0, x.total);
   if (Array.isArray(x.entries) && x.entries.length) return x.entries.reduce((s, e) => s + (isNum(e && e.ml) ? e.ml : 0), 0);
   return null;

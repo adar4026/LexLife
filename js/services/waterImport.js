@@ -140,7 +140,7 @@ export function assignImportKeys(rows, prefix = WATERMINDER_IMPORT_PREFIX) {
   });
 }
 
-function isWaterMinderKey(key, prefix = WATERMINDER_IMPORT_PREFIX) {
+export function isWaterMinderKey(key, prefix = WATERMINDER_IMPORT_PREFIX) {
   return typeof key === 'string' && key.startsWith(`${prefix}:`);
 }
 
@@ -157,16 +157,19 @@ function toEntry(row) {
    записи импортируются отдельным подтверждённым действием, а не автоматически). */
 export function buildWaterImportPlan(rows, existingWaterLog, todayKey) {
   const existingKeys = new Set();
+  const removedKeys = new Set(); // импортированные записи, удалённые пользователем, — не возвращать
   for (const day of Object.values(existingWaterLog || {})) {
     for (const e of (day && day.entries) || []) {
       if (e && typeof e.key === 'string') existingKeys.add(e.key);
     }
+    for (const k of (day && Array.isArray(day.removedKeys) ? day.removedKeys : [])) removedKeys.add(k);
   }
 
   const perDay = new Map(); // dateKey -> { csvCount, newCount, dupCount }
   const additionsByDay = {}; // исключая todayKey
   const todayAdditions = []; // [{ day, entry, row }]
   const duplicates = []; // строки, уже импортированные ранее (повторный запуск)
+  const removedByUser = []; // строки, которые были импортированы и затем удалены пользователем
   let minDate = null;
   let maxDate = null;
 
@@ -175,7 +178,9 @@ export function buildWaterImportPlan(rows, existingWaterLog, todayKey) {
     if (maxDate == null || r.dateKey > maxDate) maxDate = r.dateKey;
     const stat = perDay.get(r.dateKey) || { csvCount: 0, newCount: 0, dupCount: 0 };
     stat.csvCount += 1;
-    if (existingKeys.has(r.importKey)) {
+    if (removedKeys.has(r.importKey) && !existingKeys.has(r.importKey)) {
+      removedByUser.push(r);
+    } else if (existingKeys.has(r.importKey)) {
       stat.dupCount += 1;
       duplicates.push(r);
     } else {
@@ -205,6 +210,8 @@ export function buildWaterImportPlan(rows, existingWaterLog, todayKey) {
     additionsByDay,
     todayAdditions,
     duplicates,
+    removedByUser,
+    removedByUserCount: removedByUser.length,
     todayKey,
     addedCount,
     duplicateCount: duplicates.length,
