@@ -782,24 +782,46 @@ h1, h2, h3 {
 .scrim.open { opacity: 1; pointer-events: auto; }
 
 /* Панель Drawer (выезжает справа) */
+/* Прикреплена к обоим краям viewport (top/bottom: 0) — высота всегда равна видимой
+   области, в т.ч. в iOS PWA; 100vh/100dvh не нужны. Шапка профиля — сверху,
+   ниже — собственный scroll-контейнер (.drawer-scroll) с меню и footer. */
 .drawer {
   position: fixed;
   top: 0;
+  bottom: 0;
   right: 0;
-  height: 100%;
   width: 84%;
   max-width: 330px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   background: var(--bg);
   border-left: 1px solid var(--border);
   transform: translateX(100%);
   transition: transform 0.26s ease;
   z-index: 300;
-  overflow-y: auto;
-  padding-bottom: 24px;
 }
 .drawer.open { transform: translateX(0); }
+.drawer-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain; /* жест у края не уходит на страницу под шторкой */
+  padding-bottom: calc(var(--safe-bottom) + 24px); /* footer выше Home Indicator */
+}
+
+/* Открытая шторка: страница под ней зафиксирована (top задаётся из JS = -scrollY) */
+body.is-scroll-locked {
+  position: fixed;
+  left: 0;
+  right: 0;
+  width: 100%;
+  overflow: hidden;
+}
 
 .drawer-head {
+  flex-shrink: 0;
   width: 100%;
   border: 0;
   text-align: left;

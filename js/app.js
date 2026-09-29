@@ -1821,6 +1821,8 @@ async function buildDrawer() {
     </button>
   `);
   drawer.appendChild(head);
+  const scroller = el('<div class="drawer-scroll"></div>');
+  drawer.appendChild(scroller);
   DRAWER_SECTIONS.forEach((items) => {
     const sec = el('<div class="drawer-sec"></div>');
     items.forEach((it) => {
@@ -1832,16 +1834,53 @@ async function buildDrawer() {
         </button>
       `));
     });
-    drawer.appendChild(sec);
+    scroller.appendChild(sec);
   });
-  drawer.appendChild(appFooter());
+  scroller.appendChild(appFooter());
+  guardDrawerTouch(head, scroller);
   drawer.addEventListener('click', (e) => {
     const it = e.target.closest('[data-route]');
     if (it) { closeDrawer(); location.hash = `#/${it.getAttribute('data-route')}`; }
   });
 }
-function openDrawer() { $('#drawer').classList.add('open'); $('#scrim').classList.add('open'); }
-function closeDrawer() { $('#drawer').classList.remove('open'); $('#scrim').classList.remove('open'); }
+function openDrawer() { lockPageScroll(); $('#drawer').classList.add('open'); $('#scrim').classList.add('open'); }
+function closeDrawer() { $('#drawer').classList.remove('open'); $('#scrim').classList.remove('open'); unlockPageScroll(); }
+
+/* Блокировка прокрутки страницы под открытой шторкой (надёжно для iOS Safari/PWA:
+   overflow:hidden на body iOS игнорирует, поэтому body фиксируется на текущей позиции).
+   Идемпотентно: повторные open/close не накапливают состояние. */
+let lockedScrollY = null;
+function lockPageScroll() {
+  if (lockedScrollY !== null) return;
+  lockedScrollY = window.scrollY;
+  document.body.style.top = `-${lockedScrollY}px`;
+  document.body.classList.add('is-scroll-locked');
+}
+function unlockPageScroll() {
+  if (lockedScrollY === null) return;
+  const y = lockedScrollY;
+  lockedScrollY = null;
+  document.body.classList.remove('is-scroll-locked');
+  document.body.style.top = '';
+  window.scrollTo(0, y);
+}
+
+/* iOS: жест внутри шторки принадлежит только её scroll-контейнеру.
+   – у края прокрутки сдвигаем на 1px, чтобы iOS не передавал жест дальше (iOS < 16
+     не поддерживает overscroll-behavior);
+   – на шапке профиля (не прокручивается) вертикальный жест гасится. */
+function guardDrawerTouch(head, scroller) {
+  scroller.addEventListener('touchstart', () => {
+    const max = scroller.scrollHeight - scroller.clientHeight;
+    if (max <= 0) return;
+    if (scroller.scrollTop <= 0) scroller.scrollTop = 1;
+    else if (scroller.scrollTop >= max) scroller.scrollTop = max - 1;
+  }, { passive: true });
+  scroller.addEventListener('touchmove', (e) => {
+    if (scroller.scrollHeight <= scroller.clientHeight) e.preventDefault();
+  }, { passive: false });
+  head.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+}
 
 /* =========================================================
    Роутер
@@ -1892,6 +1931,8 @@ function initChrome() {
   $('#tab-bar').addEventListener('click', (e) => { const tab = e.target.closest('.tab'); if (tab) location.hash = `#/${tab.dataset.route}`; });
   $('#menu-btn').addEventListener('click', openDrawer);
   $('#scrim').addEventListener('click', closeDrawer);
+  /* затемнение не пропускает жест прокрутки на страницу (тап по-прежнему закрывает) */
+  $('#scrim').addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
 }
 
 function registerSW() {
