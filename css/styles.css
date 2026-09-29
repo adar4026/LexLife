@@ -1049,3 +1049,17 @@ textarea.input { resize: vertical; font-family: inherit; }
 .dialog__btn--primary { background: var(--green); border-color: var(--green); color: #0b2912; }
 .dialog__btn--danger { background: var(--red); border-color: var(--red); color: #fff; }
 .dialog__btn:active { filter: brightness(0.92); }
+
+/* ---------- О приложении / footer с версией (по образцу LexCar) ---------- */
+.group-label {
+  margin: 22px 0 10px 14px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--text2);
+}
+.app-footer { text-align: center; padding: 18px 16px 6px; }
+.drawer .app-footer { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 14px; }
+.app-footer__name { margin: 0; font-size: 12px; font-weight: 600; color: var(--text); }
+.app-footer__date { margin: 2px 0 0; font-size: 11px; color: var(--text2); opacity: 0.8; }

@@ -6,7 +6,7 @@
    Показатели — единая модель: каждый показатель = модуль #/metric/<key>.
    ========================================================= */
 
-import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, CURRENT_SCHEMA_VERSION, BackupError, parseBackup } from './services/storage.js';
+import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup } from './services/storage.js';
 
 /* ---------- DOM-помощники ---------- */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -1137,8 +1137,21 @@ async function SettingsScreen() {
   });
   $('.list-card', danger).appendChild(reset);
   screen.appendChild(danger);
-  screen.appendChild(el(`<p class="empty">LexLife • версия ${esc(APP_VERSION)}</p>`));
+  screen.appendChild(el(`
+    <section class="section">
+      <h2 class="group-label">О приложении</h2>
+      <div class="list-card">
+        <div class="row"><div class="row__body"><p class="row__title">Версия приложения</p></div><span class="row__trailing">${esc(APP_VERSION)}</span></div>
+      </div>
+    </section>
+  `));
+  screen.appendChild(appFooter());
   return screen;
+}
+
+/* Footer с версией (Настройки, Drawer): номер — из APP_VERSION, дата релиза — из APP_UPDATED */
+function appFooter() {
+  return el(`<footer class="app-footer"><p class="app-footer__name">LexLife · v${esc(APP_VERSION)}</p><p class="app-footer__date">Обновлено: ${esc(APP_UPDATED)}</p></footer>`);
 }
 
 /* ---------- под-экран: Активность ---------- */
@@ -1821,6 +1834,7 @@ async function buildDrawer() {
     });
     drawer.appendChild(sec);
   });
+  drawer.appendChild(appFooter());
   drawer.addEventListener('click', (e) => {
     const it = e.target.closest('[data-route]');
     if (it) { closeDrawer(); location.hash = `#/${it.getAttribute('data-route')}`; }

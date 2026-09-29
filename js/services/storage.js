@@ -18,6 +18,9 @@ export const CURRENT_SCHEMA_VERSION = 8;
 /* Версия приложения (UI/маркетинг) — отдельно от CURRENT_SCHEMA_VERSION (схема данных).
    Меняется при релизах, не влияет на миграции/хранение. */
 export const APP_VERSION = '1.0.0';
+/* Месяц релиза текущей APP_VERSION (показывается в UI как есть). Меняется вручную
+   при выпуске новой версии вместе с APP_VERSION — не вычисляется из даты устройства. */
+export const APP_UPDATED = 'сентябрь 2026';
 
 /* Ключи: health_metrics (v2, теперь конфиг) + metrics_log (v4, единая история) */
 export const KEYS = {
