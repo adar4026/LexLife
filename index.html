@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no"
+  />
+  <meta name="theme-color" content="#0d1117" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="LexLife" />
+  <meta name="description" content="Личное приложение здоровья: анализы, активность, лекарства, визиты — всё офлайн." />
+  <title>LexLife</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icons/lexlife-icon-180.png" />
+
+  <!-- Шрифты из ТЗ: Unbounded (заголовки), Mulish (тело) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Unbounded:wght@600;700;800&family=Mulish:wght@400;600;700;800&display=swap"
+    rel="stylesheet"
+  />
+
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <div class="app" id="app">
+    <!-- Кнопка бокового меню (на основных экранах) -->
+    <button class="menu-btn" id="menu-btn" type="button" aria-label="Меню">☰</button>
+
+    <main class="screen" id="screen" role="main"></main>
+
+    <!-- Нижний таб-бар: Главная · Показатели · Лекарства · Анализы -->
+    <nav class="tab-bar" id="tab-bar" role="navigation" aria-label="Основная навигация">
+      <button class="tab" data-route="home" type="button">
+        <span class="tab__emoji" aria-hidden="true">🏠</span>
+        <span class="tab__label">Главная</span>
+      </button>
+      <button class="tab" data-route="metrics" type="button">
+        <span class="tab__emoji" aria-hidden="true">📊</span>
+        <span class="tab__label">Показатели</span>
+      </button>
+      <button class="tab" data-route="meds" type="button">
+        <span class="tab__emoji" aria-hidden="true">💊</span>
+        <span class="tab__label">Лекарства</span>
+      </button>
+      <button class="tab" data-route="tests" type="button">
+        <span class="tab__emoji" aria-hidden="true">🩸</span>
+        <span class="tab__label">Анализы</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- Боковое меню (Drawer) + затемнение -->
+  <div class="scrim" id="scrim"></div>
+  <aside class="drawer" id="drawer" aria-label="Боковое меню"></aside>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

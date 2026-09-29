@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Claude Code local tooling (dev-only, not part of the shipped app)
+.claude/
+
+# Secrets / env
+.env
+.env.*
+*.pem
+*.key
+
+# Editor
+.vscode/
+.idea/
+
+# Logs / temp
+*.log
+.tmp/
