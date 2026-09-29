@@ -756,21 +756,33 @@ class StorageService {
   async getWaterEntries(day = dateKey()) { return (await this.getWaterDay(day)).entries || []; }
   async getWaterGoal() { return (await this.getMetricGoal('water')) || 2500; }
   async setWaterGoal(ml) { return this.setMetricGoal('water', Math.round(ml)); }
-  async addWaterEntry(ml, day = dateKey(), t) {
+  /* Приём воды. Без day/t — фактические локальные дата и время нажатия, взятые из ОДНОГО
+     момента (около полуночи дата и время не разойдутся). План дня время записи не меняет. */
+  async addWaterEntry(ml, day, t) {
+    const now = new Date();
+    day = day || dateKey(now);
+    const time = t || `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
     const all = await this.getMetricsLog();
     all.water = { ...(all.water || {}) };
     const cur = all.water[day] || { total: 0, entries: [] };
-    const time = t || new Date().toTimeString().slice(0, 5);
     const entries = [...(cur.entries || []), { t: time, ml: Math.round(ml) }].sort((a, b) => a.t.localeCompare(b.t));
     const total = entries.reduce((s, e) => s + e.ml, 0);
     all.water[day] = { total, entries };
     await this._write(KEYS.metricsLog, all);
     return total;
   }
-  async removeWaterEntry(idx, day = dateKey()) {
+  /* Удалить приём. expect ({ t, ml }) — какая запись показана на экране: если индекс
+     устарел (другая вкладка, смена суток), удаляется совпадающая запись, иначе ничего. */
+  async removeWaterEntry(idx, day = dateKey(), expect = null) {
     const all = await this.getMetricsLog();
     const cur = all.water && all.water[day];
     if (!cur || !cur.entries) return;
+    const same = (e) => e && (!expect || (e.t === expect.t && e.ml === expect.ml));
+    if (!same(cur.entries[idx])) {
+      if (!expect) return; // неверный индекс без описания записи — ничего не удаляем
+      idx = cur.entries.findIndex(same);
+      if (idx < 0) return;
+    }
     cur.entries.splice(idx, 1);
     cur.total = cur.entries.reduce((s, e) => s + e.ml, 0);
     all.water = { ...all.water, [day]: cur };

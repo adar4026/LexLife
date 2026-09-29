@@ -54,6 +54,38 @@ export function isUserGoal(cfg, metric) {
   return !Object.keys(cfg).some((m) => m !== metric && isObj(cfg[m]) && cfg[m].at === c.at);
 }
 
+/* ---------- план воды на день: статусы порций по фактическим записям ----------
+   slots: [{ time (мин от полуночи), ml }] по возрастанию; entries: [{ t: 'ЧЧ:ММ', ml }];
+   nowMin — текущее время (мин); endMin — конец окна бодрствования (мин).
+   Запись относится к окну своей порции: [начало порции, начало следующей); записи до первой
+   порции — к первой, после последней — к последней. Излишек переносится только ВПЕРЁД
+   (выпито заранее → покрывает следующие порции), назад — никогда: вода, выпитая в 21:16,
+   не закрывает пропущенную порцию 18:00. Время самих записей не меняется.
+   Статус: done — порция покрыта; current — идёт её окно; missed — окно закрылось без
+   полного объёма; upcoming — ещё не наступила. got — сколько засчитано порции. */
+const hmToMin = (s) => { const [h, m] = String(s).split(':').map(Number); return h * 60 + m; };
+export function evaluateWaterPlan(slots, entries, nowMin, endMin) {
+  const n = slots.length;
+  const vol = new Array(n).fill(0);
+  for (const e of Array.isArray(entries) ? entries : []) {
+    if (!e || !isNum(e.ml) || e.ml <= 0 || typeof e.t !== 'string' || !/^\d{2}:\d{2}$/.test(e.t)) continue;
+    const t = hmToMin(e.t);
+    let i = 0;
+    while (i + 1 < n && t >= slots[i + 1].time) i += 1;
+    vol[i] += e.ml;
+  }
+  let carry = 0;
+  return slots.map((s, i) => {
+    const deadline = i + 1 < n ? slots[i + 1].time : (isNum(endMin) && endMin > s.time ? endMin : s.time + 60);
+    const avail = carry + vol[i];
+    const base = { time: s.time, ml: s.ml, deadline, inWindow: vol[i] };
+    if (avail >= s.ml) { carry = avail - s.ml; return { ...base, status: 'done', got: s.ml }; }
+    carry = 0;
+    const status = nowMin >= deadline ? 'missed' : nowMin >= s.time ? 'current' : 'upcoming';
+    return { ...base, status, got: avail };
+  });
+}
+
 /* ---------- даты ---------- */
 export function dayNum(iso) {
   const [y, m, d] = iso.split('-').map(Number);

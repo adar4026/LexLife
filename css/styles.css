@@ -955,6 +955,10 @@ body.is-scroll-locked {
 .plan-row--done .plan-row__time { color: var(--text2); }
 .plan-row--now { background: rgba(88, 166, 255, 0.08); }
 .plan-row--now .plan-row__icon, .plan-row--now .plan-row__time { color: var(--blue); }
+.plan-row--missed .plan-row__icon { color: var(--orange); }
+.plan-row--missed .plan-row__time { color: var(--text2); }
+.plan-note { font-size: 12px; color: var(--text2); }
+.plan-hint { margin: 8px 4px 0; font-size: 12px; line-height: 1.4; color: var(--text2); }
 
 .rs-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--border); }
 .rs-row:last-child { border-bottom: 0; }

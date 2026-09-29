@@ -7,7 +7,7 @@
    ========================================================= */
 
 import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup } from './services/storage.js';
-import { createStatsEngine, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay } from './services/analytics.js';
+import { createStatsEngine, evaluateWaterPlan, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay } from './services/analytics.js';
 import { lineChart, barChart as svgBarChart } from './ui/charts.js';
 
 /* ---------- DOM-помощники ---------- */
@@ -532,11 +532,11 @@ async function WaterScreen() {
     screen.appendChild(quickBar());
 
     /* 4. План гидратации по времени + 5. отставание/опережение */
-    screen.appendChild(planSection(goal, hyd, total));
+    screen.appendChild(planSection(goal, hyd, dayObj.entries || []));
     screen.appendChild(deviationSection(goal, hyd, total));
 
     /* 6. История за день */
-    screen.appendChild(journal(dayObj.entries, goal));
+    screen.appendChild(journal(dayObj.entries || [], today));
 
     /* 7. Графики неделя/месяц/год */
     const seg = el(`
@@ -564,27 +564,33 @@ async function WaterScreen() {
     screen.appendChild(reminderSettings(hyd));
   }
 
-  /* План гидратации (фиксированные слоты) */
-  function planSection(goal, hyd, total) {
+  /* План гидратации (фиксированные слоты) — только ориентир. Статус порции считается по
+     фактическим записям и их времени (evaluateWaterPlan): запись не переносится назад к
+     первой незакрытой порции, время записи не меняется. */
+  const PLAN_ROW = {
+    done: { icon: '✓', cls: 'plan-row--done', text: (p, now) => (now < p.time ? 'выполнено заранее' : 'выполнено') },
+    current: { icon: '•', cls: 'plan-row--now', text: (p) => `сейчас${p.got ? ` · засчитано ${fmtMl(p.got)} из ${fmtMl(p.ml)} мл` : ''}` },
+    missed: { icon: '✕', cls: 'plan-row--missed', text: (p) => `пропущено${p.got ? ` · засчитано ${fmtMl(p.got)} из ${fmtMl(p.ml)} мл` : ''}` },
+    upcoming: { icon: '○', cls: '', text: () => '' },
+  };
+  function planSection(goal, hyd, entries) {
     const slots = buildPlan(goal, hyd);
     const now = nowMinutes();
-    const sec = el('<section class="section"><div class="section__head"><h2 class="section__title">План на день</h2></div><div class="list-card" id="planbox"></div></section>');
+    const plan = evaluateWaterPlan(slots, entries, now, hhmmToMin(hyd.wakeEnd));
+    const sec = el('<section class="section"><div class="section__head"><h2 class="section__title">План на день</h2><span class="plan-note">ориентир</span></div><div class="list-card" id="planbox"></div></section>');
     const box = $('#planbox', sec);
-    let currentSet = false;
-    slots.forEach((s) => {
-      const done = total >= s.cum;
-      const current = !done && !currentSet;
-      if (current) currentSet = true;
-      const icon = done ? '✓' : current ? '•' : '○';
-      const cls = done ? 'plan-row--done' : current ? 'plan-row--now' : '';
+    plan.forEach((p) => {
+      const v = PLAN_ROW[p.status];
+      const extra = v.text(p, now);
       box.appendChild(el(`
-        <div class="row plan-row ${cls}">
-          <span class="plan-row__icon">${icon}</span>
-          <span class="plan-row__time">${minToHHMM(s.time)}</span>
-          <div class="row__body"><p class="row__sub" style="margin:0">${fmtMl(s.ml)} мл${current ? ' · сейчас' : ''}</p></div>
+        <div class="row plan-row ${v.cls}">
+          <span class="plan-row__icon">${v.icon}</span>
+          <span class="plan-row__time">${minToHHMM(p.time)}</span>
+          <div class="row__body"><p class="row__sub" style="margin:0">${fmtMl(p.ml)} мл${extra ? ` · ${esc(extra)}` : ''}</p></div>
         </div>
       `));
     });
+    sec.appendChild(el('<p class="plan-hint">Записи сохраняются с фактическим временем. Выпитое засчитывается порции своего времени и следующим, но не пропущенным раньше.</p>'));
     return sec;
   }
 
@@ -717,7 +723,7 @@ async function WaterScreen() {
   }
 
   /* Журнал приёмов за сегодня (с удалением) */
-  function journal(entries, goal) {
+  function journal(entries, day) {
     const sec = el('<section class="section"><div class="section__head"><h2 class="section__title">Сегодня · приёмы</h2></div><div class="list-card" id="jbox"></div></section>');
     const box = $('#jbox', sec);
     if (!entries.length) { box.appendChild(el('<div class="empty">Пока нет приёмов</div>')); return sec; }
@@ -730,7 +736,7 @@ async function WaterScreen() {
         </div>
       `);
       $('.wdel', row).addEventListener('click', async () => {
-        if (confirm(`Удалить запись ${e.t} · ${e.ml} мл?`)) { await Storage.removeWaterEntry(i); await paint(); flash('Удалено'); }
+        if (confirm(`Удалить запись ${e.t} · ${e.ml} мл?`)) { await Storage.removeWaterEntry(i, day, { t: e.t, ml: e.ml }); await paint(); flash('Удалено'); }
       });
       box.appendChild(row);
     });
