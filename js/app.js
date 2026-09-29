@@ -2077,9 +2077,8 @@ async function StatsScreen() {
       sec.appendChild(singleState(pressureTxt(p.value, diaBy.get(p.day)?.value), 'mmHg', p.date));
       return sec;
     }
-    const goals = [];
-    if (goal && goal.systolic > 0) goals.push({ value: goal.systolic, label: `цель SYS ${goal.systolic}` });
-    if (goal && goal.diastolic > 0) goals.push({ value: goal.diastolic, label: `цель DIA ${goal.diastolic}` });
+    /* goal — только явно сохранённая пользователем цель (analytics.isUserGoal), иначе null */
+    const goals = goal ? [{ value: goal.systolic, label: `цель SYS ${goal.systolic}` }, { value: goal.diastolic, label: `цель DIA ${goal.diastolic}` }] : [];
     const cardEl = el('<div class="card st-card"></div>');
     cardEl.appendChild(lineChart({
       range: m.range,
@@ -2088,7 +2087,7 @@ async function StatsScreen() {
         { key: 'dia', label: 'DIA · диастолическое', color: 'var(--viz-2)', points: dia.points },
       ],
       goals,
-      goalLegend: goal && goal.systolic && goal.diastolic ? `цель ${goal.systolic}/${goal.diastolic}` : '',
+      goalLegend: goal ? `цель ${goal.systolic}/${goal.diastolic}` : '',
       minSpan: 20,
       ariaLabel: `Давление за период: ${sys.stats.count} измерений, среднее ${pressureTxt(sys.stats.avg, dia.stats.avg)} mmHg`,
       readout: (day) => {
@@ -2104,7 +2103,7 @@ async function StatsScreen() {
       ['Последнее', pressureTxt(sys.stats.last.value, diaBy.get(sys.stats.last.day)?.value), fmtDayShort(sys.stats.last.day)],
       ['Измерений', String(sys.stats.count), `${sys.stats.days} ${daysWord(sys.stats.days)} с данными`],
     ];
-    if (goal && goal.systolic && goal.diastolic) items.push(['Цель', `${goal.systolic}/${goal.diastolic}`, 'из настроек показателя']);
+    if (goal) items.push(['Цель', `${goal.systolic}/${goal.diastolic}`, 'ваша цель']);
     cardEl.appendChild(el(tiles(items)));
     sec.appendChild(cardEl);
     sec.appendChild(tableView(sys.points.length, () => newestFirst(sys.points).map((p) => [fmtDate(p.date), `${pressureTxt(p.value, diaBy.get(p.day)?.value)} mmHg`])));

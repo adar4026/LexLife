@@ -43,6 +43,17 @@ export const TREND_MIN_POINTS = 5;
 export const TREND_MIN_SPAN = 5;
 export const TREND_T_CRIT = 2;
 
+/* ---------- цели ----------
+   Цель считается явно сохранённой пользователем, только если её запись не из пакета
+   значений по умолчанию: defaultMetricsConfig() (seed / restore / миграция v3→v4) пишет
+   все цели одним вызовом с одинаковой меткой at, а setMetricGoal() («изменить» в модуле
+   показателя) — одну цель со своей меткой at. Нет метки — происхождение неизвестно → не цель. */
+export function isUserGoal(cfg, metric) {
+  const c = isObj(cfg) ? cfg[metric] : null;
+  if (!isObj(c) || c.goal == null || typeof c.at !== 'string') return false;
+  return !Object.keys(cfg).some((m) => m !== metric && isObj(cfg[m]) && cfg[m].at === c.at);
+}
+
 /* ---------- даты ---------- */
 export function dayNum(iso) {
   const [y, m, d] = iso.split('-').map(Number);
@@ -308,7 +319,10 @@ export function createStatsEngine(raw, todayIso) {
   const firstDay = firstDays.length ? Math.min(...firstDays) : null;
   const hasAny = firstDay != null;
 
-  const pressureGoal = isObj(cfg.pressure && cfg.pressure.goal) ? cfg.pressure.goal : null;
+  /* давление: линия/плитка цели — только при явно сохранённой пользовательской цели */
+  const pg = cfg.pressure && cfg.pressure.goal;
+  const pressureGoal = isUserGoal(cfg, 'pressure') && isObj(pg) && isNum(pg.systolic) && pg.systolic > 0 && isNum(pg.diastolic) && pg.diastolic > 0
+    ? { systolic: pg.systolic, diastolic: pg.diastolic } : null;
   const numGoal = (m) => (cfg[m] && isNum(cfg[m].goal) && cfg[m].goal > 0 ? cfg[m].goal : null);
 
   function block(key, range, prev) {
