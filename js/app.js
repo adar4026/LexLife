@@ -7,12 +7,14 @@
    ========================================================= */
 
 import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup } from './services/storage.js';
-import { createStatsEngine, evaluateWaterPlan, waterGoalDays, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay } from './services/analytics.js';
+import { createStatsEngine, evaluateWaterPlan, waterGoalDays, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay, dayNum } from './services/analytics.js';
 import { parseWaterMinderCsv, assignImportKeys, buildWaterImportPlan, applyWaterImportPlan, applyTodayWaterImport, isWaterMinderKey } from './services/waterImport.js';
 import { lineChart, barChart as svgBarChart } from './ui/charts.js';
 import { AttachmentService, IdbAttachmentStore, AttachmentError, ATTACHMENT_ACCEPT, ATTACHMENT_TYPES, checkAttachmentFile, formatBytes, attachmentOf } from './services/attachments.js';
 import { createFullBackup, prepareFullRestore, applyFullRestore, isZipFile, countDocsLostOnRestore } from './services/fullBackup.js';
 import { parsePreparedTest, importPreparedTest, PreparedImportError } from './services/preparedImport.js';
+import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
+import { openDocViewer as showDocViewer } from './ui/docViewer.js';
 
 /* Документы анализов: файлы в IndexedDB (только на этом устройстве), метаданные — в health_tests */
 const Attachments = new AttachmentService(Storage, new IdbAttachmentStore());
@@ -73,19 +75,8 @@ const chartVal = (key, v) => {
 };
 
 /* ---------- доменная логика анализов ---------- */
-function evaluate(field, value) {
-  const ref = REFERENCE[field];
-  if (!ref || value == null || value === '' || isNaN(Number(value))) return 'none';
-  const v = Number(value);
-  if (ref.higherIsBetter) return v >= ref.goodMin ? 'good' : 'warn';
-  if (ref.goodMin != null && ref.good != null) return v >= ref.goodMin && v <= ref.good ? 'good' : 'warn';
-  if (ref.warn != null) {
-    if (v <= ref.good) return 'good';
-    if (v <= ref.warn) return 'warn';
-    return 'danger';
-  }
-  return v <= ref.good ? 'good' : 'danger';
-}
+/* Цветовая отметка основных полей по справочным значениям приложения (REFERENCE) */
+const evaluate = evaluateField;
 function nextDose(med) {
   if (!med.every_days || !med.start) return null;
   const ms = 86400000;
@@ -202,7 +193,7 @@ async function HomeScreen() {
       const st = evaluate(f, val);
       g.appendChild(
         el(`
-        <div class="metric-tile">
+        <div class="metric-tile" role="button" data-route="test-history/${f}">
           <div class="metric-tile__top"><span class="metric-tile__name">${esc(ref.label)}</span><span class="dot-status dot-status--${st}"></span></div>
           <div class="metric-tile__value">${val ?? '—'}<span class="metric-tile__unit">${esc(ref.unit)}</span></div>
         </div>
@@ -852,13 +843,18 @@ async function MedsScreen() {
 }
 
 /* =========================================================
-   Вкладка 4 — Анализы
+   Вкладка 4 — Анализы: журнал (#/tests) → полный анализ (#/test/<id>) →
+   история показателя (#/test-history/<ключ>); форма — #/test/new, #/test/<id>/edit.
    ========================================================= */
 const DOC_ICON = { pdf: '📄', image: '🖼️' };
 const docKind = (type) => (ATTACHMENT_TYPES[type] || {}).kind || 'pdf';
-const docLine = (meta) => [(ATTACHMENT_TYPES[meta.type] || {}).label || 'Файл', formatBytes(meta.size)].filter(Boolean).join(' · ');
+const docLabel = (type) => (ATTACHMENT_TYPES[type] || {}).label || 'Файл';
+const docLine = (meta) => [docLabel(meta.type), formatBytes(meta.size)].filter(Boolean).join(' · ');
 const alertDialog = (title, html) => showDialog({ title, body: html, actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
 const DOC_MISSING_HTML = '<p>Файл этого анализа не найден на устройстве.</p><p class="dialog__muted">Так бывает после восстановления из обычной резервной копии (она не содержит PDF и фото) или на другом устройстве. Анализ сохранён; прикрепите документ заново через «Изменить» или восстановите полную резервную копию с документами.</p>';
+/* «14 февр. 2026 г.» */
+const fmtTestDate = (iso) => new Date(iso + 'T00:00:00').toLocaleDateString(RU, { day: '2-digit', month: 'short', year: 'numeric' });
+const indicatorsWord = (n) => `${n} ${plural(n, 'показатель', 'показателя', 'показателей')}`;
 
 /* Открыть документ анализа из хранилища; нет файла → понятное сообщение */
 async function openTestDocument(meta) {
@@ -867,71 +863,34 @@ async function openTestDocument(meta) {
     file = await Attachments.getFile(meta);
   } catch (err) {
     await alertDialog('Документ недоступен', `<p>${esc(err instanceof AttachmentError ? err.message : 'Не удалось прочитать документ.')}</p>`);
-    return;
+    return null;
   }
-  if (!file) { await alertDialog('Документ не найден', DOC_MISSING_HTML); return; }
-  openDocViewer(file);
+  if (!file) { await alertDialog('Документ не найден', DOC_MISSING_HTML); return null; }
+  return openDocViewer(file);
 }
 
-/* Просмотр PDF/фото поверх приложения (выше таб-бара, с учётом safe-area).
-   iOS: PDF во встроенном окне; «Поделиться» открывает системное меню (Файлы, Книги и т.д.). */
+/* «Документ анализа» поверх приложения (js/ui/docViewer.js): PDF целиком, фото с масштабом */
 function openDocViewer(file) {
-  const url = URL.createObjectURL(file);
-  const kind = docKind(file.type);
-  const canShare = !!(navigator.canShare && navigator.canShare({ files: [file] }));
-  const v = el(`
-    <div class="doc-viewer" role="dialog" aria-modal="true" aria-label="Документ анализа">
-      <div class="doc-viewer__bar">
-        <button class="doc-viewer__btn" type="button" data-act="close">‹ Закрыть</button>
-        <span class="doc-viewer__title"></span>
-        <button class="doc-viewer__btn" type="button" data-act="${canShare ? 'share' : 'open'}">${canShare ? 'Поделиться' : 'Открыть'}</button>
-      </div>
-      <div class="doc-viewer__body"></div>
-    </div>
-  `);
-  $('.doc-viewer__title', v).textContent = file.name;
-  const body = $('.doc-viewer__body', v);
-  const unsupported = () => {
-    body.innerHTML = `<div class="doc-viewer__msg"><p>Этот браузер не может показать файл «${esc(file.name)}» (${esc(docLine({ type: file.type, size: file.size }))}).</p><p>${canShare ? 'Нажмите «Поделиться» и откройте его в другом приложении или сохраните в «Файлы».' : 'Нажмите «Открыть», чтобы открыть его отдельно.'}</p></div>`;
-  };
-  if (kind === 'image') {
-    const img = el('<img class="doc-viewer__img" alt="">');
-    img.alt = file.name;
-    img.addEventListener('error', unsupported);
-    img.src = url;
-    body.appendChild(img);
-  } else {
-    const frame = el('<iframe class="doc-viewer__frame" title="PDF"></iframe>');
-    frame.src = url;
-    body.appendChild(frame);
-  }
-  const close = () => { document.removeEventListener('keydown', onKey); v.remove(); unlockPageScroll(); setTimeout(() => URL.revokeObjectURL(url), 1000); };
-  const onKey = (e) => { if (e.key === 'Escape') close(); };
-  v.addEventListener('click', async (e) => {
-    const act = e.target.closest('[data-act]');
-    if (!act) return;
-    if (act.dataset.act === 'close') close();
-    else if (act.dataset.act === 'share') {
-      try { await navigator.share({ files: [file] }); } catch { /* отменено */ }
-    } else window.open(url, '_blank', 'noopener');
-  });
-  document.addEventListener('keydown', onKey);
-  lockPageScroll();
-  document.body.appendChild(v);
-  $('[data-act="close"]', v).focus();
+  return showDocViewer(file, { lockScroll: lockPageScroll, unlockScroll: unlockPageScroll });
 }
+
+/* Состояние журнала между переходами: фильтр года, подсветка только что добавленной записи */
+let testsYear = 'all';
+let testsHighlight = null;
 
 async function TestsScreen() {
-  const screen = el('<div></div>');
-  let formFor = null; // null — формы нет; 'new' — новый анализ; id — редактирование
+  const screen = el('<div class="tj"></div>');
   let importing = false;
 
   async function paint() {
     const tests = await Storage.getTests();
+    const j = journal(tests, { year: testsYear });
+    testsYear = j.year;
     screen.innerHTML = '';
-    screen.appendChild(el(`<header class="header"><p class="header__eyebrow">${tests.length} ${plural(tests.length, 'запись', 'записи', 'записей')}</p><h1 class="header__title">Анализы</h1></header>`));
-    const addBtn = el('<button class="btn-ghost" type="button" style="margin:8px 0 4px">+ Добавить анализ</button>');
-    addBtn.addEventListener('click', () => { formFor = formFor === 'new' ? null : 'new'; paint(); });
+    screen.appendChild(el(`<header class="header"><p class="header__eyebrow">${j.total} ${plural(j.total, 'запись', 'записи', 'записей')}</p><h1 class="header__title">Анализы</h1></header>`));
+
+    const addBtn = el('<button class="btn-ghost tj-add" type="button">+ Добавить анализ</button>');
+    addBtn.addEventListener('click', () => { location.hash = '#/test/new'; });
     screen.appendChild(addBtn);
     const impLabel = el(`<label class="btn-ghost tests-import${importing ? ' is-busy' : ''}">📥 Импортировать подготовленный анализ<input type="file" accept=".json,application/json" hidden></label>`);
     const impInput = $('input', impLabel);
@@ -941,214 +900,76 @@ async function TestsScreen() {
       if (file) importPrepared(file, impLabel);
     });
     screen.appendChild(impLabel);
-    if (formFor === 'new') screen.appendChild(buildForm(null));
 
-    const list = el('<section class="section" style="margin-top:16px"></section>');
-    if (!tests.length) list.appendChild(el('<div class="empty">Пока нет анализов</div>'));
-    else tests.forEach((t) => {
-      if (formFor === t.id) { const f = buildForm(t); f.id = `test-${t.id}`; list.appendChild(f); return; }
-      list.appendChild(testCard(t));
-    });
-    screen.appendChild(list);
-    if (formFor && formFor !== 'new') setTimeout(() => { const n = document.getElementById(`test-${formFor}`); if (n) n.scrollIntoView({ block: 'start', behavior: 'smooth' }); }, 60);
-  }
-
-  function testCard(t) {
-    const card = el('<div class="card test-card"></div>');
-    const head = el(`<div class="test-card__head"><span class="test-card__date">${esc(fmtDate(t.date))}</span><button class="test-card__edit" type="button" aria-label="Изменить анализ от ${esc(fmtDate(t.date))}">Изменить</button></div>`);
-    $('.test-card__edit', head).addEventListener('click', () => { formFor = t.id; paint(); });
-    card.appendChild(head);
-    if (t.note) card.appendChild(el(`<p class="test-card__note">${esc(t.note)}</p>`));
-
-    const meta = attachmentOf(t);
-    if (meta) {
-      const doc = el(`<button class="doc-chip" type="button"><span class="doc-chip__icon" aria-hidden="true">${DOC_ICON[docKind(meta.type)]}</span><span class="doc-chip__name"></span><span class="doc-chip__meta">${esc(docLine(meta))}</span></button>`);
-      $('.doc-chip__name', doc).textContent = meta.name || 'Документ';
-      doc.setAttribute('aria-label', `Открыть документ ${meta.name || ''}`);
-      doc.addEventListener('click', () => openTestDocument(meta));
-      card.appendChild(doc);
-    }
-
-    const values = el('<div class="test-values"></div>');
-    TEST_FIELDS.forEach((f) => {
-      if (t[f] == null) return;
-      const ref = REFERENCE[f];
-      const st = evaluate(f, t[f]);
-      const lab = t.labRanges && t.labRanges[f] ? `<span class="test-value__ref">лаборатория: ${esc(t.labRanges[f])}</span>` : '';
-      values.appendChild(el(`<div class="test-value"><span class="dot-status dot-status--${st}"></span><span class="test-value__label">${esc(ref.label)}${lab}</span><span class="test-value__num">${esc(fmtNum(t[f]))}<span style="color:var(--text2);font-weight:400"> ${esc(ref.unit)}</span></span></div>`));
-    });
-    if (values.childElementCount) card.appendChild(values);
-
-    const custom = Array.isArray(t.customResults) ? t.customResults : [];
-    if (custom.length) card.appendChild(customResultsBlock(custom));
-    return card;
-  }
-
-  /* Показатели вне основных полей формы — по группам, с диапазоном лаборатории.
-     ↑/↓ — только факт выхода за числовой диапазон, указанный лабораторией. */
-  function customResultsBlock(custom) {
-    const groups = [];
-    custom.forEach((r) => {
-      const g = r.group || 'Другие показатели';
-      let grp = groups.find((x) => x.name === g);
-      if (!grp) { grp = { name: g, items: [] }; groups.push(grp); }
-      grp.items.push(r);
-    });
-    const d = el(`<details class="test-extra"><summary>Все показатели лаборатории · ${custom.length}</summary></details>`);
-    groups.forEach((g) => {
-      d.appendChild(el(`<div class="test-extra__group">${esc(g.name)}</div>`));
-      const box = el('<div class="test-values"></div>');
-      g.items.forEach((r) => {
-        const out = r.value != null && r.refLow != null && r.refHigh != null ? (r.value < r.refLow ? '↓' : r.value > r.refHigh ? '↑' : '') : '';
-        const hint = out === '↑' ? 'выше диапазона лаборатории' : out === '↓' ? 'ниже диапазона лаборатории' : '';
-        box.appendChild(el(`
-          <div class="test-value">
-            <span class="test-value__label">${esc(r.name)}${r.ref ? `<span class="test-value__ref">${esc(r.ref)}</span>` : ''}</span>
-            <span class="test-value__num">${out ? `<span class="test-value__out" title="${hint}" aria-label="${hint}">${out}</span> ` : ''}${esc(fmtNum(r.value))}${r.unit ? `<span style="color:var(--text2);font-weight:400"> ${esc(r.unit)}</span>` : ''}</span>
-          </div>
-        `));
-      });
-      d.appendChild(box);
-    });
-    return d;
-  }
-
-  /* Форма нового анализа / редактирования. Документ: выбор, «Открыть», «Удалить» —
-     изменения применяются по «Сохранить» (отмена ничего не меняет). */
-  function buildForm(existing) {
-    const t = existing || { date: dateKey(), note: '' };
-    const form = el('<div class="input-card test-form"></div>');
-    form.appendChild(el(`<div class="input-card__head"><span class="input-card__title">${existing ? 'Изменить анализ' : 'Новый анализ'}</span></div>`));
-    form.appendChild(el(`<div class="field"><label class="field__label" for="f-date">Дата анализа</label><input class="input" type="date" id="f-date" value="${esc(t.date)}"></div>`));
-    TEST_FIELDS.forEach((f) => {
-      const ref = REFERENCE[f];
-      form.appendChild(el(`<div class="field"><label class="field__label">${esc(ref.label)} (${esc(ref.unit)})</label><input class="input" type="number" step="any" inputmode="decimal" data-field="${f}" value="${t[f] != null ? esc(t[f]) : ''}" placeholder="—"></div>`));
-    });
-    form.appendChild(el(`<div class="field"><label class="field__label" for="f-note">Заметка</label><input class="input" type="text" id="f-note" value="${esc(t.note || '')}" placeholder="напр. сдано не натощак"></div>`));
-    const extraCount = Array.isArray(t.customResults) ? t.customResults.length : 0;
-    if (extraCount) form.appendChild(el(`<p class="doc-block__hint" style="margin:0 0 12px">Показатели лаборатории (${extraCount}) сохраняются без изменений.</p>`));
-
-    /* ---- блок «Документ анализа» ---- */
-    const origMeta = attachmentOf(t);
-    let doc = origMeta ? { kind: 'existing', meta: origMeta } : { kind: 'none' };
-    const block = el(`
-      <div class="doc-block">
-        <div class="doc-block__title">Документ анализа</div>
-        <div class="doc-block__body"></div>
-        <label class="btn-ghost doc-block__pick"><span></span><input type="file" accept="${ATTACHMENT_ACCEPT}" hidden></label>
-        <p class="doc-block__hint">PDF, JPG, PNG или HEIC · до 15 МБ · файл хранится только на этом устройстве</p>
-      </div>
-    `);
-    const bodyEl = $('.doc-block__body', block);
-    const pickText = $('.doc-block__pick span', block);
-    const pickInput = $('.doc-block__pick input', block);
-    function paintDoc() {
-      bodyEl.innerHTML = '';
-      if (doc.kind === 'none') {
-        bodyEl.appendChild(el(`<p class="doc-block__empty">${origMeta ? 'Документ будет удалён при сохранении.' : 'Файл не прикреплён.'}</p>`));
-        pickText.textContent = 'Прикрепить PDF или фото';
-        return;
-      }
-      const meta = doc.kind === 'new' ? { name: doc.file.name, type: doc.type, size: doc.file.size } : doc.meta;
-      const row = el(`
-        <div class="doc-row">
-          <span class="doc-row__icon" aria-hidden="true">${DOC_ICON[docKind(meta.type)]}</span>
-          <div class="doc-row__body"><p class="doc-row__name"></p><p class="doc-row__meta">${esc(docLine(meta))}${doc.kind === 'new' ? ' · сохранится вместе с анализом' : ''}</p></div>
-        </div>
-      `);
-      $('.doc-row__name', row).textContent = meta.name || 'Документ';
-      const acts = el('<div class="doc-row__actions"><button class="doc-btn" type="button" data-act="open">Открыть</button><button class="doc-btn doc-btn--danger" type="button" data-act="del">Удалить</button></div>');
-      acts.addEventListener('click', (e) => {
-        const b = e.target.closest('[data-act]');
-        if (!b) return;
-        if (b.dataset.act === 'open') {
-          if (doc.kind === 'new') openDocViewer(new File([doc.file], doc.file.name, { type: doc.type }));
-          else openTestDocument(doc.meta);
-        } else {
-          doc = { kind: 'none' };
-          paintDoc();
-        }
-      });
-      bodyEl.append(row, acts);
-      pickText.textContent = 'Заменить файл';
-    }
-    pickInput.addEventListener('change', async () => {
-      const file = pickInput.files && pickInput.files[0];
-      pickInput.value = '';
-      if (!file) return;
-      const check = await checkAttachmentFile(file);
-      if (!check.ok) { await alertDialog('Файл не прикреплён', `<p>${esc(check.message)}</p>`); return; }
-      doc = { kind: 'new', file, type: check.type };
-      paintDoc();
-    });
-    paintDoc();
-    form.appendChild(block);
-
-    const actions = el('<div class="test-form__actions"></div>');
-    const save = el(`<button class="btn-primary" type="button">${existing ? 'Сохранить' : 'Сохранить анализ'}</button>`);
-    const cancel = el('<button class="btn-ghost" type="button">Отмена</button>');
-    cancel.addEventListener('click', () => { formFor = null; paint(); });
-    actions.append(save, cancel);
-    if (existing) {
-      const del = el('<button class="btn-ghost test-form__delete" type="button">Удалить анализ</button>');
-      del.addEventListener('click', () => deleteTest(existing));
-      actions.appendChild(del);
-    }
-    form.appendChild(actions);
-
-    save.addEventListener('click', async () => {
-      const date = $('#f-date', form).value;
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { await alertDialog('Анализ не сохранён', '<p>Укажите дату анализа.</p>'); return; }
-      const values = {};
-      $$('[data-field]', form).forEach((inp) => { values[inp.dataset.field] = inp.value !== '' ? Number(inp.value) : undefined; });
-      save.classList.add('is-busy');
-      let testId = existing ? existing.id : null;
-      try {
-        if (existing) {
-          const upd = await Storage.updateTest(existing.id, { date, note: $('#f-note', form).value.trim(), ...values });
-          if (!upd) { await alertDialog('Анализ не найден', '<p>Запись была удалена. Ничего не изменено.</p>'); formFor = null; await paint(); return; }
-        } else {
-          const entry = { date, note: $('#f-note', form).value.trim() };
-          Object.entries(values).forEach(([k, v]) => { if (v !== undefined) entry[k] = v; });
-          testId = (await Storage.addTest(entry)).id;
-        }
-      } catch (err) {
-        save.classList.remove('is-busy');
-        await alertDialog('Анализ не сохранён', `<p>${esc((err && err.message) || 'Попробуйте ещё раз.')}</p>`);
-        return;
-      }
-      let docError = null;
-      try {
-        if (doc.kind === 'new') await Attachments.attachToTest(testId, doc.file);
-        else if (doc.kind === 'none' && origMeta) await Attachments.removeFromTest(testId);
-      } catch (err) {
-        docError = err instanceof AttachmentError ? err.message : 'Не удалось сохранить документ на устройстве.';
-      }
-      formFor = null;
-      await paint();
-      if (docError) await alertDialog('Анализ сохранён, документ — нет', `<p>${esc(docError)}</p><p class="dialog__muted">Попробуйте прикрепить файл ещё раз через «Изменить».</p>`);
-      else flash(existing ? 'Сохранено ✓' : 'Анализ сохранён ✓');
-    });
-    return form;
-  }
-
-  async function deleteTest(t) {
-    const meta = attachmentOf(t);
-    const ok = await showDialog({
-      title: 'Удалить анализ?',
-      body: `<p>Анализ от <b>${esc(fmtDate(t.date))}</b> будет удалён${meta ? ' вместе с прикреплённым документом' : ''}.</p><p class="dialog__muted">Это действие нельзя отменить, если у вас нет резервной копии.</p>`,
-      actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
-    });
-    if (!ok) return;
-    try {
-      await Attachments.deleteTest(t.id);
-    } catch (err) {
-      await alertDialog('Не удалось удалить', `<p>${esc((err && err.message) || 'Попробуйте ещё раз.')}</p>`);
+    if (!j.total) {
+      screen.appendChild(el('<div class="empty tj-empty">Пока нет анализов.<br>Добавьте анализ вручную или импортируйте подготовленный файл.</div>'));
       return;
     }
-    formFor = null;
-    await paint();
-    flash('Анализ удалён');
+
+    if (j.years.length > 1) {
+      const f = el(`<div class="st-period tj-filter" role="group" aria-label="Период">
+        ${['all', ...j.years].map((y) => `<button class="st-period__btn${j.year === y ? ' is-active' : ''}" type="button" data-year="${y}" aria-pressed="${j.year === y}">${y === 'all' ? 'Все' : y}</button>`).join('')}
+      </div>`);
+      f.addEventListener('click', (e) => {
+        const b = e.target.closest('[data-year]');
+        if (!b) return;
+        testsYear = b.dataset.year === 'all' ? 'all' : Number(b.dataset.year);
+        paint();
+      });
+      screen.appendChild(f);
+    }
+
+    const list = el('<div class="tj-list"></div>');
+    j.groups.forEach((g) => {
+      const sec = el(`<section class="tj-year"><h2 class="tj-year__title">${g.year}</h2><div class="list-card tj-card"></div></section>`);
+      const box = $('.tj-card', sec);
+      g.items.forEach((it) => box.appendChild(journalRow(it)));
+      list.appendChild(sec);
+    });
+    screen.appendChild(list);
+
+    if (testsHighlight) {
+      const id = testsHighlight;
+      testsHighlight = null;
+      const row = $(`.tj-row[data-id="${CSS.escape(id)}"]`, screen);
+      if (row) {
+        row.classList.add('is-new');
+        setTimeout(() => { if (row.isConnected) row.scrollIntoView({ block: 'center', behavior: 'smooth' }); }, 80);
+      }
+    }
+  }
+
+  /* Одна запись — одна строка: дата, группы, документ, ›.
+     Строка → полный анализ; блок документа → сам документ. */
+  function journalRow({ test: t, no, sameDay }) {
+    const meta = attachmentOf(t);
+    const summary = groupSummary(t) || t.note || 'Показатели не внесены';
+    const row = el(`
+      <div class="tj-row" data-id="${esc(t.id)}">
+        <a class="tj-row__main" href="#/test/${encodeURIComponent(t.id)}">
+          <span class="tj-row__date">${esc(fmtTestDate(t.date))}</span>
+          ${sameDay > 1 ? `<span class="tj-row__no">Анализ № ${no}</span>` : ''}
+          <span class="tj-row__groups">${esc(summary)}</span>
+        </a>
+        ${meta
+          ? `<button class="tj-doc" type="button"><span class="tj-doc__badge tj-doc__badge--${docKind(meta.type)}">${esc(docLabel(meta.type))}</span><span class="tj-doc__text"><span class="tj-doc__name"></span><span class="tj-doc__meta">${esc(formatBytes(meta.size))}</span></span></button>`
+          : '<span class="tj-doc tj-doc--none">Без документа</span>'}
+        <span class="tj-row__chev" aria-hidden="true">›</span>
+      </div>
+    `);
+    const label = `Анализ от ${fmtTestDate(t.date)}${sameDay > 1 ? `, № ${no}` : ''}`;
+    $('.tj-row__main', row).setAttribute('aria-label', `${label}. ${summary}`);
+    if (meta) {
+      const doc = $('.tj-doc', row);
+      $('.tj-doc__name', doc).textContent = meta.name || 'Документ';
+      doc.setAttribute('aria-label', `Открыть документ ${meta.name || ''} (${docLine(meta)})`);
+    }
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.tj-doc:not(.tj-doc--none)')) { openTestDocument(meta); return; }
+      e.preventDefault();
+      location.hash = `#/test/${encodeURIComponent(t.id)}`;
+    });
+    return row;
   }
 
   /* Импорт подготовленного JSON: проверка → предпросмотр → добавление (без замены) */
@@ -1188,7 +1009,7 @@ async function TestsScreen() {
           ${mainRows ? `<ul class="dialog__list">${mainRows}</ul>` : ''}
           ${groupRows ? `<ul class="dialog__list">${groupRows}</ul>` : ''}
           ${allRows ? `<details class="dialog__details"><summary>Все показатели</summary>${allRows}</details>` : ''}
-          ${sameDate ? '<p class="dialog__warn">На эту дату уже есть анализ — будет добавлена ещё одна запись.</p>' : ''}
+          ${sameDate ? '<p class="dialog__warn">На эту дату уже есть анализ — будет добавлена ещё одна, отдельная запись.</p>' : ''}
           <p class="dialog__muted">Запись будет добавлена к существующим анализам. Другие данные (вода, лекарства, показатели, настройки) не изменятся.</p>
         `,
         actions: [{ label: 'Отмена', value: false }, { label: 'Добавить анализ', value: true, kind: 'primary' }],
@@ -1202,8 +1023,9 @@ async function TestsScreen() {
         return;
       }
       if (!res.added) { await alertDialog('Уже импортировано', '<p>Этот анализ уже есть в LexLife. Повторно он не добавлен.</p>'); return; }
-      formFor = null;
       importing = false;
+      testsYear = 'all';
+      testsHighlight = res.entry.id;
       await paint();
       flash('Анализ добавлен ✓');
     } finally {
@@ -1213,6 +1035,264 @@ async function TestsScreen() {
   }
 
   await paint();
+  screen.restoreScroll = true;
+  return screen;
+}
+
+/* ---------- Полный анализ (#/test/<id>) ---------- */
+async function TestDetailScreen(id) {
+  const screen = el('<div class="tv"></div>');
+  const tests = await Storage.getTests();
+  const t = tests.find((x) => x.id === id);
+  const back = () => goBackOr('tests');
+  if (!t) {
+    screen.appendChild(backHeader('Анализ', { label: 'Назад', onBack: back }));
+    screen.appendChild(el('<div class="empty">Анализ не найден — возможно, он был удалён.</div>'));
+    const b = el('<button class="btn-ghost" type="button">К списку анализов</button>');
+    b.addEventListener('click', () => { location.replace('#/tests'); });
+    screen.appendChild(b);
+    return screen;
+  }
+  const { no, sameDay } = sameDayNumber(tests, id);
+  const sections = testSections(t);
+  const count = sections.reduce((n, s) => n + s.rows.length, 0);
+
+  screen.appendChild(backHeader(`Анализ от ${fmtTestDate(t.date)}`, { label: 'Назад', onBack: back }));
+  const sub = [sameDay > 1 ? `Анализ № ${no} из ${sameDay} за этот день` : '', count ? indicatorsWord(count) : ''].filter(Boolean).join(' · ');
+  if (sub) screen.appendChild(el(`<p class="tv-sub">${esc(sub)}</p>`));
+  if (t.note) screen.appendChild(el(`<p class="tv-note">${esc(t.note)}</p>`));
+
+  /* документ */
+  const meta = attachmentOf(t);
+  if (meta) {
+    const doc = el(`
+      <button class="tv-doc" type="button">
+        <span class="tv-doc__badge tj-doc__badge tj-doc__badge--${docKind(meta.type)}">${esc(docLabel(meta.type))}</span>
+        <span class="tv-doc__body"><span class="tv-doc__name"></span><span class="tv-doc__meta">${esc(docLine(meta))} · ${docKind(meta.type) === 'pdf' ? 'все страницы' : 'с масштабом'}</span></span>
+        <span class="tv-doc__open">Открыть</span>
+      </button>
+    `);
+    $('.tv-doc__name', doc).textContent = meta.name || 'Документ';
+    doc.setAttribute('aria-label', `Открыть документ ${meta.name || ''} (${docLine(meta)})`);
+    doc.addEventListener('click', () => openTestDocument(meta));
+    screen.appendChild(doc);
+  } else {
+    screen.appendChild(el('<div class="tv-doc tv-doc--none"><span class="tv-doc__badge tj-doc__badge tj-doc__badge--none">—</span><span class="tv-doc__body"><span class="tv-doc__name">Без документа</span><span class="tv-doc__meta">PDF или фото можно прикрепить через «Изменить»</span></span></div>'));
+  }
+
+  /* показатели по разделам */
+  if (!sections.length) screen.appendChild(el('<div class="empty">Показатели не внесены</div>'));
+  sections.forEach((s) => {
+    const sec = el(`<section class="section tv-sec"><div class="section__head"><h2 class="section__title">${esc(s.title)}</h2><span class="tv-sec__count">${s.rows.length}</span></div><div class="list-card"></div></section>`);
+    const box = $('.list-card', sec);
+    s.rows.forEach((r) => {
+      const hint = r.out === '↑' ? 'выше диапазона лаборатории' : r.out === '↓' ? 'ниже диапазона лаборатории' : '';
+      const refText = r.ref ? (r.kind === 'field' ? `лаборатория: ${r.ref}` : r.ref) : '';
+      const row = el(`
+        <a class="row tv-row" href="#/test-history/${encodeURIComponent(r.key)}">
+          <span class="dot-status dot-status--${r.status}" aria-hidden="true"></span>
+          <span class="row__body"><span class="tv-row__name"></span>${refText ? '<span class="tv-row__ref"></span>' : ''}</span>
+          <span class="tv-row__val">${r.out ? `<span class="test-value__out" title="${hint}" aria-label="${hint}">${r.out}</span> ` : ''}<b>${esc(fmtNum(r.value))}</b>${r.unit ? ` <span class="tv-row__unit">${esc(r.unit)}</span>` : ''}</span>
+          <span class="row__chevron" aria-hidden="true">›</span>
+        </a>
+      `);
+      $('.tv-row__name', row).textContent = r.name;
+      if (refText) $('.tv-row__ref', row).textContent = refText;
+      row.setAttribute('aria-label', `${r.name}: ${fmtNum(r.value)} ${r.unit}${hint ? `, ${hint}` : ''}. История показателя`);
+      box.appendChild(row);
+    });
+    screen.appendChild(sec);
+  });
+  if (count) screen.appendChild(el('<p class="st-disclaimer" style="margin-top:14px">Точка — справочные значения приложения для основных показателей; ↑/↓ — вне диапазона, указанного лабораторией. Это не медицинская оценка. Нажмите на показатель, чтобы открыть его историю и график.</p>'));
+
+  /* действия — только здесь */
+  const actions = el('<div class="tv-actions"><button class="btn-ghost" type="button" data-act="edit">Изменить</button><button class="btn-ghost tv-actions__delete" type="button" data-act="delete">Удалить анализ</button></div>');
+  actions.addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-act]');
+    if (!b) return;
+    if (b.dataset.act === 'edit') { location.hash = `#/test/${encodeURIComponent(t.id)}/edit`; return; }
+    const ok = await showDialog({
+      title: 'Удалить анализ?',
+      body: `<p>Анализ от <b>${esc(fmtTestDate(t.date))}</b>${sameDay > 1 ? ` (№ ${no})` : ''} будет удалён${meta ? ' вместе с прикреплённым документом' : ''}. Другие анализы не изменятся.</p><p class="dialog__muted">Это действие нельзя отменить, если у вас нет резервной копии.</p>`,
+      actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+    });
+    if (!ok) return;
+    try {
+      await Attachments.deleteTest(t.id);
+    } catch (err) {
+      await alertDialog('Не удалось удалить', `<p>${esc((err && err.message) || 'Попробуйте ещё раз.')}</p>`);
+      return;
+    }
+    goBackOr('tests');
+    flash('Анализ удалён');
+  });
+  screen.appendChild(actions);
+  screen.restoreScroll = true;
+  return screen;
+}
+
+/* ---------- История одного показателя (#/test-history/<ключ>) ---------- */
+async function TestHistoryScreen(key) {
+  const screen = el('<div></div>');
+  const h = indicatorHistory(await Storage.getTests(), key);
+  screen.appendChild(backHeader(h.title, { label: 'Назад', onBack: () => goBackOr('tests') }));
+  if (!h.entries.length) { screen.appendChild(el('<div class="empty">Нет записей этого показателя</div>')); return screen; }
+  screen.appendChild(el(`<p class="tv-sub">${h.entries.length} ${plural(h.entries.length, 'значение', 'значения', 'значений')}${h.unit ? ` · ${esc(h.unit)}` : ''}</p>`));
+
+  if (h.points.length >= 2) {
+    const points = h.points.map((p) => ({ day: dayNum(p.date), value: p.value, date: p.date }));
+    const card = el('<div class="card st-card" style="margin-top:12px"></div>');
+    card.appendChild(lineChart({
+      range: { start: points[0].day, end: Math.max(points[points.length - 1].day, dayNum(dateKey())) },
+      series: [{ key, label: h.title, color: 'var(--viz-1)', points }],
+      minSpan: 0.1,
+      ariaLabel: `${h.title}: ${points.length} значений`,
+      readout: (day) => { const p = points.find((q) => q.day === day); return `<span class="chart__rv">${esc(fmtNum(p.value))} <small>${esc(h.unit)}</small></span><span class="chart__rd">${esc(fmtDate(p.date))}</span>`; },
+    }));
+    screen.appendChild(card);
+  } else {
+    screen.appendChild(el('<p class="backup-note" style="margin:12px 2px 4px">График появится, когда будет хотя бы два анализа с этим показателем.</p>'));
+  }
+
+  const list = el('<section class="section"><div class="list-card"></div></section>');
+  h.entries.forEach((e) => {
+    const hint = e.out === '↑' ? 'выше диапазона лаборатории' : e.out === '↓' ? 'ниже диапазона лаборатории' : '';
+    const row = el(`
+      <a class="row tv-row" href="#/test/${encodeURIComponent(e.testId)}">
+        <span class="dot-status dot-status--${e.status}" aria-hidden="true"></span>
+        <span class="row__body"><span class="tv-row__name">${esc(fmtTestDate(e.date))}${e.sameDay > 1 ? ` · № ${e.no}` : ''}</span>${e.ref ? '<span class="tv-row__ref"></span>' : ''}</span>
+        <span class="tv-row__val">${e.out ? `<span class="test-value__out" title="${hint}">${e.out}</span> ` : ''}<b>${esc(fmtNum(e.value))}</b>${e.unit ? ` <span class="tv-row__unit">${esc(e.unit)}</span>` : ''}</span>
+        <span class="row__chevron" aria-hidden="true">›</span>
+      </a>
+    `);
+    if (e.ref) $('.tv-row__ref', row).textContent = TEST_FIELDS.includes(key) ? `лаборатория: ${e.ref}` : e.ref;
+    list.firstChild.appendChild(row);
+  });
+  screen.appendChild(list);
+  screen.appendChild(el('<p class="st-disclaimer">Диапазоны — справочные значения лаборатории из бланка; это не медицинская оценка.</p>'));
+  return screen;
+}
+
+/* ---------- Форма нового анализа / редактирования (#/test/new, #/test/<id>/edit) ----------
+   Документ: выбор, «Открыть», «Удалить» — изменения применяются по «Сохранить» (отмена ничего не меняет).
+   Показатели лаборатории (customResults) и прочие поля записи сохраняются без изменений. */
+async function TestFormScreen(id) {
+  const screen = el('<div></div>');
+  const existing = id ? await Storage.getTest(id) : null;
+  const done = () => goBackOr(existing ? `test/${encodeURIComponent(existing.id)}` : 'tests');
+  screen.appendChild(backHeader(existing ? 'Изменить анализ' : 'Новый анализ', { label: 'Отмена', onBack: done }));
+  if (id && !existing) {
+    screen.appendChild(el('<div class="empty">Анализ не найден — возможно, он был удалён.</div>'));
+    return screen;
+  }
+  const t = existing || { date: dateKey(), note: '' };
+  const form = el('<div class="input-card test-form"></div>');
+  form.appendChild(el(`<div class="field"><label class="field__label" for="f-date">Дата анализа</label><input class="input" type="date" id="f-date" value="${esc(t.date)}"></div>`));
+  TEST_FIELDS.forEach((f) => {
+    const ref = REFERENCE[f];
+    form.appendChild(el(`<div class="field"><label class="field__label">${esc(ref.label)} (${esc(ref.unit)})</label><input class="input" type="number" step="any" inputmode="decimal" data-field="${f}" value="${t[f] != null ? esc(t[f]) : ''}" placeholder="—"></div>`));
+  });
+  form.appendChild(el(`<div class="field"><label class="field__label" for="f-note">Заметка</label><input class="input" type="text" id="f-note" value="${esc(t.note || '')}" placeholder="напр. сдано не натощак"></div>`));
+  const extraCount = Array.isArray(t.customResults) ? t.customResults.length : 0;
+  if (extraCount) form.appendChild(el(`<p class="doc-block__hint" style="margin:0 0 12px">Показатели лаборатории (${extraCount}) сохраняются без изменений.</p>`));
+
+  /* ---- блок «Документ анализа» ---- */
+  const origMeta = attachmentOf(t);
+  let doc = origMeta ? { kind: 'existing', meta: origMeta } : { kind: 'none' };
+  const block = el(`
+    <div class="doc-block">
+      <div class="doc-block__title">Документ анализа</div>
+      <div class="doc-block__body"></div>
+      <label class="btn-ghost doc-block__pick"><span></span><input type="file" accept="${ATTACHMENT_ACCEPT}" hidden></label>
+      <p class="doc-block__hint">PDF, JPG, PNG или HEIC · до 15 МБ · файл хранится только на этом устройстве</p>
+    </div>
+  `);
+  const bodyEl = $('.doc-block__body', block);
+  const pickText = $('.doc-block__pick span', block);
+  const pickInput = $('.doc-block__pick input', block);
+  function paintDoc() {
+    bodyEl.innerHTML = '';
+    if (doc.kind === 'none') {
+      bodyEl.appendChild(el(`<p class="doc-block__empty">${origMeta ? 'Документ будет удалён при сохранении.' : 'Файл не прикреплён.'}</p>`));
+      pickText.textContent = 'Прикрепить PDF или фото';
+      return;
+    }
+    const meta = doc.kind === 'new' ? { name: doc.file.name, type: doc.type, size: doc.file.size } : doc.meta;
+    const row = el(`
+      <div class="doc-row">
+        <span class="doc-row__icon" aria-hidden="true">${DOC_ICON[docKind(meta.type)]}</span>
+        <div class="doc-row__body"><p class="doc-row__name"></p><p class="doc-row__meta">${esc(docLine(meta))}${doc.kind === 'new' ? ' · сохранится вместе с анализом' : ''}</p></div>
+      </div>
+    `);
+    $('.doc-row__name', row).textContent = meta.name || 'Документ';
+    const acts = el('<div class="doc-row__actions"><button class="doc-btn" type="button" data-act="open">Открыть</button><button class="doc-btn doc-btn--danger" type="button" data-act="del">Удалить</button></div>');
+    acts.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-act]');
+      if (!b) return;
+      if (b.dataset.act === 'open') {
+        if (doc.kind === 'new') openDocViewer(new File([doc.file], doc.file.name, { type: doc.type }));
+        else openTestDocument(doc.meta);
+      } else {
+        doc = { kind: 'none' };
+        paintDoc();
+      }
+    });
+    bodyEl.append(row, acts);
+    pickText.textContent = 'Заменить файл';
+  }
+  pickInput.addEventListener('change', async () => {
+    const file = pickInput.files && pickInput.files[0];
+    pickInput.value = '';
+    if (!file) return;
+    const check = await checkAttachmentFile(file);
+    if (!check.ok) { await alertDialog('Файл не прикреплён', `<p>${esc(check.message)}</p>`); return; }
+    doc = { kind: 'new', file, type: check.type };
+    paintDoc();
+  });
+  paintDoc();
+  form.appendChild(block);
+
+  const actions = el('<div class="test-form__actions"></div>');
+  const save = el(`<button class="btn-primary" type="button">${existing ? 'Сохранить' : 'Сохранить анализ'}</button>`);
+  const cancel = el('<button class="btn-ghost" type="button">Отмена</button>');
+  cancel.addEventListener('click', done);
+  actions.append(save, cancel);
+  form.appendChild(actions);
+
+  save.addEventListener('click', async () => {
+    const date = $('#f-date', form).value;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { await alertDialog('Анализ не сохранён', '<p>Укажите дату анализа.</p>'); return; }
+    const values = {};
+    $$('[data-field]', form).forEach((inp) => { values[inp.dataset.field] = inp.value !== '' ? Number(inp.value) : undefined; });
+    save.classList.add('is-busy');
+    let testId = existing ? existing.id : null;
+    try {
+      if (existing) {
+        const upd = await Storage.updateTest(existing.id, { date, note: $('#f-note', form).value.trim(), ...values });
+        if (!upd) { await alertDialog('Анализ не найден', '<p>Запись была удалена. Ничего не изменено.</p>'); location.replace('#/tests'); return; }
+      } else {
+        const entry = { date, note: $('#f-note', form).value.trim() };
+        Object.entries(values).forEach(([k, v]) => { if (v !== undefined) entry[k] = v; });
+        testId = (await Storage.addTest(entry)).id;
+      }
+    } catch (err) {
+      save.classList.remove('is-busy');
+      await alertDialog('Анализ не сохранён', `<p>${esc((err && err.message) || 'Попробуйте ещё раз.')}</p>`);
+      return;
+    }
+    let docError = null;
+    try {
+      if (doc.kind === 'new') await Attachments.attachToTest(testId, doc.file);
+      else if (doc.kind === 'none' && origMeta) await Attachments.removeFromTest(testId);
+    } catch (err) {
+      docError = err instanceof AttachmentError ? err.message : 'Не удалось сохранить документ на устройстве.';
+    }
+    if (!existing) { testsYear = 'all'; testsHighlight = testId; }
+    done();
+    if (docError) await alertDialog('Анализ сохранён, документ — нет', `<p>${esc(docError)}</p><p class="dialog__muted">Попробуйте прикрепить файл ещё раз через «Изменить».</p>`);
+    else flash(existing ? 'Сохранено ✓' : 'Анализ сохранён ✓');
+  });
+  screen.appendChild(form);
   return screen;
 }
 
@@ -2453,7 +2533,7 @@ function dayPointEvents(dateStr, data) {
     if (v.date === dateStr) ev.push({ icon: '🩺', title: v.doctor || 'Визит', sub: [v.specialty, v.clinic].filter(Boolean).join(' · ') || 'Визит к врачу', time: null, route: `visit/${v.id}` });
     if (v.nextDate === dateStr) ev.push({ icon: '📅', title: 'Следующий визит', sub: v.doctor || '', time: null, route: `visit/${v.id}` });
   });
-  data.tests.forEach((t) => { if (t.date === dateStr) ev.push({ icon: '🧪', title: 'Анализ крови', sub: t.note || 'Результаты внесены', time: null, route: 'tests' }); });
+  data.tests.forEach((t) => { if (t.date === dateStr) ev.push({ icon: '🧪', title: 'Анализ крови', sub: t.note || 'Результаты внесены', time: null, route: `test/${encodeURIComponent(t.id)}` }); });
   data.nextDoses.forEach(({ med, date }) => { if (date === dateStr) ev.push({ icon: '💊', title: med.name, sub: 'Следующая доза', time: null, route: 'meds' }); });
   data.notifs.forEach((n) => { if (n.enabled && n.repeat === 'once' && n.date === dateStr) ev.push({ icon: (NOTIF_TYPES[n.type] || {}).emoji || '🔔', title: n.text, sub: 'Напоминание', time: n.time, route: 'notifications' }); });
   return ev;
@@ -3081,7 +3161,7 @@ async function StatsScreen() {
       const st = evaluate(f.field, f.value);
       const outTxt = st === 'warn' || st === 'danger' ? 'вне справочного диапазона · ' : '';
       const prevTxt = f.prev ? `пред.: ${fmtNum(f.prev.value)} (${fmtDate(f.prev.date)}) · изменение ${fmtDelta(f.delta)}` : 'первое значение';
-      box.appendChild(el(`<div class="row"><span class="dot-status dot-status--${st}"></span><div class="row__body"><p class="row__title">${esc(ref.label)}</p><p class="row__sub">${esc(outTxt + prevTxt)}</p></div><span class="row__trailing">${esc(fmtNum(f.value))} ${esc(ref.unit)}</span></div>`));
+      box.appendChild(el(`<div class="row" role="button" data-route="test-history/${f.field}"><span class="dot-status dot-status--${st}"></span><div class="row__body"><p class="row__title">${esc(ref.label)}</p><p class="row__sub">${esc(outTxt + prevTxt)}</p></div><span class="row__trailing">${esc(fmtNum(f.value))} ${esc(ref.unit)}</span></div>`));
     });
     sec.appendChild(box);
     return sec;
@@ -3287,6 +3367,13 @@ function resolve() {
     if (rest.endsWith('/edit')) return { fn: () => VisitFormScreen(rest.slice(0, -5)), tab: null, main: false };
     return { fn: () => VisitDetailScreen(rest), tab: null, main: false };
   }
+  if (h === 'test/new') return { fn: () => TestFormScreen(null), tab: 'tests', main: false };
+  if (h.startsWith('test/')) {
+    const rest = h.slice(5);
+    if (rest.endsWith('/edit')) return { fn: () => TestFormScreen(safeDecode(rest.slice(0, -5))), tab: 'tests', main: false };
+    return { fn: () => TestDetailScreen(safeDecode(rest)), tab: 'tests', main: false };
+  }
+  if (h.startsWith('test-history/')) return { fn: () => TestHistoryScreen(safeDecode(h.slice(13))), tab: 'tests', main: false };
   if (h === 'water-log' || h.startsWith('water-log/')) return { fn: () => WaterLogScreen(h.slice(10)), tab: 'metrics', main: false };
   if (h.startsWith('metric/')) {
     const k = h.slice(7);
@@ -3297,9 +3384,31 @@ function resolve() {
   return { fn: HomeScreen, tab: 'home', main: true };
 }
 
+const safeDecode = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
+
+/* Место прокрутки хранится в записи истории браузера (history.state.y): «Назад» возвращает
+   экран туда, где он был, новый переход открывает экран сверху. Применяется к экранам
+   с node.restoreScroll = true (журнал анализов, полный анализ). */
+let scrollSaveTimer = 0;
+function saveScrollState() {
+  clearTimeout(scrollSaveTimer);
+  const y = lockedScrollY ?? window.scrollY;
+  try { history.replaceState({ ...(history.state || {}), y }, ''); } catch { /* Safari: лимит частоты replaceState */ }
+}
+/* Вернуться на предыдущий экран; открыт напрямую (истории нет) — на route */
+function goBackOr(route) {
+  if (history.length > 1) history.back();
+  else location.replace(`#/${route}`);
+}
+
 let renderToken = 0;
+let currentRoute = null;
 async function render() {
+  clearTimeout(scrollSaveTimer); // отложенное сохранение не должно попасть в запись нового экрана
   const { fn, tab, main } = resolve();
+  const route = location.hash.replace(/^#\/?/, '');
+  const routeChanged = route !== currentRoute;
+  currentRoute = route;
   const token = ++renderToken;
   closeDrawer();
   $$('.tab').forEach((t) => t.classList.toggle('is-active', t.dataset.route === tab));
@@ -3310,6 +3419,10 @@ async function render() {
   mount.innerHTML = '';
   mount.appendChild(node);
   mount.scrollTop = 0;
+  if (routeChanged && node.restoreScroll) {
+    const y = history.state && typeof history.state.y === 'number' ? history.state.y : 0;
+    window.scrollTo(0, y);
+  }
 }
 
 function initChrome() {
@@ -3332,6 +3445,8 @@ async function boot() {
   initChrome();
   await buildDrawer();
   window.addEventListener('hashchange', render);
+  window.addEventListener('scroll', () => { clearTimeout(scrollSaveTimer); scrollSaveTimer = setTimeout(saveScrollState, 250); }, { passive: true });
+  document.addEventListener('click', saveScrollState, true); // до перехода по ссылке/кнопке
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { render(); Notifier.check(); } });
   await render();
   registerSW();

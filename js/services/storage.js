@@ -100,6 +100,14 @@ export const TEST_FIELDS = [
   'hba1c', 'vitd', 'tsh', 'psa', 'hgb', 'hct',
 ];
 
+/* Анализы от новых к старым. Одна дата — позже добавленный выше: записи хранятся
+   в порядке добавления (addTest дописывает в конец, updateTest место не меняет). */
+export function sortTests(list) {
+  return list.map((t, i) => [t, i])
+    .sort((a, b) => b[0].date.localeCompare(a[0].date) || b[1] - a[1])
+    .map(([t]) => t);
+}
+
 /* ---------- утилиты ---------- */
 
 /* §6.5 — календарная дата в ISO (YYYY-MM-DD, локальная) */
@@ -967,8 +975,7 @@ export class StorageService {
 
   /* ---- Анализы (новые сверху) ---- */
   async getTests() {
-    const list = await this._read(KEYS.tests, []);
-    return list.slice().sort((a, b) => b.date.localeCompare(a.date));
+    return sortTests(await this._read(KEYS.tests, []));
   }
   async getLatestTest() {
     return (await this.getTests())[0] || null;

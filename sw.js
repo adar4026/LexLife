@@ -6,7 +6,7 @@
    Меняйте CACHE_VERSION при обновлении ассетов.
    ========================================================= */
 
-const CACHE_VERSION = 'lexlife-v29';
+const CACHE_VERSION = 'lexlife-v30';
 const FONT_CACHE = 'lexlife-fonts-v1';
 
 const APP_SHELL = [
@@ -21,7 +21,11 @@ const APP_SHELL = [
   './js/services/fullBackup.js',
   './js/services/preparedImport.js',
   './js/services/zip.js',
+  './js/services/testsJournal.js',
   './js/ui/charts.js',
+  './js/ui/docViewer.js',
+  './js/vendor/pdfjs/pdf.min.js',
+  './js/vendor/pdfjs/pdf.worker.min.js',
   './manifest.json',
   './icons/lexlife-icon-192.png',
 ];
