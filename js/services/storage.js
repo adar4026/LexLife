@@ -334,11 +334,12 @@ const mapOf = (pred) => (v) => isPlainObj(v) && Object.entries(v).every(([k, x])
 
 /* Анализ: необязательные поля (все аддитивные — старые версии их просто не показывают).
    attachments — метаданные документа (сам файл в IndexedDB, services/attachments.js);
-   customResults — показатели вне основных полей формы; labRanges — диапазоны лаборатории
+   customResults — показатели вне основных полей формы (value — число; text — качественный
+   результат бланка без числа, например «отрицательно»); labRanges — диапазоны лаборатории
    для основных полей; importId — метка подготовленного импорта (защита от повторов). */
 const TEST_ATTACHMENT_OK = (a) => isPlainObj(a) && (a.attachmentId == null || isSafeId(a.attachmentId))
   && isStrOrNull(a.name) && isStrOrNull(a.type) && isNumOrNull(a.size) && isStrOrNull(a.addedAt);
-const TEST_RESULT_OK = (r) => isPlainObj(r) && typeof r.name === 'string' && isNumOrNull(r.value)
+const TEST_RESULT_OK = (r) => isPlainObj(r) && typeof r.name === 'string' && isNumOrNull(r.value) && isStrOrNull(r.text)
   && isStrOrNull(r.unit) && isStrOrNull(r.ref) && isStrOrNull(r.group) && isNumOrNull(r.refLow) && isNumOrNull(r.refHigh);
 export const IMPORT_ID_RE = /^[A-Za-z0-9._:-]{8,100}$/;
 const testExtrasOk = (t) => (t.attachments == null || (Array.isArray(t.attachments) && t.attachments.every(TEST_ATTACHMENT_OK)))

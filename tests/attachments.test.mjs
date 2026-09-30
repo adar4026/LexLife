@@ -468,6 +468,43 @@ test('сохраняются все пользовательские показ�
   assert.deepEqual(parseRange('для мужчин 30–400'), {});
 });
 
+test('качественные результаты бланка (text) импортируются без числа и переживают обычный и полный backup', async () => {
+  const { storage, store } = await setup();
+  const parsed = parsePreparedTest(preparedJson({
+    importId: 'synthetic-text-0001',
+    test: {
+      date: '2025-04-10',
+      customResults: [
+        { group: 'Анализ мочи', name: 'Показатель Т1', text: 'отрицательно', unit: 'mg/dL', ref: '' },
+        { group: 'Анализ мочи', name: 'Показатель Т2', value: 5.5, unit: '', ref: '5.00–7.80' },
+        { group: 'Микробиология', name: 'Показатель Т3', text: '  не проводится  ' },
+      ],
+    },
+  }), { today: new Date('2026-01-01') });
+  const [t1, t2, t3] = parsed.entry.customResults;
+  assert.deepEqual(t1, { group: 'Анализ мочи', name: 'Показатель Т1', text: 'отрицательно', unit: 'mg/dL', ref: '' });
+  assert.ok(!('value' in t1), 'числа у текстового результата нет');
+  assert.equal(t2.value, 5.5);
+  assert.ok(!('text' in t2));
+  assert.equal(t3.text, 'не проводится');
+  const { entry } = await importPreparedTest(storage, parsed);
+  const service = new AttachmentService(storage, store);
+  await service.attachToTest(entry.id, pdfFile('synthetic.pdf'));
+
+  const b = await storage.createBackup();
+  assert.equal(b.verified, true);
+  const other = await setup();
+  await other.storage.restoreBackup(await other.storage.prepareRestore(parseBackup(b.json)));
+  assert.deepEqual((await other.storage.getTests())[0].customResults, entry.customResults);
+
+  const full = await createFullBackup(storage, store);
+  const dst = await setup();
+  await applyFullRestore(dst.storage, dst.service, await prepareFullRestore(dst.storage, full.blob));
+  const restored = (await dst.storage.getTests())[0];
+  assert.deepEqual(restored.customResults, entry.customResults);
+  await sameBytes(await dst.service.getFile(attachmentOf(restored)), PDF);
+});
+
 test('JSON-импорт отклоняет некорректные файлы с понятным сообщением', () => {
   const today = { today: new Date('2026-01-01') };
   const bad = (json, re) => assert.throws(() => parsePreparedTest(json, today), (e) => e instanceof PreparedImportError && re.test(e.message));
@@ -485,6 +522,11 @@ test('JSON-импорт отклоняет некорректные файлы �
   bad(preparedJson({ test: { date: '2025-02-01', customResults: [{ name: 'A', value: 'много' }] } }), /числом/);
   bad(preparedJson({ test: { date: '2025-02-01', customResults: [{ name: 'A', value: 1 }, { name: 'A', value: 2 }] } }), /повторяется/);
   bad(preparedJson({ test: { date: '2025-02-01', customResults: [{ name: 'A', value: 1, dob: '1970' }] } }), /неизвестные поля/);
+  bad(preparedJson({ test: { date: '2025-02-01', customResults: [{ name: 'A', value: 1, text: 'норма' }] } }), /либо число/);
+  bad(preparedJson({ test: { date: '2025-02-01', customResults: [{ name: 'A', text: '   ' }] } }), /непустым текстовым/);
+  bad(preparedJson({ test: { date: '2025-02-01', customResults: [{ name: 'A', text: 5 }] } }), /текстом/);
+  bad(preparedJson({ test: { date: '2025-02-01', customResults: [{ name: 'A', text: 'x'.repeat(61) }] } }), /слишком длинное/);
+  bad(preparedJson({ test: { date: '2025-02-01', customResults: [{ name: 'A' }] } }), /числом/);
   bad('{"__proto__":{"x":1},"app":"lexlife"}', /не является/);
 });
 

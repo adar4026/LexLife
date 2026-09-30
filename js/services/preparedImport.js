@@ -13,7 +13,8 @@ export const PREPARED_FORMAT_VERSION = 1;
 const MAX_TEXT = 1024 * 1024;
 const MAX_RESULTS = 300;
 const TEST_KEYS = new Set(['date', 'note', 'labRanges', 'customResults', ...TEST_FIELDS]);
-const RESULT_KEYS = new Set(['group', 'name', 'value', 'unit', 'ref']);
+const RESULT_KEYS = new Set(['group', 'name', 'value', 'text', 'unit', 'ref']);
+const MAX_RESULT_TEXT = 60;
 const FORBIDDEN = new Set(['__proto__', 'prototype', 'constructor']);
 
 export class PreparedImportError extends Error {
@@ -113,8 +114,11 @@ export function parsePreparedTest(text, { today = new Date() } = {}) {
       if (extra.length) fail(`Показатель №${n}: неизвестные поля ${extra.join(', ')}.`);
       const name = str(r.name, 120, `название показателя №${n}`);
       if (!name) fail(`Показатель №${n}: нет названия.`);
-      if (!isNum(r.value)) fail(`Показатель «${name}»: значение должно быть числом.`);
-      const item = { group: str(r.group, 60, 'группа'), name, value: r.value, unit: str(r.unit, 40, `единица «${name}»`), ref: str(r.ref, 200, `диапазон «${name}»`) };
+      /* значение — число; качественный результат бланка («отрицательно», «норма») — текст в text, без числа */
+      const text = str(r.text, MAX_RESULT_TEXT, `результат «${name}»`);
+      if (r.value != null && r.text != null) fail(`Показатель «${name}»: укажите либо число (value), либо текстовый результат (text).`);
+      if (r.text != null ? !text : !isNum(r.value)) fail(`Показатель «${name}»: значение должно быть числом или непустым текстовым результатом.`);
+      const item = { group: str(r.group, 60, 'группа'), name, ...(text ? { text } : { value: r.value }), unit: str(r.unit, 40, `единица «${name}»`), ref: str(r.ref, 200, `диапазон «${name}»`) };
       const key = `${item.group}\u0001${item.name}\u0001${item.unit}`.toLowerCase();
       if (seen.has(key)) fail(`Показатель «${name}» повторяется.`);
       seen.add(key);

@@ -44,6 +44,8 @@ const fmtFull = (d = new Date()) => {
 const fmtDate = (iso) =>
   new Date(iso + 'T00:00:00').toLocaleDateString(RU, { day: 'numeric', month: 'short', year: 'numeric' });
 const fmtNum = (n) => (n == null ? '—' : String(n).replace('.', ','));
+/* Значение показателя лаборатории: число или качественный результат бланка («отрицательно») */
+const fmtResult = (r) => (r.value == null && r.text ? r.text : fmtNum(r.value));
 
 /* ---------- реестр показателей ---------- */
 const METRICS = {
@@ -996,7 +998,7 @@ async function TestsScreen() {
       const sameDate = tests.some((x) => x.date === summary.date);
       const mainRows = summary.main.map((f) => `<li><span>${esc(REFERENCE[f].label)}</span><span>${esc(fmtNum(entry[f]))} ${esc(REFERENCE[f].unit)}</span></li>`).join('');
       const groupRows = summary.groups.map((g) => `<li><span>${esc(g.name)}</span><span>${g.items.length}</span></li>`).join('');
-      const allRows = summary.groups.map((g) => `<p class="dialog__muted" style="margin:10px 0 4px">${esc(g.name)}</p><ul class="dialog__list">${g.items.map((r) => `<li><span>${esc(r.name)}</span><span>${esc(fmtNum(r.value))} ${esc(r.unit || '')}</span></li>`).join('')}</ul>`).join('');
+      const allRows = summary.groups.map((g) => `<p class="dialog__muted" style="margin:10px 0 4px">${esc(g.name)}</p><ul class="dialog__list">${g.items.map((r) => `<li><span>${esc(r.name)}</span><span>${esc(fmtResult(r))} ${esc(r.unit || '')}</span></li>`).join('')}</ul>`).join('');
       const go = await showDialog({
         title: 'Подготовленный анализ',
         body: `
@@ -1092,13 +1094,13 @@ async function TestDetailScreen(id) {
         <a class="row tv-row" href="#/test-history/${encodeURIComponent(r.key)}">
           <span class="dot-status dot-status--${r.status}" aria-hidden="true"></span>
           <span class="row__body"><span class="tv-row__name"></span>${refText ? '<span class="tv-row__ref"></span>' : ''}</span>
-          <span class="tv-row__val">${r.out ? `<span class="test-value__out" title="${hint}" aria-label="${hint}">${r.out}</span> ` : ''}<b>${esc(fmtNum(r.value))}</b>${r.unit ? ` <span class="tv-row__unit">${esc(r.unit)}</span>` : ''}</span>
+          <span class="tv-row__val">${r.out ? `<span class="test-value__out" title="${hint}" aria-label="${hint}">${r.out}</span> ` : ''}<b>${esc(fmtResult(r))}</b>${r.unit ? ` <span class="tv-row__unit">${esc(r.unit)}</span>` : ''}</span>
           <span class="row__chevron" aria-hidden="true">›</span>
         </a>
       `);
       $('.tv-row__name', row).textContent = r.name;
       if (refText) $('.tv-row__ref', row).textContent = refText;
-      row.setAttribute('aria-label', `${r.name}: ${fmtNum(r.value)} ${r.unit}${hint ? `, ${hint}` : ''}. История показателя`);
+      row.setAttribute('aria-label', `${r.name}: ${fmtResult(r)} ${r.unit}${hint ? `, ${hint}` : ''}. История показателя`);
       box.appendChild(row);
     });
     screen.appendChild(sec);
@@ -1150,6 +1152,8 @@ async function TestHistoryScreen(key) {
       readout: (day) => { const p = points.find((q) => q.day === day); return `<span class="chart__rv">${esc(fmtNum(p.value))} <small>${esc(h.unit)}</small></span><span class="chart__rd">${esc(fmtDate(p.date))}</span>`; },
     }));
     screen.appendChild(card);
+  } else if (h.entries.every((e) => e.value == null)) {
+    screen.appendChild(el('<p class="backup-note" style="margin:12px 2px 4px">Результат лаборатории — текстом, без числа, поэтому графика нет.</p>'));
   } else {
     screen.appendChild(el('<p class="backup-note" style="margin:12px 2px 4px">График появится, когда будет хотя бы два анализа с этим показателем.</p>'));
   }
@@ -1161,7 +1165,7 @@ async function TestHistoryScreen(key) {
       <a class="row tv-row" href="#/test/${encodeURIComponent(e.testId)}">
         <span class="dot-status dot-status--${e.status}" aria-hidden="true"></span>
         <span class="row__body"><span class="tv-row__name">${esc(fmtTestDate(e.date))}${e.sameDay > 1 ? ` · № ${e.no}` : ''}</span>${e.ref ? '<span class="tv-row__ref"></span>' : ''}</span>
-        <span class="tv-row__val">${e.out ? `<span class="test-value__out" title="${hint}">${e.out}</span> ` : ''}<b>${esc(fmtNum(e.value))}</b>${e.unit ? ` <span class="tv-row__unit">${esc(e.unit)}</span>` : ''}</span>
+        <span class="tv-row__val">${e.out ? `<span class="test-value__out" title="${hint}">${e.out}</span> ` : ''}<b>${esc(fmtResult(e))}</b>${e.unit ? ` <span class="tv-row__unit">${esc(e.unit)}</span>` : ''}</span>
         <span class="row__chevron" aria-hidden="true">›</span>
       </a>
     `);

@@ -213,7 +213,8 @@ fallback → home
 // health_tests (11 основных показателей + необязательные поля; файлы документов — в IndexedDB, §7.2)
 [ { "id": "...", "date": "ГГГГ-ММ-ДД", "chol": 190, "ldl": 110, ..., "note": "...",
     "attachments": [ { "attachmentId": "att_...", "name": "...", "type": "application/pdf", "size": 0, "addedAt": "ISO" } ],
-    "customResults": [ { "group": "...", "name": "...", "value": 0, "unit": "...", "ref": "...", "refLow": 0, "refHigh": 0 } ],
+    "customResults": [ { "group": "...", "name": "...", "value": 0, "unit": "...", "ref": "...", "refLow": 0, "refHigh": 0 },
+                       { "group": "Анализ мочи", "name": "...", "text": "отрицательно", "unit": "", "ref": "" } ],  // text — качественный результат без числа
     "labRanges": { "ldl": "..." }, "importId": "...", "importedAt": "ISO", "source": "prepared-json" } ]
 // health_meds
 [ { "id": "...", "name": "...", "icon": "💊", "dose": "...", "purpose": "...", "start": "...", "end": "...", "reminder_time": "21:00", "every_days": 15, "active": true } ]

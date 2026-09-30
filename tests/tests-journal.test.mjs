@@ -141,7 +141,7 @@ test('описание групп: группы бланка, иначе раз�
 
 /* ================= разделы полного анализа ================= */
 
-test('разделы полного анализа: Липиды · Сахар · Печень и почки · Железо и витамины · Гематология · Другие', () => {
+test('разделы полного анализа: Липиды · Сахар · Печень и почки · Железо и витамины · Гематология · (Анализ мочи) · Другие', () => {
   const cases = {
     'LDL холестерин': 'lipids', 'Colesterol HDL': 'lipids', 'Триглицериды': 'lipids',
     'Глюкоза': 'sugar', 'Гликированный гемоглобин HbA1c': 'sugar', 'Мочевая кислота': 'sugar', 'Инсулин': 'sugar',
@@ -173,6 +173,40 @@ test('разделы полного анализа: Липиды · Сахар �
   assert.deepEqual(other, ['PSA', 'Новый показатель'], 'пользовательский показатель показан');
   assert.equal(outOfLabRange({ value: 12, refLow: 4, refHigh: 11 }), '↑');
   assert.equal(outOfLabRange({ value: 12 }), '');
+});
+
+test('анализ мочи — отдельный раздел: одноимённые показатели не смешиваются с кровью; текстовые результаты', async () => {
+  const urine = (name, extra) => ({ group: 'Анализ мочи', name, unit: '', ref: '', ...extra });
+  assert.equal(sectionOfResult({ name: 'Глюкоза (моча)', group: 'Анализ мочи' }), 'urine');
+  assert.equal(sectionOfResult({ name: 'Гемоглобин/миоглобин (моча)', group: 'Анализ мочи' }), 'urine');
+  assert.equal(sectionOfResult({ name: 'Densidad', group: 'Orina' }), 'urine');
+  assert.equal(sectionOfResult({ name: 'Мочевина', group: 'Биохимия' }), 'organs', 'мочевина крови — не анализ мочи');
+  assert.equal(sectionOfResult({ name: 'Посев', group: 'Микробиология' }), 'other');
+
+  const { storage } = await setup();
+  const t = await storage.addTest({
+    date: '2025-04-10', glucose: 90, psa: 1,
+    customResults: [
+      lab('Гематология', 'Лейкоциты', 5, 'x10³/mm³', '4.00–11.00', 4, 11),
+      urine('pH мочи', { value: 5.5, ref: '5.00–7.80', refLow: 5, refHigh: 7.8 }),
+      urine('Глюкоза (моча)', { text: 'отрицательно', unit: 'mg/dL' }),
+      { group: 'Микробиология', name: 'Посев', text: 'не проводится' },
+    ],
+  });
+  const secs = testSections(t);
+  assert.deepEqual(secs.map((s) => s.title), ['Сахар и метаболизм', 'Гематология', 'Анализ мочи', 'Другие показатели']);
+  const u = secs.find((s) => s.key === 'urine').rows;
+  assert.deepEqual(u.map((r) => [r.name, r.value, r.text, r.out]), [['pH мочи', 5.5, '', ''], ['Глюкоза (моча)', null, 'отрицательно', '']]);
+  assert.deepEqual(secs.find((s) => s.key === 'sugar').rows.map((r) => r.name), ['Глюкоза'], 'глюкоза мочи не попала к глюкозе крови');
+  assert.equal(indicatorCount(t), 6);
+  assert.equal(groupSummary(t), 'Гематология · Анализ мочи · Микробиология · Сахар и метаболизм');
+
+  await storage.addTest({ date: '2025-10-01', customResults: [urine('Глюкоза (моча)', { text: 'норма' })] });
+  const h = indicatorHistory(await storage.getTests(), customKey('Глюкоза (моча)'));
+  assert.deepEqual(h.entries.map((e) => [e.date, e.value, e.text]), [['2025-10-01', null, 'норма'], ['2025-04-10', null, 'отрицательно']]);
+  assert.deepEqual(h.points, [], 'текстовые результаты не попадают в график');
+  /* текст игнорируется, если есть число */
+  assert.equal(testSections({ date: '2025-01-01', customResults: [urine('X', { value: 1, text: 'y' })] })[0].rows[0].text, '');
 });
 
 /* ================= история показателя ================= */

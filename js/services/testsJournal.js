@@ -17,6 +17,7 @@ export const SECTIONS = [
   { key: 'organs', title: 'Печень и почки' },
   { key: 'iron', title: 'Железо и витамины' },
   { key: 'blood', title: 'Гематология' },
+  { key: 'urine', title: 'Анализ мочи' },
   { key: 'other', title: 'Другие показатели' },
 ];
 
@@ -29,6 +30,8 @@ const FIELD_SECTION = {
 };
 
 /* Раздел показателя лаборатории — по названию (рус./лат./исп.), затем по группе бланка.
+   Исключение — группа «Анализ мочи»: её показатели (глюкоза, билирубин, гемоглобин в моче)
+   остаются в своём разделе и не смешиваются с одноимёнными показателями крови.
    words — целые слова (короткие аббревиатуры), stems — части слов. Порядок правил важен:
    «гликированный гемоглобин» — сахар, а не гематология; СРБ — «Другие». */
 const RULES = [
@@ -52,6 +55,8 @@ const RULES = [
       'палочкояд', 'сегментояд', 'ретикулоцит', 'reticulocit', 'reticulocyt', 'тромбокрит', 'plaquetocrit', 'plateletcrit'] },
 ];
 
+const URINE_GROUP = ['моч', 'orina', 'urin'];
+
 const GROUP_RULES = [
   { section: 'blood', stems: ['гематолог', 'hemat', 'кровь общ', 'общий анализ крови', 'hemogram'] },
   { section: 'iron', stems: ['витамин', 'vitamin'] },
@@ -63,12 +68,13 @@ const lower = (s) => String(s || '').toLowerCase().replace(/ё/g, 'е');
 const wordsOf = (s) => lower(s).split(/[^a-zа-я0-9áéíóúñü]+/).filter(Boolean);
 
 export function sectionOfResult(r) {
+  const group = lower(r && r.group);
+  if (URINE_GROUP.some((s) => group.includes(s))) return 'urine';
   const name = lower(r && r.name);
   const words = new Set(wordsOf(name));
   for (const rule of RULES) {
     if (rule.words.some((w) => words.has(w)) || rule.stems.some((s) => name.includes(s))) return rule.section;
   }
-  const group = lower(r && r.group);
   for (const rule of GROUP_RULES) if (rule.stems.some((s) => group.includes(s))) return rule.section;
   return 'other';
 }
@@ -103,6 +109,8 @@ export const customKey = (name) => `c:${normName(name)}`;
 
 const customList = (t) => (Array.isArray(t && t.customResults) ? t.customResults.filter((r) => r && typeof r.name === 'string') : []);
 const hasNum = (v) => typeof v === 'number' && Number.isFinite(v);
+/* качественный результат бланка («отрицательно») — только если нет числа */
+const textOf = (r) => (!hasNum(r.value) && typeof r.text === 'string' && r.text.trim() ? r.text.trim() : '');
 
 /* ---------- строки показателей одной записи ---------- */
 function rowsOf(t) {
@@ -119,7 +127,7 @@ function rowsOf(t) {
   customList(t).forEach((r) => {
     rows.push({
       kind: 'custom', key: customKey(r.name), section: sectionOfResult(r), name: r.name,
-      value: hasNum(r.value) ? r.value : null, unit: r.unit || '', ref: r.ref || '', group: r.group || '',
+      value: hasNum(r.value) ? r.value : null, text: textOf(r), unit: r.unit || '', ref: r.ref || '', group: r.group || '',
       status: 'none', out: outOfLabRange(r),
     });
   });
@@ -154,6 +162,7 @@ const SECTION_WORDS = {
   organs: ['печен', 'почк', 'hepat', 'renal'],
   iron: ['желез', 'витамин', 'vitamin'],
   blood: ['гематолог', 'hemat', 'кровь'],
+  urine: URINE_GROUP,
   other: [],
 };
 
@@ -195,7 +204,7 @@ export function sameDayNumber(tests, id) {
 }
 
 /* ---------- история одного показателя ----------
-   → { key, title, unit, entries: [{ testId, date, no, sameDay, value, unit, ref, out, status }] (новые сверху),
+   → { key, title, unit, entries: [{ testId, date, no, sameDay, value, text, unit, ref, out, status }] (новые сверху),
        points: [{ date, value }] (для графика: одна единица, по одному значению на дату — позже добавленное) } */
 export function indicatorHistory(tests, key) {
   const isField = TEST_FIELDS.includes(key);
@@ -213,7 +222,7 @@ export function indicatorHistory(tests, key) {
     }
     customList(t).filter((r) => customKey(r.name) === key).forEach((r) => {
       entries.push({
-        testId: t.id, date: t.date, no, sameDay, value: hasNum(r.value) ? r.value : null, unit: r.unit || '',
+        testId: t.id, date: t.date, no, sameDay, value: hasNum(r.value) ? r.value : null, text: textOf(r), unit: r.unit || '',
         ref: r.ref || '', out: outOfLabRange(r), status: 'none', name: r.name,
       });
     });
