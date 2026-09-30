@@ -16,7 +16,7 @@ import { createFullBackup, prepareFullRestore, applyFullRestore } from '../js/se
 import { parsePreparedTest, importPreparedTest } from '../js/services/preparedImport.js';
 import {
   journal, groupSummary, testSections, indicatorHistory, sameDayNumber, sectionOfResult,
-  customKey, evaluateField, outOfLabRange, indicatorCount,
+  customKey, resultKey, evaluateField, outOfLabRange, indicatorCount,
 } from '../js/services/testsJournal.js';
 import { DocSession, stepZoom, clampZoom, canvasScale } from '../js/ui/docViewer.js';
 import { makeTestPdf } from './helpers/syntheticPdf.mjs';
@@ -141,7 +141,7 @@ test('описание групп: группы бланка, иначе раз�
 
 /* ================= разделы полного анализа ================= */
 
-test('разделы полного анализа: Липиды · Сахар · Печень и почки · Железо и витамины · Гематология · (Анализ мочи) · Другие', () => {
+test('разделы полного анализа: Липиды · Сахар · Печень и почки · Железо и витамины · Гематология · (Анализ мочи · Кал) · Другие', () => {
   const cases = {
     'LDL холестерин': 'lipids', 'Colesterol HDL': 'lipids', 'Триглицериды': 'lipids',
     'Глюкоза': 'sugar', 'Гликированный гемоглобин HbA1c': 'sugar', 'Мочевая кислота': 'sugar', 'Инсулин': 'sugar',
@@ -207,6 +207,70 @@ test('анализ мочи — отдельный раздел: одноимё�
   assert.deepEqual(h.points, [], 'текстовые результаты не попадают в график');
   /* текст игнорируется, если есть число */
   assert.equal(testSections({ date: '2025-01-01', customResults: [urine('X', { value: 1, text: 'y' })] })[0].rows[0].text, '');
+});
+
+test('кал — отдельный раздел по группе бланка; «кальций» и одноимённые показатели крови туда не попадают', () => {
+  assert.equal(sectionOfResult({ name: 'Показатель К1', group: 'Кал' }), 'stool');
+  assert.equal(sectionOfResult({ name: 'Показатель К1', group: 'Анализ кала' }), 'stool');
+  assert.equal(sectionOfResult({ name: 'Sangre oculta', group: 'Heces' }), 'stool');
+  assert.equal(sectionOfResult({ name: 'Гемоглобин', group: 'Кал' }), 'stool', 'гемоглобин в кале — не гематология');
+  assert.equal(sectionOfResult({ name: 'Кальций', group: 'Биохимия' }), 'other');
+  assert.equal(sectionOfResult({ name: 'Показатель X', group: 'Кальций и фосфор' }), 'other', '«кал» — только целым словом');
+
+  const t = {
+    date: '2026-02-14',
+    customResults: [
+      lab('Гематология', 'Лейкоциты', 5, 'x10³/mm³', '4.00–11.00', 4, 11),
+      { group: 'Анализ мочи', name: 'Показатель М1', text: 'neg', unit: '', ref: '' },
+      { group: 'Анализ мочи', name: 'Показатель М2', text: 'norm', unit: 'mg/dL', ref: '' },
+      { group: 'Кал', name: 'Показатель К1', text: 'NEGATIVO', unit: '', ref: '' },
+    ],
+  };
+  const secs = testSections(t);
+  assert.deepEqual(secs.map((s) => s.title), ['Гематология', 'Анализ мочи', 'Кал']);
+  assert.deepEqual(secs.find((s) => s.key === 'stool').rows.map((r) => [r.name, r.value, r.text, r.out]), [['Показатель К1', null, 'NEGATIVO', '']]);
+  assert.deepEqual(secs.find((s) => s.key === 'urine').rows.map((r) => r.text), ['neg', 'norm'], 'текст сохраняется как на бланке');
+  assert.equal(groupSummary(t), 'Гематология · Анализ мочи · Кал');
+  assert.deepEqual(indicatorHistory([{ id: 'a', ...t }], customKey('Показатель К1')).points, [], 'текст не попадает в график');
+});
+
+test('показатели мочи — стабильные ключи: история разных названий объединяется, исходное название сохраняется', async () => {
+  const u = (name, extra) => ({ group: 'Анализ мочи', name, unit: '', ref: '', ...extra });
+  const keys = {
+    'pH мочи': 'urine_ph', 'pH': 'urine_ph', 'Удельный вес': 'urine_specific_gravity', 'Densidad': 'urine_specific_gravity',
+    'Белок (моча)': 'urine_protein', 'PROTEINAS': 'urine_protein', 'Глюкоза в моче': 'urine_glucose', 'Glucosuria': 'urine_glucose',
+    'Нитриты': 'urine_nitrites', 'Кетоновые тела': 'urine_ketones', 'Cuerpos cetónicos': 'urine_ketones',
+    'Уробилиноген': 'urine_urobilinogen', 'Билирубин в моче': 'urine_bilirubin', 'Гемоглобин/миоглобин (моча)': 'urine_hemoglobin_myoglobin',
+    'Осадок мочи': 'urine_sediment', 'Sedimento': 'urine_sediment',
+  };
+  for (const [name, key] of Object.entries(keys)) assert.equal(resultKey(u(name)), key, name);
+  assert.equal(resultKey({ group: 'Биохимия', name: 'Глюкоза' }), customKey('Глюкоза'), 'вне мочи — прежний ключ');
+  assert.equal(resultKey({ group: 'Биохимия', name: 'Билирубин общий' }), customKey('Билирубин общий'));
+  assert.equal(resultKey(u('Показатель М9')), customKey('Показатель М9'), 'нестандартный показатель мочи — по названию');
+
+  const { storage } = await setup();
+  const a = await storage.addTest({ date: '2025-03-01', customResults: [u('pH мочи', { value: 5.5 }), u('Белок (моча)', { text: 'отрицательно', unit: 'mg/dL' })] });
+  await storage.addTest({ date: '2026-02-14', customResults: [u('pH', { value: 6 }), u('Белок в моче', { value: 25, unit: 'mg/dL' }), u('Нитриты', { text: 'neg' })] });
+  const tests = await storage.getTests();
+  const saved = (await storage.getTest(a.id)).customResults.map((r) => r.name);
+  assert.deepEqual(saved, ['pH мочи', 'Белок (моча)'], 'в записи названия не меняются');
+
+  const b = tests.find((t) => t.date === '2026-02-14');
+  const rows = testSections(b).find((s) => s.key === 'urine').rows;
+  assert.deepEqual(rows.map((r) => [r.key, r.name, r.labName]), [
+    ['urine_ph', 'pH мочи', 'pH'], ['urine_protein', 'Белок (моча)', 'Белок в моче'], ['urine_nitrites', 'Нитриты', ''],
+  ]);
+
+  const ph = indicatorHistory(tests, 'urine_ph');
+  assert.equal(ph.title, 'pH мочи');
+  assert.deepEqual(ph.points, [{ date: '2025-03-01', value: 5.5 }, { date: '2026-02-14', value: 6 }], 'общий график по датам');
+  assert.deepEqual(ph.entries.map((e) => e.labName), ['pH', '']);
+  const prot = indicatorHistory(tests, 'urine_protein');
+  assert.deepEqual(prot.entries.map((e) => [e.date, e.value, e.text]), [['2026-02-14', 25, ''], ['2025-03-01', null, 'отрицательно']]);
+  assert.deepEqual(prot.points, [{ date: '2026-02-14', value: 25 }], 'текст не попадает в график');
+  const nit = indicatorHistory(tests, 'urine_nitrites');
+  assert.deepEqual([nit.entries.map((e) => e.text), nit.points], [['neg'], []]);
+  assert.deepEqual(indicatorHistory(tests, customKey('pH')).points.length, 2, 'старая ссылка c:<название> ведёт на общий ключ');
 });
 
 /* ================= история показателя ================= */

@@ -18,6 +18,7 @@ export const SECTIONS = [
   { key: 'iron', title: 'Железо и витамины' },
   { key: 'blood', title: 'Гематология' },
   { key: 'urine', title: 'Анализ мочи' },
+  { key: 'stool', title: 'Кал' },
   { key: 'other', title: 'Другие показатели' },
 ];
 
@@ -30,8 +31,8 @@ const FIELD_SECTION = {
 };
 
 /* Раздел показателя лаборатории — по названию (рус./лат./исп.), затем по группе бланка.
-   Исключение — группа «Анализ мочи»: её показатели (глюкоза, билирубин, гемоглобин в моче)
-   остаются в своём разделе и не смешиваются с одноимёнными показателями крови.
+   Исключение — группы «Анализ мочи» и «Кал»: их показатели (глюкоза, билирубин, гемоглобин в моче,
+   скрытая кровь в кале) остаются в своём разделе и не смешиваются с одноимёнными показателями крови.
    words — целые слова (короткие аббревиатуры), stems — части слов. Порядок правил важен:
    «гликированный гемоглобин» — сахар, а не гематология; СРБ — «Другие». */
 const RULES = [
@@ -56,6 +57,10 @@ const RULES = [
 ];
 
 const URINE_GROUP = ['моч', 'orina', 'urin'];
+/* «Кал» / «Анализ кала» — целым словом, чтобы не задеть «кальций»; остальное — части слов */
+const STOOL_WORDS = ['кал', 'кала'];
+const STOOL_GROUP = ['копрогр', 'heces', 'stool', 'feces', 'faeces', 'fecal', 'faecal'];
+const isStoolGroup = (group) => wordsOf(group).some((w) => STOOL_WORDS.includes(w)) || STOOL_GROUP.some((s) => group.includes(s));
 
 const GROUP_RULES = [
   { section: 'blood', stems: ['гематолог', 'hemat', 'кровь общ', 'общий анализ крови', 'hemogram'] },
@@ -70,6 +75,7 @@ const wordsOf = (s) => lower(s).split(/[^a-zа-я0-9áéíóúñü]+/).filter(Bo
 export function sectionOfResult(r) {
   const group = lower(r && r.group);
   if (URINE_GROUP.some((s) => group.includes(s))) return 'urine';
+  if (isStoolGroup(group)) return 'stool';
   const name = lower(r && r.name);
   const words = new Set(wordsOf(name));
   for (const rule of RULES) {
@@ -107,6 +113,33 @@ const normName = (s) => lower(s).trim().replace(/\s+/g, ' ');
 export const fieldKey = (f) => f;
 export const customKey = (name) => `c:${normName(name)}`;
 
+/* Стандартные показатели анализа мочи — стабильный внутренний ключ и единое название.
+   Лаборатории и импорты называют их по-разному («pH» / «pH мочи», «Белок в моче» / «Белок (моча)»,
+   PROTEINAS / GLUCOSURIA); ключ объединяет историю, исходное название в записи не меняется.
+   Только для показателей раздела «Анализ мочи»; порядок правил важен (уробилиноген — до билирубина). */
+const URINE_KEYS = [
+  { key: 'urine_specific_gravity', label: 'Удельный вес мочи', stems: ['удельн', 'плотност', 'densidad', 'specific gravity', 'gravedad'] },
+  { key: 'urine_ph', label: 'pH мочи', words: ['ph'] },
+  { key: 'urine_nitrites', label: 'Нитриты', stems: ['нитрит', 'nitrit'] },
+  { key: 'urine_protein', label: 'Белок (моча)', stems: ['белок', 'протеин', 'protein', 'proteín'] },
+  { key: 'urine_glucose', label: 'Глюкоза (моча)', stems: ['глюкоз', 'glucos'] },
+  { key: 'urine_ketones', label: 'Кетоновые тела', stems: ['кетон', 'ceton', 'cetón', 'keton'] },
+  { key: 'urine_urobilinogen', label: 'Уробилиноген', stems: ['уробилин', 'urobilin'] },
+  { key: 'urine_bilirubin', label: 'Билирубин (моча)', stems: ['билирубин', 'bilirub', 'bilirrub'] },
+  { key: 'urine_hemoglobin_myoglobin', label: 'Гемоглобин/миоглобин (моча)', stems: ['гемоглобин', 'миоглобин', 'hemoglobin', 'mioglobin', 'myoglobin'] },
+  { key: 'urine_sediment', label: 'Осадок мочи', stems: ['осадок', 'sediment'] },
+];
+/* → { key, label } стандартного показателя мочи или null */
+export function urineStandard(r) {
+  if (!r || sectionOfResult(r) !== 'urine') return null;
+  const name = lower(r.name);
+  const words = new Set(wordsOf(name));
+  const u = URINE_KEYS.find((x) => (x.words || []).some((w) => words.has(w)) || (x.stems || []).some((st) => name.includes(st)));
+  return u ? { key: u.key, label: u.label } : null;
+}
+/* Ключ истории показателя лаборатории: стандартный показатель мочи — urine_*, иначе c:<название> */
+export const resultKey = (r) => (urineStandard(r) || {}).key || customKey(r.name);
+
 const customList = (t) => (Array.isArray(t && t.customResults) ? t.customResults.filter((r) => r && typeof r.name === 'string') : []);
 const hasNum = (v) => typeof v === 'number' && Number.isFinite(v);
 /* качественный результат бланка («отрицательно») — только если нет числа */
@@ -125,8 +158,10 @@ function rowsOf(t) {
     });
   });
   customList(t).forEach((r) => {
+    const std = urineStandard(r);
     rows.push({
-      kind: 'custom', key: customKey(r.name), section: sectionOfResult(r), name: r.name,
+      kind: 'custom', key: std ? std.key : customKey(r.name), section: sectionOfResult(r), name: std ? std.label : r.name,
+      labName: std && normName(std.label) !== normName(r.name) ? r.name : '',
       value: hasNum(r.value) ? r.value : null, text: textOf(r), unit: r.unit || '', ref: r.ref || '', group: r.group || '',
       status: 'none', out: outOfLabRange(r),
     });
@@ -163,6 +198,7 @@ const SECTION_WORDS = {
   iron: ['желез', 'витамин', 'vitamin'],
   blood: ['гематолог', 'hemat', 'кровь'],
   urine: URINE_GROUP,
+  stool: STOOL_GROUP,
   other: [],
 };
 
@@ -204,10 +240,16 @@ export function sameDayNumber(tests, id) {
 }
 
 /* ---------- история одного показателя ----------
-   → { key, title, unit, entries: [{ testId, date, no, sameDay, value, text, unit, ref, out, status }] (новые сверху),
+   Ключ — поле формы, urine_* (стандартный показатель мочи, см. URINE_KEYS) или c:<название>.
+   → { key, title, unit, entries: [{ testId, date, no, sameDay, value, text, unit, ref, out, status, name, labName }] (новые сверху),
        points: [{ date, value }] (для графика: одна единица, по одному значению на дату — позже добавленное) } */
 export function indicatorHistory(tests, key) {
   const isField = TEST_FIELDS.includes(key);
+  /* старая ссылка c:<название> на стандартный показатель мочи → его ключ */
+  if (!isField && key.startsWith('c:')) {
+    const r = tests.flatMap(customList).find((x) => customKey(x.name) === key);
+    if (r && urineStandard(r)) key = urineStandard(r).key;
+  }
   const items = journal(tests).groups.flatMap((g) => g.items);
   const entries = [];
   items.forEach(({ test: t, no, sameDay }) => {
@@ -220,10 +262,12 @@ export function indicatorHistory(tests, key) {
       });
       return;
     }
-    customList(t).filter((r) => customKey(r.name) === key).forEach((r) => {
+    customList(t).filter((r) => resultKey(r) === key).forEach((r) => {
+      const std = urineStandard(r);
       entries.push({
         testId: t.id, date: t.date, no, sameDay, value: hasNum(r.value) ? r.value : null, text: textOf(r), unit: r.unit || '',
-        ref: r.ref || '', out: outOfLabRange(r), status: 'none', name: r.name,
+        ref: r.ref || '', out: outOfLabRange(r), status: 'none', name: std ? std.label : r.name,
+        labName: std && normName(std.label) !== normName(r.name) ? r.name : '',
       });
     });
   });

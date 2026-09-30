@@ -1089,7 +1089,8 @@ async function TestDetailScreen(id) {
     const box = $('.list-card', sec);
     s.rows.forEach((r) => {
       const hint = r.out === '↑' ? 'выше диапазона лаборатории' : r.out === '↓' ? 'ниже диапазона лаборатории' : '';
-      const refText = r.ref ? (r.kind === 'field' ? `лаборатория: ${r.ref}` : r.ref) : '';
+      /* labName — название на бланке, если на экране показано единое название (показатели мочи) */
+      const refText = [r.labName ? `на бланке: ${r.labName}` : '', r.ref ? (r.kind === 'field' ? `лаборатория: ${r.ref}` : r.ref) : ''].filter(Boolean).join(' · ');
       const row = el(`
         <a class="row tv-row" href="#/test-history/${encodeURIComponent(r.key)}">
           <span class="dot-status dot-status--${r.status}" aria-hidden="true"></span>
@@ -1154,6 +1155,8 @@ async function TestHistoryScreen(key) {
     screen.appendChild(card);
   } else if (h.entries.every((e) => e.value == null)) {
     screen.appendChild(el('<p class="backup-note" style="margin:12px 2px 4px">Результат лаборатории — текстом, без числа, поэтому графика нет.</p>'));
+  } else if (h.entries.some((e) => e.value == null)) {
+    screen.appendChild(el('<p class="backup-note" style="margin:12px 2px 4px">Текстовые результаты лаборатории в график не входят; он появится, когда будет хотя бы два числовых значения.</p>'));
   } else {
     screen.appendChild(el('<p class="backup-note" style="margin:12px 2px 4px">График появится, когда будет хотя бы два анализа с этим показателем.</p>'));
   }
@@ -1164,12 +1167,14 @@ async function TestHistoryScreen(key) {
     const row = el(`
       <a class="row tv-row" href="#/test/${encodeURIComponent(e.testId)}">
         <span class="dot-status dot-status--${e.status}" aria-hidden="true"></span>
-        <span class="row__body"><span class="tv-row__name">${esc(fmtTestDate(e.date))}${e.sameDay > 1 ? ` · № ${e.no}` : ''}</span>${e.ref ? '<span class="tv-row__ref"></span>' : ''}</span>
+        <span class="row__body"><span class="tv-row__name">${esc(fmtTestDate(e.date))}${e.sameDay > 1 ? ` · № ${e.no}` : ''}</span>${e.ref || e.labName ? '<span class="tv-row__ref"></span>' : ''}</span>
         <span class="tv-row__val">${e.out ? `<span class="test-value__out" title="${hint}">${e.out}</span> ` : ''}<b>${esc(fmtResult(e))}</b>${e.unit ? ` <span class="tv-row__unit">${esc(e.unit)}</span>` : ''}</span>
         <span class="row__chevron" aria-hidden="true">›</span>
       </a>
     `);
-    if (e.ref) $('.tv-row__ref', row).textContent = TEST_FIELDS.includes(key) ? `лаборатория: ${e.ref}` : e.ref;
+    if (e.ref || e.labName) {
+      $('.tv-row__ref', row).textContent = [e.labName ? `на бланке: ${e.labName}` : '', e.ref ? (TEST_FIELDS.includes(key) ? `лаборатория: ${e.ref}` : e.ref) : ''].filter(Boolean).join(' · ');
+    }
     list.firstChild.appendChild(row);
   });
   screen.appendChild(list);
