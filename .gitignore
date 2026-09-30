@@ -26,3 +26,8 @@
 LexLife-backup-*.json
 lexlife-backup-*.json
 *.lexlife-backup.json
+LexLife-full-backup-*.zip
+lexlife-full-backup-*.zip
+
+# Private local data (prepared analyses, lab PDFs) — never commit, never publish
+private/

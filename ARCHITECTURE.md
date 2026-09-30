@@ -27,6 +27,7 @@ _Физическая папка проекта на диске: `/Users/MacPro/
 ```
 LexLife/
 ├── ARCHITECTURE.md             # Этот документ
+├── docs/FULL_BACKUP.md          # Документы анализов, формат полной копии (ZIP), импорт анализа
 ├── index.html                  # Оболочка: <main id="screen">, таб-бар, ☰, Drawer, scrim
 ├── manifest.json                # PWA-манифест
 ├── sw.js                        # Service Worker (app-shell + кэш шрифтов + notificationclick)
@@ -35,6 +36,10 @@ LexLife/
 │   ├── app.js                   # Роутер, Drawer, тема, все экраны, доменная логика
 │   ├── services/storage.js      # StorageService: ключи, конфиг, миграции, API
 │   ├── services/analytics.js    # Чистые функции аналитики для «Статистики» (§8.7)
+│   ├── services/attachments.js  # Документы анализов (PDF/фото) в IndexedDB (§7.2)
+│   ├── services/fullBackup.js   # Полная резервная копия с документами (ZIP, §7.2)
+│   ├── services/zip.js          # Минимальный ZIP без зависимостей (STORE + CRC-32)
+│   ├── services/preparedImport.js # Импорт подготовленного анализа из JSON (§7.2)
 │   └── ui/charts.js             # Лёгкие интерактивные SVG-графики (линия/столбцы)
 └── icons/                       # Иконки PWA LexLife (lexlife-icon-180/192/512.png)
 ```
@@ -82,7 +87,7 @@ fallback → home
 | 🏠 Главная | `home` | таб | Приветствие+дата · 4 карточки показателей (Вес/Давление/Пульс/Вода → модуль) · предупреждения · «Ближайшее» · последние анализы |
 | 📊 Показатели | `metrics` | таб | Сетка 7 карточек-модулей |
 | 💊 Лекарства | `meds` | таб | Список + чекбокс «принял сегодня» |
-| 🩸 Анализы | `tests` | таб | Список по датам с цветовой индикацией + форма добавления |
+| 🩸 Анализы | `tests` | таб | Список по датам с цветовой индикацией · форма добавления/изменения/удаления · документ анализа (PDF/фото) · показатели лаборатории · импорт подготовленного анализа (JSON) |
 | ⚖️ Вес | `metric/weight` | из Показателей | Модуль показателя (точечный) |
 | 🩸 Давление | `metric/pressure` | из Показателей | Модуль показателя (точечный, два значения) |
 | ❤️ Пульс | `metric/pulse` | из Показателей | Модуль показателя (точечный) |
@@ -198,8 +203,11 @@ fallback → home
 ```jsonc
 // health_alerts
 [ { "id": "...", "type": "danger|warning|info", "title": "...", "value": "...", "norm": "...", "note": "..." } ]
-// health_tests (11 показателей крови + вложения)
-[ { "id": "...", "date": "ГГГГ-ММ-ДД", "chol": 190, "ldl": 110, ..., "note": "...", "attachments": [] } ]
+// health_tests (11 основных показателей + необязательные поля; файлы документов — в IndexedDB, §7.2)
+[ { "id": "...", "date": "ГГГГ-ММ-ДД", "chol": 190, "ldl": 110, ..., "note": "...",
+    "attachments": [ { "attachmentId": "att_...", "name": "...", "type": "application/pdf", "size": 0, "addedAt": "ISO" } ],
+    "customResults": [ { "group": "...", "name": "...", "value": 0, "unit": "...", "ref": "...", "refLow": 0, "refHigh": 0 } ],
+    "labRanges": { "ldl": "..." }, "importId": "...", "importedAt": "ISO", "source": "prepared-json" } ]
 // health_meds
 [ { "id": "...", "name": "...", "icon": "💊", "dose": "...", "purpose": "...", "start": "...", "end": "...", "reminder_time": "21:00", "every_days": 15, "active": true } ]
 ```
@@ -217,7 +225,7 @@ fallback → home
 ### 5.10 Прочее
 - `app_theme` (`'dark'|'light'`) — UI-настройка, отдельно от данных; в бэкапе — `settings.theme`.
 - `lexlife_stats_period` (`'7d'|'30d'|'3m'|'6m'|'1y'|'all'`) — последний выбранный период «Статистики»; UI-настройка вне `DATA_KEYS`, в бэкап не входит. Статистика не хранится — всегда вычисляется из исходных данных.
-- Поле `attachments` на анализах/визитах — каркас (метаданные; бинарь — после `IndexedDbDriver`, §7).
+- Поле `attachments` на анализах — метаданные документа, сам файл в IndexedDB (§7.2); на визитах — пока каркас (только метаданные).
 - **Календарь здоровья не имеет собственной модели** — это агрегатор поверх §5.6/5.8/5.7/5.4 (см. §8.6).
 
 ---
@@ -269,6 +277,9 @@ fallback → home
 3. `restoreBackup(prepared)` — атомарно: снимок текущих ключей → одна защитная копия `lexlife_restore_rollback` (+ в памяти) → запись → перечитывание и `verifyIntegrity()` → успех: копия удаляется; ошибка: откат из снимка. Если приложение закрылось посреди записи, `init()` откатывает при следующем запуске.
 
 Шифрование паролем — будущий формат с полем `encryption` вместо открытого `data`; расшифровка встанет между шагами 1 и 2. Текущая версия такие файлы отклоняет с понятным сообщением.
+
+### 7.2 Документы анализов, полная копия, импорт анализа
+Подробно — `docs/FULL_BACKUP.md`. Файлы PDF/фото хранятся в IndexedDB (`lexlife-files` / `attachments`), в `health_tests` — только метаданные; схема данных не менялась (v8), обычная копия — прежний формат 2. «Полная резервная копия с документами» — ZIP: `lexlife-full-backup.json` (манифест) + `backup.json` (обычная копия) + `attachments/<id>.<ext>`. Восстановление: проверка без записи → документы в IndexedDB → атомарная замена данных → удаление непривязанных документов. «Висячие» документы очищаются при запуске (строгое чтение анализов, файлы моложе 10 минут не трогаются). Импорт подготовленного анализа (`kind: lexlife-prepared-test`) добавляет одну запись, повтор блокируется по `importId`; изменения анализов сериализуются (`_serialTests`).
 
 Ключевые методы: показатели (`getMetricsConfig/getMetricConfig/getMetricGoal/setMetricGoal`, `getMetricLog/getMetricLatest/getMetricValue/setMetricValue/addMetricValue`), вода (`getWater/setWater/addWaterEntry/removeWaterEntry/getWaterRecord/getWaterStreak`), гидратация (`getHydration/setHydration`), профиль (`getProfile/setProfile`), визиты (`getVisits/getVisit/addVisit/updateVisit/removeVisit`), уведомления (`getNotifications/updateNotification`), плюс показатели здоровья (alerts/tests/meds), активность, лог лекарств, `createBackup/exportBackup/prepareRestore/restoreBackup/importBackup`, `clearAll`.
 
@@ -355,7 +366,7 @@ fallback → home
 
 Согласованный порядок (от «трекера показателей» к «персональному медицинскому кабинету»):
 1. ~~Вода~~ · ~~Показатели~~ · ~~Врачи и визиты~~ · ~~Центр уведомлений~~ · ~~Календарь здоровья~~ · ~~Статистика здоровья~~ — готово.
-2. 📎 Фото/PDF вложения к визитам и анализам — требует `IndexedDbDriver` (бинарные данные не помещаются в `localStorage`).
+2. 📎 Фото/PDF вложения: к анализам — готово (IndexedDB, §7.2); к визитам — следующий шаг.
 3. 📤 Экспорт медицинской истории в PDF (сейчас есть только JSON-бэкап).
 4. 🔔 Настоящие push-уведомления — push-сервер или Notification Triggers; модель (`channel`, `ref`) и `notificationclick` уже готовы.
 5. ☁️ Синхронизация между устройствами.

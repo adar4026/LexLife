@@ -10,6 +10,12 @@ import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CUR
 import { createStatsEngine, evaluateWaterPlan, waterGoalDays, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay } from './services/analytics.js';
 import { parseWaterMinderCsv, assignImportKeys, buildWaterImportPlan, applyWaterImportPlan, applyTodayWaterImport, isWaterMinderKey } from './services/waterImport.js';
 import { lineChart, barChart as svgBarChart } from './ui/charts.js';
+import { AttachmentService, IdbAttachmentStore, AttachmentError, ATTACHMENT_ACCEPT, ATTACHMENT_TYPES, checkAttachmentFile, formatBytes, attachmentOf } from './services/attachments.js';
+import { createFullBackup, prepareFullRestore, applyFullRestore, isZipFile, countDocsLostOnRestore } from './services/fullBackup.js';
+import { parsePreparedTest, importPreparedTest, PreparedImportError } from './services/preparedImport.js';
+
+/* Документы анализов: файлы в IndexedDB (только на этом устройстве), метаданные — в health_tests */
+const Attachments = new AttachmentService(Storage, new IdbAttachmentStore());
 
 /* ---------- DOM-помощники ---------- */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -848,53 +854,364 @@ async function MedsScreen() {
 /* =========================================================
    Вкладка 4 — Анализы
    ========================================================= */
+const DOC_ICON = { pdf: '📄', image: '🖼️' };
+const docKind = (type) => (ATTACHMENT_TYPES[type] || {}).kind || 'pdf';
+const docLine = (meta) => [(ATTACHMENT_TYPES[meta.type] || {}).label || 'Файл', formatBytes(meta.size)].filter(Boolean).join(' · ');
+const alertDialog = (title, html) => showDialog({ title, body: html, actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+const DOC_MISSING_HTML = '<p>Файл этого анализа не найден на устройстве.</p><p class="dialog__muted">Так бывает после восстановления из обычной резервной копии (она не содержит PDF и фото) или на другом устройстве. Анализ сохранён; прикрепите документ заново через «Изменить» или восстановите полную резервную копию с документами.</p>';
+
+/* Открыть документ анализа из хранилища; нет файла → понятное сообщение */
+async function openTestDocument(meta) {
+  let file = null;
+  try {
+    file = await Attachments.getFile(meta);
+  } catch (err) {
+    await alertDialog('Документ недоступен', `<p>${esc(err instanceof AttachmentError ? err.message : 'Не удалось прочитать документ.')}</p>`);
+    return;
+  }
+  if (!file) { await alertDialog('Документ не найден', DOC_MISSING_HTML); return; }
+  openDocViewer(file);
+}
+
+/* Просмотр PDF/фото поверх приложения (выше таб-бара, с учётом safe-area).
+   iOS: PDF во встроенном окне; «Поделиться» открывает системное меню (Файлы, Книги и т.д.). */
+function openDocViewer(file) {
+  const url = URL.createObjectURL(file);
+  const kind = docKind(file.type);
+  const canShare = !!(navigator.canShare && navigator.canShare({ files: [file] }));
+  const v = el(`
+    <div class="doc-viewer" role="dialog" aria-modal="true" aria-label="Документ анализа">
+      <div class="doc-viewer__bar">
+        <button class="doc-viewer__btn" type="button" data-act="close">‹ Закрыть</button>
+        <span class="doc-viewer__title"></span>
+        <button class="doc-viewer__btn" type="button" data-act="${canShare ? 'share' : 'open'}">${canShare ? 'Поделиться' : 'Открыть'}</button>
+      </div>
+      <div class="doc-viewer__body"></div>
+    </div>
+  `);
+  $('.doc-viewer__title', v).textContent = file.name;
+  const body = $('.doc-viewer__body', v);
+  const unsupported = () => {
+    body.innerHTML = `<div class="doc-viewer__msg"><p>Этот браузер не может показать файл «${esc(file.name)}» (${esc(docLine({ type: file.type, size: file.size }))}).</p><p>${canShare ? 'Нажмите «Поделиться» и откройте его в другом приложении или сохраните в «Файлы».' : 'Нажмите «Открыть», чтобы открыть его отдельно.'}</p></div>`;
+  };
+  if (kind === 'image') {
+    const img = el('<img class="doc-viewer__img" alt="">');
+    img.alt = file.name;
+    img.addEventListener('error', unsupported);
+    img.src = url;
+    body.appendChild(img);
+  } else {
+    const frame = el('<iframe class="doc-viewer__frame" title="PDF"></iframe>');
+    frame.src = url;
+    body.appendChild(frame);
+  }
+  const close = () => { document.removeEventListener('keydown', onKey); v.remove(); unlockPageScroll(); setTimeout(() => URL.revokeObjectURL(url), 1000); };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  v.addEventListener('click', async (e) => {
+    const act = e.target.closest('[data-act]');
+    if (!act) return;
+    if (act.dataset.act === 'close') close();
+    else if (act.dataset.act === 'share') {
+      try { await navigator.share({ files: [file] }); } catch { /* отменено */ }
+    } else window.open(url, '_blank', 'noopener');
+  });
+  document.addEventListener('keydown', onKey);
+  lockPageScroll();
+  document.body.appendChild(v);
+  $('[data-act="close"]', v).focus();
+}
+
 async function TestsScreen() {
   const screen = el('<div></div>');
-  let showForm = false;
+  let formFor = null; // null — формы нет; 'new' — новый анализ; id — редактирование
+  let importing = false;
+
   async function paint() {
     const tests = await Storage.getTests();
     screen.innerHTML = '';
-    screen.appendChild(el(`<header class="header"><p class="header__eyebrow">${tests.length} записей</p><h1 class="header__title">Анализы</h1></header>`));
+    screen.appendChild(el(`<header class="header"><p class="header__eyebrow">${tests.length} ${plural(tests.length, 'запись', 'записи', 'записей')}</p><h1 class="header__title">Анализы</h1></header>`));
     const addBtn = el('<button class="btn-ghost" type="button" style="margin:8px 0 4px">+ Добавить анализ</button>');
-    addBtn.addEventListener('click', () => { showForm = !showForm; paint(); });
+    addBtn.addEventListener('click', () => { formFor = formFor === 'new' ? null : 'new'; paint(); });
     screen.appendChild(addBtn);
-    if (showForm) screen.appendChild(buildForm());
+    const impLabel = el(`<label class="btn-ghost tests-import${importing ? ' is-busy' : ''}">📥 Импортировать подготовленный анализ<input type="file" accept=".json,application/json" hidden></label>`);
+    const impInput = $('input', impLabel);
+    impInput.addEventListener('change', () => {
+      const file = impInput.files && impInput.files[0];
+      impInput.value = '';
+      if (file) importPrepared(file, impLabel);
+    });
+    screen.appendChild(impLabel);
+    if (formFor === 'new') screen.appendChild(buildForm(null));
+
     const list = el('<section class="section" style="margin-top:16px"></section>');
     if (!tests.length) list.appendChild(el('<div class="empty">Пока нет анализов</div>'));
     else tests.forEach((t) => {
-      const card = el('<div class="card test-card"></div>');
-      card.appendChild(el(`<div class="test-card__head"><span class="test-card__date">${esc(fmtDate(t.date))}</span>${t.note ? `<span class="test-card__note">${esc(t.note)}</span>` : ''}</div>`));
-      const values = el('<div class="test-values"></div>');
-      TEST_FIELDS.forEach((f) => {
-        if (t[f] == null) return;
-        const ref = REFERENCE[f];
-        const st = evaluate(f, t[f]);
-        values.appendChild(el(`<div class="test-value"><span class="dot-status dot-status--${st}"></span><span class="test-value__label">${esc(ref.label)}</span><span class="test-value__num">${esc(t[f])}<span style="color:var(--text2);font-weight:400"> ${esc(ref.unit)}</span></span></div>`));
-      });
-      card.appendChild(values);
-      list.appendChild(card);
+      if (formFor === t.id) { const f = buildForm(t); f.id = `test-${t.id}`; list.appendChild(f); return; }
+      list.appendChild(testCard(t));
     });
     screen.appendChild(list);
+    if (formFor && formFor !== 'new') setTimeout(() => { const n = document.getElementById(`test-${formFor}`); if (n) n.scrollIntoView({ block: 'start', behavior: 'smooth' }); }, 60);
   }
-  function buildForm() {
-    const form = el('<div class="input-card"></div>');
-    form.appendChild(el('<div class="input-card__head"><span class="input-card__title">Новый анализ</span></div>'));
-    form.appendChild(el(`<div class="field"><label class="field__label">Дата анализа</label><input class="input" type="date" id="f-date" value="${dateKey()}"></div>`));
+
+  function testCard(t) {
+    const card = el('<div class="card test-card"></div>');
+    const head = el(`<div class="test-card__head"><span class="test-card__date">${esc(fmtDate(t.date))}</span><button class="test-card__edit" type="button" aria-label="Изменить анализ от ${esc(fmtDate(t.date))}">Изменить</button></div>`);
+    $('.test-card__edit', head).addEventListener('click', () => { formFor = t.id; paint(); });
+    card.appendChild(head);
+    if (t.note) card.appendChild(el(`<p class="test-card__note">${esc(t.note)}</p>`));
+
+    const meta = attachmentOf(t);
+    if (meta) {
+      const doc = el(`<button class="doc-chip" type="button"><span class="doc-chip__icon" aria-hidden="true">${DOC_ICON[docKind(meta.type)]}</span><span class="doc-chip__name"></span><span class="doc-chip__meta">${esc(docLine(meta))}</span></button>`);
+      $('.doc-chip__name', doc).textContent = meta.name || 'Документ';
+      doc.setAttribute('aria-label', `Открыть документ ${meta.name || ''}`);
+      doc.addEventListener('click', () => openTestDocument(meta));
+      card.appendChild(doc);
+    }
+
+    const values = el('<div class="test-values"></div>');
+    TEST_FIELDS.forEach((f) => {
+      if (t[f] == null) return;
+      const ref = REFERENCE[f];
+      const st = evaluate(f, t[f]);
+      const lab = t.labRanges && t.labRanges[f] ? `<span class="test-value__ref">лаборатория: ${esc(t.labRanges[f])}</span>` : '';
+      values.appendChild(el(`<div class="test-value"><span class="dot-status dot-status--${st}"></span><span class="test-value__label">${esc(ref.label)}${lab}</span><span class="test-value__num">${esc(fmtNum(t[f]))}<span style="color:var(--text2);font-weight:400"> ${esc(ref.unit)}</span></span></div>`));
+    });
+    if (values.childElementCount) card.appendChild(values);
+
+    const custom = Array.isArray(t.customResults) ? t.customResults : [];
+    if (custom.length) card.appendChild(customResultsBlock(custom));
+    return card;
+  }
+
+  /* Показатели вне основных полей формы — по группам, с диапазоном лаборатории.
+     ↑/↓ — только факт выхода за числовой диапазон, указанный лабораторией. */
+  function customResultsBlock(custom) {
+    const groups = [];
+    custom.forEach((r) => {
+      const g = r.group || 'Другие показатели';
+      let grp = groups.find((x) => x.name === g);
+      if (!grp) { grp = { name: g, items: [] }; groups.push(grp); }
+      grp.items.push(r);
+    });
+    const d = el(`<details class="test-extra"><summary>Все показатели лаборатории · ${custom.length}</summary></details>`);
+    groups.forEach((g) => {
+      d.appendChild(el(`<div class="test-extra__group">${esc(g.name)}</div>`));
+      const box = el('<div class="test-values"></div>');
+      g.items.forEach((r) => {
+        const out = r.value != null && r.refLow != null && r.refHigh != null ? (r.value < r.refLow ? '↓' : r.value > r.refHigh ? '↑' : '') : '';
+        const hint = out === '↑' ? 'выше диапазона лаборатории' : out === '↓' ? 'ниже диапазона лаборатории' : '';
+        box.appendChild(el(`
+          <div class="test-value">
+            <span class="test-value__label">${esc(r.name)}${r.ref ? `<span class="test-value__ref">${esc(r.ref)}</span>` : ''}</span>
+            <span class="test-value__num">${out ? `<span class="test-value__out" title="${hint}" aria-label="${hint}">${out}</span> ` : ''}${esc(fmtNum(r.value))}${r.unit ? `<span style="color:var(--text2);font-weight:400"> ${esc(r.unit)}</span>` : ''}</span>
+          </div>
+        `));
+      });
+      d.appendChild(box);
+    });
+    return d;
+  }
+
+  /* Форма нового анализа / редактирования. Документ: выбор, «Открыть», «Удалить» —
+     изменения применяются по «Сохранить» (отмена ничего не меняет). */
+  function buildForm(existing) {
+    const t = existing || { date: dateKey(), note: '' };
+    const form = el('<div class="input-card test-form"></div>');
+    form.appendChild(el(`<div class="input-card__head"><span class="input-card__title">${existing ? 'Изменить анализ' : 'Новый анализ'}</span></div>`));
+    form.appendChild(el(`<div class="field"><label class="field__label" for="f-date">Дата анализа</label><input class="input" type="date" id="f-date" value="${esc(t.date)}"></div>`));
     TEST_FIELDS.forEach((f) => {
       const ref = REFERENCE[f];
-      form.appendChild(el(`<div class="field"><label class="field__label">${esc(ref.label)} (${esc(ref.unit)})</label><input class="input" type="number" step="any" inputmode="decimal" data-field="${f}" placeholder="—"></div>`));
+      form.appendChild(el(`<div class="field"><label class="field__label">${esc(ref.label)} (${esc(ref.unit)})</label><input class="input" type="number" step="any" inputmode="decimal" data-field="${f}" value="${t[f] != null ? esc(t[f]) : ''}" placeholder="—"></div>`));
     });
-    form.appendChild(el(`<div class="field"><label class="field__label">Заметка</label><input class="input" type="text" id="f-note" placeholder="напр. сдано не натощак"></div>`));
-    const save = el('<button class="btn-primary" type="button">Сохранить анализ</button>');
+    form.appendChild(el(`<div class="field"><label class="field__label" for="f-note">Заметка</label><input class="input" type="text" id="f-note" value="${esc(t.note || '')}" placeholder="напр. сдано не натощак"></div>`));
+    const extraCount = Array.isArray(t.customResults) ? t.customResults.length : 0;
+    if (extraCount) form.appendChild(el(`<p class="doc-block__hint" style="margin:0 0 12px">Показатели лаборатории (${extraCount}) сохраняются без изменений.</p>`));
+
+    /* ---- блок «Документ анализа» ---- */
+    const origMeta = attachmentOf(t);
+    let doc = origMeta ? { kind: 'existing', meta: origMeta } : { kind: 'none' };
+    const block = el(`
+      <div class="doc-block">
+        <div class="doc-block__title">Документ анализа</div>
+        <div class="doc-block__body"></div>
+        <label class="btn-ghost doc-block__pick"><span></span><input type="file" accept="${ATTACHMENT_ACCEPT}" hidden></label>
+        <p class="doc-block__hint">PDF, JPG, PNG или HEIC · до 15 МБ · файл хранится только на этом устройстве</p>
+      </div>
+    `);
+    const bodyEl = $('.doc-block__body', block);
+    const pickText = $('.doc-block__pick span', block);
+    const pickInput = $('.doc-block__pick input', block);
+    function paintDoc() {
+      bodyEl.innerHTML = '';
+      if (doc.kind === 'none') {
+        bodyEl.appendChild(el(`<p class="doc-block__empty">${origMeta ? 'Документ будет удалён при сохранении.' : 'Файл не прикреплён.'}</p>`));
+        pickText.textContent = 'Прикрепить PDF или фото';
+        return;
+      }
+      const meta = doc.kind === 'new' ? { name: doc.file.name, type: doc.type, size: doc.file.size } : doc.meta;
+      const row = el(`
+        <div class="doc-row">
+          <span class="doc-row__icon" aria-hidden="true">${DOC_ICON[docKind(meta.type)]}</span>
+          <div class="doc-row__body"><p class="doc-row__name"></p><p class="doc-row__meta">${esc(docLine(meta))}${doc.kind === 'new' ? ' · сохранится вместе с анализом' : ''}</p></div>
+        </div>
+      `);
+      $('.doc-row__name', row).textContent = meta.name || 'Документ';
+      const acts = el('<div class="doc-row__actions"><button class="doc-btn" type="button" data-act="open">Открыть</button><button class="doc-btn doc-btn--danger" type="button" data-act="del">Удалить</button></div>');
+      acts.addEventListener('click', (e) => {
+        const b = e.target.closest('[data-act]');
+        if (!b) return;
+        if (b.dataset.act === 'open') {
+          if (doc.kind === 'new') openDocViewer(new File([doc.file], doc.file.name, { type: doc.type }));
+          else openTestDocument(doc.meta);
+        } else {
+          doc = { kind: 'none' };
+          paintDoc();
+        }
+      });
+      bodyEl.append(row, acts);
+      pickText.textContent = 'Заменить файл';
+    }
+    pickInput.addEventListener('change', async () => {
+      const file = pickInput.files && pickInput.files[0];
+      pickInput.value = '';
+      if (!file) return;
+      const check = await checkAttachmentFile(file);
+      if (!check.ok) { await alertDialog('Файл не прикреплён', `<p>${esc(check.message)}</p>`); return; }
+      doc = { kind: 'new', file, type: check.type };
+      paintDoc();
+    });
+    paintDoc();
+    form.appendChild(block);
+
+    const actions = el('<div class="test-form__actions"></div>');
+    const save = el(`<button class="btn-primary" type="button">${existing ? 'Сохранить' : 'Сохранить анализ'}</button>`);
+    const cancel = el('<button class="btn-ghost" type="button">Отмена</button>');
+    cancel.addEventListener('click', () => { formFor = null; paint(); });
+    actions.append(save, cancel);
+    if (existing) {
+      const del = el('<button class="btn-ghost test-form__delete" type="button">Удалить анализ</button>');
+      del.addEventListener('click', () => deleteTest(existing));
+      actions.appendChild(del);
+    }
+    form.appendChild(actions);
+
     save.addEventListener('click', async () => {
-      const entry = { date: $('#f-date', form).value || dateKey(), note: $('#f-note', form).value.trim() };
-      $$('[data-field]', form).forEach((inp) => { if (inp.value !== '') entry[inp.dataset.field] = Number(inp.value); });
-      await Storage.addTest(entry);
-      showForm = false; await paint(); flash('Анализ сохранён ✓');
+      const date = $('#f-date', form).value;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { await alertDialog('Анализ не сохранён', '<p>Укажите дату анализа.</p>'); return; }
+      const values = {};
+      $$('[data-field]', form).forEach((inp) => { values[inp.dataset.field] = inp.value !== '' ? Number(inp.value) : undefined; });
+      save.classList.add('is-busy');
+      let testId = existing ? existing.id : null;
+      try {
+        if (existing) {
+          const upd = await Storage.updateTest(existing.id, { date, note: $('#f-note', form).value.trim(), ...values });
+          if (!upd) { await alertDialog('Анализ не найден', '<p>Запись была удалена. Ничего не изменено.</p>'); formFor = null; await paint(); return; }
+        } else {
+          const entry = { date, note: $('#f-note', form).value.trim() };
+          Object.entries(values).forEach(([k, v]) => { if (v !== undefined) entry[k] = v; });
+          testId = (await Storage.addTest(entry)).id;
+        }
+      } catch (err) {
+        save.classList.remove('is-busy');
+        await alertDialog('Анализ не сохранён', `<p>${esc((err && err.message) || 'Попробуйте ещё раз.')}</p>`);
+        return;
+      }
+      let docError = null;
+      try {
+        if (doc.kind === 'new') await Attachments.attachToTest(testId, doc.file);
+        else if (doc.kind === 'none' && origMeta) await Attachments.removeFromTest(testId);
+      } catch (err) {
+        docError = err instanceof AttachmentError ? err.message : 'Не удалось сохранить документ на устройстве.';
+      }
+      formFor = null;
+      await paint();
+      if (docError) await alertDialog('Анализ сохранён, документ — нет', `<p>${esc(docError)}</p><p class="dialog__muted">Попробуйте прикрепить файл ещё раз через «Изменить».</p>`);
+      else flash(existing ? 'Сохранено ✓' : 'Анализ сохранён ✓');
     });
-    form.appendChild(save);
     return form;
   }
+
+  async function deleteTest(t) {
+    const meta = attachmentOf(t);
+    const ok = await showDialog({
+      title: 'Удалить анализ?',
+      body: `<p>Анализ от <b>${esc(fmtDate(t.date))}</b> будет удалён${meta ? ' вместе с прикреплённым документом' : ''}.</p><p class="dialog__muted">Это действие нельзя отменить, если у вас нет резервной копии.</p>`,
+      actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+    });
+    if (!ok) return;
+    try {
+      await Attachments.deleteTest(t.id);
+    } catch (err) {
+      await alertDialog('Не удалось удалить', `<p>${esc((err && err.message) || 'Попробуйте ещё раз.')}</p>`);
+      return;
+    }
+    formFor = null;
+    await paint();
+    flash('Анализ удалён');
+  }
+
+  /* Импорт подготовленного JSON: проверка → предпросмотр → добавление (без замены) */
+  async function importPrepared(file, label) {
+    if (importing) return;
+    importing = true;
+    label.classList.add('is-busy');
+    try {
+      let parsed;
+      try {
+        if (file.size > 1024 * 1024) throw new PreparedImportError('Файл слишком большой для одной записи анализа.');
+        parsed = parsePreparedTest(await file.text());
+      } catch (err) {
+        await alertDialog('Импорт невозможен', `<p>${esc(err instanceof PreparedImportError ? err.message : 'Не удалось прочитать файл.')}</p><p class="dialog__muted">Данные не изменены.</p>`);
+        return;
+      }
+      const tests = await Storage.getTests();
+      const dup = tests.find((x) => x.importId === parsed.importId);
+      if (dup) {
+        await alertDialog('Уже импортировано', `<p>Этот анализ уже есть в LexLife (${esc(fmtDate(dup.date))}). Повторно он не добавляется.</p>`);
+        return;
+      }
+      const { summary, entry } = parsed;
+      const sameDate = tests.some((x) => x.date === summary.date);
+      const mainRows = summary.main.map((f) => `<li><span>${esc(REFERENCE[f].label)}</span><span>${esc(fmtNum(entry[f]))} ${esc(REFERENCE[f].unit)}</span></li>`).join('');
+      const groupRows = summary.groups.map((g) => `<li><span>${esc(g.name)}</span><span>${g.items.length}</span></li>`).join('');
+      const allRows = summary.groups.map((g) => `<p class="dialog__muted" style="margin:10px 0 4px">${esc(g.name)}</p><ul class="dialog__list">${g.items.map((r) => `<li><span>${esc(r.name)}</span><span>${esc(fmtNum(r.value))} ${esc(r.unit || '')}</span></li>`).join('')}</ul>`).join('');
+      const go = await showDialog({
+        title: 'Подготовленный анализ',
+        body: `
+          <ul class="dialog__list">
+            <li><span>Дата анализа</span><span>${esc(fmtDate(summary.date))}</span></li>
+            ${entry.note ? `<li><span>Заметка</span><span>${esc(entry.note)}</span></li>` : ''}
+            <li><span>Основные показатели</span><span>${summary.main.length}</span></li>
+            <li><span>Показатели лаборатории</span><span>${summary.customCount}</span></li>
+          </ul>
+          ${mainRows ? `<ul class="dialog__list">${mainRows}</ul>` : ''}
+          ${groupRows ? `<ul class="dialog__list">${groupRows}</ul>` : ''}
+          ${allRows ? `<details class="dialog__details"><summary>Все показатели</summary>${allRows}</details>` : ''}
+          ${sameDate ? '<p class="dialog__warn">На эту дату уже есть анализ — будет добавлена ещё одна запись.</p>' : ''}
+          <p class="dialog__muted">Запись будет добавлена к существующим анализам. Другие данные (вода, лекарства, показатели, настройки) не изменятся.</p>
+        `,
+        actions: [{ label: 'Отмена', value: false }, { label: 'Добавить анализ', value: true, kind: 'primary' }],
+      });
+      if (!go) return;
+      let res;
+      try {
+        res = await importPreparedTest(Storage, parsed);
+      } catch (err) {
+        await alertDialog('Не удалось импортировать', `<p>${esc((err && err.message) || 'Попробуйте ещё раз.')}</p>`);
+        return;
+      }
+      if (!res.added) { await alertDialog('Уже импортировано', '<p>Этот анализ уже есть в LexLife. Повторно он не добавлен.</p>'); return; }
+      formFor = null;
+      importing = false;
+      await paint();
+      flash('Анализ добавлен ✓');
+    } finally {
+      importing = false;
+      label.classList.remove('is-busy');
+    }
+  }
+
   await paint();
   return screen;
 }
@@ -959,8 +1276,10 @@ const fmtDateTime = (iso) => new Date(iso).toLocaleString(RU, { day: 'numeric', 
 /* Сохранить JSON-файл: Share Sheet iOS («Сохранить в Файлы», iCloud Drive, AirDrop),
    если Web Share API умеет файлы; иначе — обычное скачивание Blob.
    → 'shared' | 'downloaded' | 'cancelled' | 'need-tap' (share требует нового касания) */
-async function saveBackupFile(json, fileName) {
-  const file = new File([json], fileName, { type: 'application/json' });
+async function saveBackupFile(content, fileName) {
+  const file = content instanceof Blob
+    ? new File([content], fileName, { type: content.type || 'application/zip' })
+    : new File([content], fileName, { type: 'application/json' });
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
     try {
       await navigator.share({ files: [file] });
@@ -1001,6 +1320,7 @@ async function ExportScreen() {
     <div class="input-card">
       <p class="backup-note">Резервная копия — один JSON-файл со всеми данными LexLife: показатели и их история, вода, лекарства, анализы, врачи и визиты, уведомления, цели, профиль и настройки.</p>
       <p class="backup-note">С помощью этого файла данные можно восстановить на этом или другом устройстве.</p>
+      <p class="backup-note"><b>PDF и фото анализов</b> входят только в «Полную резервную копию с документами» — один ZIP-файл с теми же данными и всеми документами. Восстанавливаются оба вида копий одной кнопкой «Восстановить из копии».</p>
     </div>
   `));
   screen.appendChild(el(`
@@ -1051,7 +1371,55 @@ async function ExportScreen() {
   });
   actions.appendChild(exp);
 
-  const impLabel = el('<label class="btn-ghost">Восстановить из копии<input type="file" accept=".json,application/json" hidden></label>');
+  /* Полная копия: данные + PDF/фото анализов одним ZIP-файлом */
+  const fullBtn = el('<button class="btn-ghost" type="button">Полная резервная копия с документами</button>');
+  fullBtn.addEventListener('click', async () => {
+    fullBtn.classList.add('is-busy');
+    try {
+      let b;
+      try {
+        b = await createFullBackup(Storage, Attachments.store);
+      } catch (err) {
+        await alertDialog('Не удалось создать копию', `<p>${esc(err instanceof AttachmentError ? err.message : 'Попробуйте ещё раз.')}</p>`);
+        return;
+      }
+      const notes = [];
+      if (!b.verified) notes.push('Самопроверка обнаружила нестандартные данные — восстановить копию может не получиться.');
+      if (b.missing) notes.push(`${b.missing} ${plural(b.missing, 'документ не найден', 'документа не найдены', 'документов не найдены')} на этом устройстве и не войдут в копию.`);
+      if (notes.length) {
+        const go = await showDialog({
+          title: 'Проверка копии',
+          body: `${notes.map((n) => `<p>${esc(n)}</p>`).join('')}<p>Всё равно сохранить файл?</p>`,
+          actions: [{ label: 'Отмена', value: false }, { label: 'Сохранить', value: true, kind: 'primary' }],
+        });
+        if (!go) return;
+      }
+      /* сборка архива занимает время — iOS требует нового касания для Share Sheet */
+      let res = await saveBackupFile(b.blob, b.fileName);
+      if (res === 'need-tap') {
+        res = await new Promise((resolve) => {
+          showDialog({
+            title: 'Полная копия готова',
+            body: `<p>${esc(b.fileName)}</p><p class="dialog__muted">${b.attachments} ${plural(b.attachments, 'документ', 'документа', 'документов')} · ${esc(formatBytes(b.bytes))}. Нажмите «Сохранить», затем «Сохранить в Файлы».</p>`,
+            actions: [
+              { label: 'Отмена', value: 'cancelled' },
+              { label: 'Сохранить', kind: 'primary', value: null, onClick: () => { saveBackupFile(b.blob, b.fileName).then(resolve); } },
+            ],
+          }).then((v) => { if (v) resolve(v); });
+        });
+      }
+      if (res === 'shared' || res === 'downloaded') {
+        await Storage.markBackupCreated(b.createdAt);
+        await paintLast();
+        flash(`Полная копия создана ✓ (${b.attachments} док.)`);
+      }
+    } finally {
+      fullBtn.classList.remove('is-busy');
+    }
+  });
+  actions.appendChild(fullBtn);
+
+  const impLabel = el('<label class="btn-ghost">Восстановить из копии<input type="file" accept=".json,.zip,application/json,application/zip" hidden></label>');
   const input = $('input', impLabel);
   input.addEventListener('change', async () => {
     const file = input.files && input.files[0];
@@ -1079,9 +1447,17 @@ async function restoreFlow(file) {
     actions: [{ label: 'Понятно', value: true, kind: 'primary' }],
   });
   let prepared;
+  let full = null; // полная копия (ZIP с документами)
+  let docsLost = 0;
   try {
-    if (file.size > 10 * 1024 * 1024) throw new BackupError('TOO_LARGE', 'Файл слишком большой для резервной копии LexLife.');
-    prepared = await Storage.prepareRestore(parseBackup(await file.text()));
+    if (await isZipFile(file)) {
+      full = await prepareFullRestore(Storage, file);
+      prepared = full.prepared;
+    } else {
+      if (file.size > 10 * 1024 * 1024) throw new BackupError('TOO_LARGE', 'Файл слишком большой для резервной копии LexLife.');
+      prepared = await Storage.prepareRestore(parseBackup(await file.text()));
+    }
+    docsLost = await countDocsLostOnRestore(Storage, prepared);
   } catch (err) {
     await fail(err instanceof BackupError ? err.message : 'Не удалось прочитать файл резервной копии.');
     return;
@@ -1096,6 +1472,7 @@ async function restoreFlow(file) {
     ['Уведомления', summary.notifications],
     ['Дни активности', summary.activityDays],
   ];
+  if (full) rows.push(['Документы анализов (PDF/фото)', full.attachments.length]);
   const schemaLine = info.migrated ? `${info.schemaVersion} → будет обновлена до ${CURRENT_SCHEMA_VERSION}` : String(info.schemaVersion);
   const skipped = prepared.ignoredKeys.length + prepared.strippedKeys;
   const body = `
@@ -1108,17 +1485,21 @@ async function restoreFlow(file) {
       ${rows.map(([k, v]) => `<li><span>${esc(k)}</span><span>${esc(v)}</span></li>`).join('')}
     </ul>
     ${skipped ? `<p class="dialog__muted">Пропущено неизвестных разделов: ${skipped}.</p>` : ''}
-    <p class="dialog__warn">Восстановление заменит текущие данные LexLife данными из выбранной резервной копии.</p>
+    ${full && full.missingInArchive ? `<p class="dialog__muted">${full.missingInArchive} ${plural(full.missingInArchive, 'документ отсутствовал', 'документа отсутствовали', 'документов отсутствовали')} при создании копии — эти анализы восстановятся без файла.</p>` : ''}
+    <p class="dialog__warn">Восстановление заменит текущие данные LexLife${full ? ' и документы анализов' : ''} данными из выбранной резервной копии.</p>
+    ${docsLost ? `<p class="dialog__warn">${docsLost} ${plural(docsLost, 'документ', 'документа', 'документов')} (PDF/фото) текущих анализов нет в этой копии — ${docsLost === 1 ? 'он будет удалён' : 'они будут удалены'} с устройства.</p>` : ''}
+    ${!full ? '<p class="dialog__muted">Обычная копия не содержит PDF и фото. Для переноса документов используйте полную резервную копию (ZIP).</p>' : ''}
   `;
   const go = await showDialog({
-    title: 'Резервная копия LexLife',
+    title: full ? 'Полная резервная копия LexLife' : 'Резервная копия LexLife',
     body,
     actions: [{ label: 'Отмена', value: false }, { label: 'Восстановить', value: true, kind: 'danger' }],
   });
   if (!go) { flash('Восстановление отменено'); return; }
 
   try {
-    await Storage.restoreBackup(prepared);
+    if (full) await applyFullRestore(Storage, Attachments, full);
+    else await Storage.restoreBackup(prepared);
   } catch (err) {
     await showDialog({
       title: 'Ошибка восстановления',
@@ -2955,5 +3336,7 @@ async function boot() {
   await render();
   registerSW();
   Notifier.start();
+  /* «висячие» документы (анализ удалён/заменён при восстановлении) — фоном, безопасно */
+  if (IdbAttachmentStore.available()) Attachments.cleanupOrphans().catch((err) => console.warn('[attachments] очистка пропущена', err && err.name));
 }
 boot();

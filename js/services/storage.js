@@ -324,6 +324,21 @@ function sanitizeJson(value, stats, depth = 0) {
 const listOf = (pred) => (v) => Array.isArray(v) && v.every((x) => isPlainObj(x) && pred(x));
 const mapOf = (pred) => (v) => isPlainObj(v) && Object.entries(v).every(([k, x]) => pred(x, k));
 
+/* Анализ: необязательные поля (все аддитивные — старые версии их просто не показывают).
+   attachments — метаданные документа (сам файл в IndexedDB, services/attachments.js);
+   customResults — показатели вне основных полей формы; labRanges — диапазоны лаборатории
+   для основных полей; importId — метка подготовленного импорта (защита от повторов). */
+const TEST_ATTACHMENT_OK = (a) => isPlainObj(a) && (a.attachmentId == null || isSafeId(a.attachmentId))
+  && isStrOrNull(a.name) && isStrOrNull(a.type) && isNumOrNull(a.size) && isStrOrNull(a.addedAt);
+const TEST_RESULT_OK = (r) => isPlainObj(r) && typeof r.name === 'string' && isNumOrNull(r.value)
+  && isStrOrNull(r.unit) && isStrOrNull(r.ref) && isStrOrNull(r.group) && isNumOrNull(r.refLow) && isNumOrNull(r.refHigh);
+export const IMPORT_ID_RE = /^[A-Za-z0-9._:-]{8,100}$/;
+const testExtrasOk = (t) => (t.attachments == null || (Array.isArray(t.attachments) && t.attachments.every(TEST_ATTACHMENT_OK)))
+  && (t.customResults == null || (Array.isArray(t.customResults) && t.customResults.every(TEST_RESULT_OK)))
+  && (t.labRanges == null || mapOf((x, k) => TEST_FIELDS.includes(k) && typeof x === 'string')(t.labRanges))
+  && (t.importId == null || (typeof t.importId === 'string' && IMPORT_ID_RE.test(t.importId)))
+  && isStrOrNull(t.importedAt) && isStrOrNull(t.source);
+
 const METRIC_VALUE_OK = {
   pressure: (x) => x == null || (isPlainObj(x) && isNumOrNull(x.systolic) && isNumOrNull(x.diastolic)),
   water: (x) => x == null || (isPlainObj(x) && isNumOrNull(x.total) && (x.entries == null
@@ -338,7 +353,7 @@ const NOTIF_TYPE_LIST = ['meds', 'water', 'pressure', 'weight', 'tests', 'visits
 const KEY_VALIDATORS = {
   [KEYS.alerts]: listOf((a) => a.id == null || isSafeId(a.id)),
   [KEYS.tests]: listOf((t) => isDateStr(t.date) && (t.id == null || isSafeId(t.id)) && isStrOrNull(t.note)
-    && TEST_FIELDS.every((f) => isNumOrNull(t[f])) && (t.attachments == null || Array.isArray(t.attachments))),
+    && TEST_FIELDS.every((f) => isNumOrNull(t[f])) && testExtrasOk(t)),
   [KEYS.meds]: listOf((m) => typeof m.name === 'string' && (m.id == null || isSafeId(m.id))
     && isTimeOrNull(m.reminder_time) && isNumOrNull(m.every_days) && isDateOrNull(m.start) && isStrOrNull(m.end)
     && isStrOrNull(m.icon) && isStrOrNull(m.dose) && isStrOrNull(m.purpose)),
@@ -958,12 +973,81 @@ export class StorageService {
   async getLatestTest() {
     return (await this.getTests())[0] || null;
   }
+  async getTest(id) {
+    return (await this._read(KEYS.tests, [])).find((t) => t.id === id) || null;
+  }
+  /* Изменения анализов выполняются по очереди: чтение-изменение-запись двух операций
+     (двойное касание, импорт + вложение) не перекрываются и не теряют запись. */
+  _serialTests(fn) {
+    const run = (this._testsQueue || Promise.resolve()).then(fn, fn);
+    this._testsQueue = run.catch(() => {});
+    return run;
+  }
+  /* Запись списка анализов с проверкой: при ошибке (нет места) — исключение, а не тихий false */
+  async _writeTests(list) {
+    if (!(await this._write(KEYS.tests, list))) throw new Error('Не удалось сохранить анализы: недостаточно места на устройстве.');
+  }
   async addTest(test) {
-    const list = await this._read(KEYS.tests, []);
-    const entry = { id: uid(), note: '', attachments: [], ...test };
-    list.push(entry);
-    await this._write(KEYS.tests, list);
-    return entry;
+    return this._serialTests(async () => {
+      const list = await this._read(KEYS.tests, []);
+      const entry = { id: uid(), note: '', attachments: [], ...test };
+      list.push(entry);
+      await this._writeTests(list);
+      return entry;
+    });
+  }
+  /* Добавить анализ однократно: запись с тем же importId уже есть → не добавляется.
+     → { added: true, entry } | { added: false, existing } */
+  async addTestOnce(test) {
+    return this._serialTests(async () => {
+      const list = await this._read(KEYS.tests, []);
+      const existing = test.importId ? list.find((t) => t.importId === test.importId) : null;
+      if (existing) return { added: false, existing };
+      const entry = { id: uid(), note: '', attachments: [], ...test };
+      list.push(entry);
+      await this._writeTests(list);
+      return { added: true, entry };
+    });
+  }
+  /* Изменить анализ: поля patch со значением undefined удаляются (очищенное поле формы). id не меняется. */
+  async updateTest(id, patch) {
+    return this._serialTests(async () => {
+      const list = await this._read(KEYS.tests, []);
+      const i = list.findIndex((t) => t.id === id);
+      if (i < 0) return null;
+      const next = { ...list[i] };
+      for (const [k, v] of Object.entries(patch)) {
+        if (k === 'id') continue;
+        if (v === undefined) delete next[k];
+        else next[k] = v;
+      }
+      list[i] = next;
+      await this._writeTests(list);
+      return next;
+    });
+  }
+  /* Удалить анализ → удалённая запись | null (вложения удаляет AttachmentService) */
+  async removeTest(id) {
+    return this._serialTests(async () => {
+      const list = await this._read(KEYS.tests, []);
+      const rec = list.find((t) => t.id === id);
+      if (!rec) return null;
+      await this._writeTests(list.filter((t) => t.id !== id));
+      return rec;
+    });
+  }
+  /* Строгое чтение анализов для очистки «висячих» вложений: при любой неясности
+     (ключа нет, JSON повреждён, идёт восстановление) → null, и очистка не выполняется. */
+  async readTestsStrict() {
+    try {
+      if ((await this.driver.get(ROLLBACK_KEY)) != null) return null;
+      const raw = await this.driver.get(KEYS.tests);
+      if (raw == null) return null;
+      const list = JSON.parse(raw);
+      return Array.isArray(list) ? list : null;
+    } catch {
+      return null;
+    }
   }
   /* история показателя по датам (для графиков, Приоритет 2) */
   async getTestSeries(field) {
