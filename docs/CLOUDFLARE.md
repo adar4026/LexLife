@@ -1,45 +1,64 @@
-# LexLife на Cloudflare: Workers + Static Assets + D1 + Cron + Web Push
+# LexLife: production на Cloudflare, резерв на GitHub Pages
 
-Статус: **параллельный production развёрнут** (ветка `cloudflare-push`, 2026-10-03) —
-`https://lexlife.alexus4026.workers.dev/`. Worker `lexlife`, D1 `lexlife`, cron `* * * * *`, production VAPID
-(приватный ключ и subject — только Cloudflare secrets). Данные пользователя не переносились.
-GitHub Pages (`https://adar4026.github.io/LexLife/`) работает как раньше, `main` не менялся.
+| | |
+|---|---|
+| **Primary production** | `https://lexlife.alexus4026.workers.dev/` — Worker `lexlife` (Static Assets + `/api` + D1 + Cron) |
+| **Legacy backup** | `https://adar4026.github.io/LexLife/` — GitHub Pages из `main`, без серверного push, не отключается до отдельного решения |
+| **Source of truth** | GitHub `adar4026/LexLife`, ветка `main` |
+| **Автодеплой** | Cloudflare Workers Builds: push в `main` → `npm ci` → `npm test` → `npm run build` → `npx wrangler deploy` |
+
+Медицинские данные живут только на устройстве (localStorage + IndexedDB) и в бэкапах пользователя.
+В D1 — только инфраструктура уведомлений. Перенос между адресами — только через файл полной резервной копии.
 
 ## Архитектура
 
 ```
-GitHub (main) ── source of truth
-   │  push в main
-   ├──► GitHub Pages            https://adar4026.github.io/LexLife/   (как сейчас, без изменений)
-   └──► Cloudflare Workers Builds ──► Worker «lexlife»                 https://lexlife.<subdomain>.workers.dev/
-                                        ├─ Static Assets (dist/)      PWA от корня /
-                                        ├─ /api/*                     Web Push backend (тот же origin, без CORS)
-                                        ├─ D1 «lexlife» (binding DB)  только инфраструктура уведомлений
-                                        └─ Cron «* * * * *»           due-уведомления → Web Push → SW → iPhone
+GitHub main ── source of truth
+   │  push
+   ├──► Cloudflare Workers Builds ──► Worker «lexlife»   https://lexlife.alexus4026.workers.dev/   PRIMARY
+   │       (test → build → deploy)       ├─ Static Assets (dist/)      PWA от корня /
+   │                                     ├─ /api/*                     Web Push backend (тот же origin)
+   │                                     ├─ D1 «lexlife» (DB)          только уведомления
+   │                                     └─ Cron «* * * * *»           due → Web Push → SW → iPhone
+   └──► GitHub Pages (из ветки main)     https://adar4026.github.io/LexLife/        LEGACY BACKUP (без /api)
 ```
 
 Один код фронтенда обслуживает оба адреса: все пути относительные (`./…`), SW регистрируется как `sw.js`
-(scope = каталог приложения), `start_url`/`scope` в манифесте — `./index.html` и `./`. Поэтому на Pages scope
-`/LexLife/`, на Cloudflare — `/`, без сборочных подстановок. Разные origin = разные SW, кэши и хранилища, они не
-конфликтуют.
+(scope = каталог приложения), `start_url`/`scope` в манифесте — `./index.html` и `./`. На Pages scope `/LexLife/`,
+на Cloudflare — `/`. Разные origin = разные SW, кэши и хранилища: они не конфликтуют, данные не смешиваются.
+
+Роль адреса — `js/services/deployment.js` (`deploymentRole`):
+
+| Роль | Где | Серверный push | Интерфейс |
+|---|---|---|---|
+| `primary` | `lexlife.alexus4026.workers.dev` | да | обычный |
+| `legacy` | `*.github.io` | **нет**: ни одного запроса к `/api`, нет device id, подписки, правил на сервере | плашка «Резервная версия LexLife» на Главной, статус на экране «Уведомления», пункт меню «Перенести LexLife на новый адрес» |
+| `dev` | `localhost`, `127.0.0.1` | да (локальный `wrangler dev`) | обычный |
+| `other` | любой другой адрес | нет | обычный |
+
+Две установленные PWA на iPhone (старая Pages и новая Cloudflare) не дают двух наборов серверных уведомлений:
+резервная копия физически не обращается к серверу. Её локальный планировщик работает, только пока она открыта
+(может повторить напоминание основной версии — об этом предупреждает экран «Уведомления»). Данные старой копии
+не удаляются и не синхронизируются.
 
 ## Файлы
 
 | Файл | Назначение |
 |---|---|
-| `wrangler.jsonc` | Worker, assets (`dist/`, `run_worker_first`), D1, cron, rate limit, публичные vars. Секретов нет |
+| `wrangler.jsonc` | Worker, assets (`dist/`, `run_worker_first`), D1, cron, rate limit, публичные vars, `preview_urls: false`. Секретов нет |
 | `worker/index.js` | вход: статика (`/index.html` без редиректа), `/api/*`, `scheduled`, security headers |
-| `worker/api.js` | маршруты API, авторизация, sync, тестовый push, rate limit |
+| `worker/api.js` | маршруты API, авторизация, sync, тестовый push, rate limit, `/api/status` |
 | `worker/cron.js` | due → атомарный claim → push → retry; обслуживание раз в час |
 | `worker/webpush.js` | VAPID (ES256) + шифрование aes128gcm на WebCrypto, без npm-зависимостей; allowlist push-сервисов |
 | `worker/delivery.js` | отправка на подписку устройства, 404/410/4xx/5xx → состояние подписки |
 | `worker/auth.js`, `worker/rules.js`, `worker/headers.js` | токены устройства, проверка правил, CSP и др. |
 | `migrations/0001_push_infrastructure.sql` | схема D1 |
+| `js/services/deployment.js` | роль адреса (`primary`/`legacy`/`dev`/`other`), `PRIMARY_URL`, экран переноса |
+| `js/services/pushClient.js` | фронтенд: устройство, подписка, синхронизация правил, offline; `serverAllowed: false` на резервной копии |
 | `js/services/zonedSchedule.js` | расписание в IANA timezone (общий для сервера и occurrenceId) |
-| `js/services/pushClient.js` | фронтенд: устройство, подписка, синхронизация правил, offline |
 | `js/services/occurrenceStore.js` | журнал показанных срабатываний (Cache API, общий со SW) |
-| `js/services/deployment.js` | где запущено приложение; `NEW_HOME_URL` для экрана переноса (пока `null`) |
-| `scripts/build-assets.mjs` | `dist/` из allowlist: `index.html manifest.json sw.js css js icons` |
+| `build-info.json` | в репозитории `sha: null` (так его видит GitHub Pages); сборка Cloudflare пишет version/sha/builtAt |
+| `scripts/build-assets.mjs` | `dist/` из allowlist + отметки сборки (`build-info.json`, `CACHE_VERSION-<sha7>` в `sw.js`) |
 | `scripts/gen-vapid.mjs` | пара VAPID; `--dev-vars` пишет локальную пару в `.dev.vars` (gitignored) |
 
 ## D1 — только уведомления
@@ -63,6 +82,7 @@ GitHub (main) ── source of truth
 
 | | Авторизация | |
 |---|---|---|
+| `GET /api/status` | нет | здоровье: `db`, `push` (VAPID настроен), `build` (version, sha, builtAt); 503 при проблеме |
 | `GET /api/config` | нет | публичный VAPID-ключ |
 | `POST /api/device/register` | нет (rate limit по IP) | `{deviceId}` → `{deviceId, token}`; занятый id → 409 |
 | `POST /api/push/subscribe` | Bearer | endpoint только Apple/Google/Mozilla/Microsoft push; одна подписка на устройство |
@@ -116,48 +136,128 @@ Google Fonts (SW кэширует шрифты); `worker-src 'self' blob:`; `obj
 
 ## Перенос данных пользователя (GitHub Pages → Cloudflare)
 
-**Данные автоматически не появятся на новом адресе.** localStorage и IndexedDB привязаны к origin.
-На iPhone приложение с экрана «Домой» к тому же имеет своё хранилище, отдельное от Safari, поэтому «мост»
-через окно или iframe (`postMessage` с github.io) прочитал бы пустое хранилище Safari, а не данные приложения.
-Пересылать данные через сервер не будем (минимизация данных).
+Выполнен пользователем 2026-10-03 через резервную копию. Данные автоматически между адресами не переносятся
+(разные origin; у PWA с экрана «Домой» на iPhone ещё и своё хранилище), сервер в переносе не участвует.
+Повторить при необходимости: в старой копии Меню → «Перенести LexLife на новый адрес» (пошаговая инструкция:
+полная копия ZIP → «Файлы» → новое приложение с экрана «Домой» → «Восстановить из копии»).
 
-Надёжный путь — уже существующая полная резервная копия (ZIP с PDF/фото), всё остаётся у пользователя:
+## Deploy (CI/CD) — Cloudflare Workers Builds
 
-1. В старом LexLife с экрана «Домой»: Меню → Резервная копия → «Полная резервная копия с документами» → «Файлы».
-2. Safari → новый адрес → Поделиться → «На экран „Домой“».
-3. Новый LexLife **с экрана «Домой»** → Меню → Резервная копия → «Восстановить из копии» → ZIP.
-4. Проверить данные; включить фоновые уведомления в новом приложении.
-5. Старое приложение не удалять, пока всё не проверено.
+Единственная система автодеплоя — Git-интеграция Cloudflare (GitHub Actions для деплоя не используются).
+API-токен Cloudflare не хранится в GitHub; секреты Worker не видны сборке и не попадают в логи.
 
-Это работает уже сейчас, без изменений на Pages. Экран-подсказка «Перенести LexLife на новый адрес»
-(`#/move`, в меню) готов и появится, когда в `js/services/deployment.js` будет задан `NEW_HOME_URL`
-(на Pages — режим «экспорт», на новом адресе — «импорт»).
+| Настройка (Dashboard → Workers & Pages → lexlife → Settings → Build) | Значение |
+|---|---|
+| Repository / Production branch | `adar4026/LexLife` / `main` |
+| Build command | `npm ci && npm test && npm run build` |
+| Deploy command | `npx wrangler deploy` |
+| Root directory | `/` |
+| Builds for non-production branches | выключено |
+| Build variables | `NODE_VERSION=24` |
 
-## Deploy из GitHub — выбран Cloudflare Workers Builds
+Порядок: checkout → install → **tests** → build → deploy. Любой упавший тест → сборка красная → deploy не
+выполняется, production остаётся на предыдущей версии. Миграции D1 в pipeline **не** входят.
 
-Git-интеграция Cloudflare (Workers Builds): push в `main` → сборка и `wrangler deploy` на стороне Cloudflare.
-Плюсы: не нужен API-токен Cloudflare в GitHub Secrets публичного репозитория, нет workflow-файлов,
-ветки получают preview-версии. Настройки проекта:
+Ручной deploy (`npm run deploy`) — только для аварийных случаев, когда Workers Builds недоступен; после него
+следующий push в `main` всё равно задеплоит версию из Git.
 
-- Build command: `npm ci && npm test && npm run build`
-- Deploy command: `npx wrangler deploy`
-- Root directory: `/`
+### Версия сборки
 
-Миграции D1 применяются вручную и осознанно (`npm run db:migrate:remote`), не при каждом push.
-GitHub Pages продолжает деплоиться из того же `main` — оба адреса живут параллельно.
+`npm run build` пишет в `dist/build-info.json` версию (`APP_VERSION`), commit (`WORKERS_CI_COMMIT_SHA`) и время, а в
+`dist/sw.js` — `CACHE_VERSION = 'lexlife-vNN-<sha7>'`. Видно в «Настройки → О приложении» (`build 1a2b3c4 · дата`)
+и в `GET /api/status`. На GitHub Pages сборки нет — там «без номера сборки», адрес «резервный (GitHub Pages)».
 
-## Production: шаги 1–5 выполнены 2026-10-03, остальное ждёт подтверждения
+### Обновление Service Worker
 
-1. `wrangler login` (аккаунт Cloudflare, Free plan достаточно).
-2. `wrangler d1 create lexlife` → записать `database_id` в `wrangler.jsonc`.
-3. `npm run db:migrate:remote` (создаёт 4 таблицы — данных пользователя там нет).
-4. Production VAPID: `node scripts/gen-vapid.mjs` → публичный ключ в `vars.VAPID_PUBLIC_KEY`,
-   приватный → `wrangler secret put VAPID_PRIVATE_KEY`, `wrangler secret put VAPID_SUBJECT` (`mailto:…`).
-5. Первый деплой: `npm run deploy` → `https://lexlife.<subdomain>.workers.dev`; cron создаётся из `triggers`.
-6. Dashboard → Worker → Settings → Builds → Connect GitHub `adar4026/LexLife`, ветка `main`.
-7. Проверки на iPhone: установка с экрана «Домой», включение фоновых уведомлений, тестовый push при
-   заблокированном экране, правило через минуту при закрытом приложении, offline, перенос данных через ZIP.
-8. Только после этого — `NEW_HOME_URL` и решение о судьбе GitHub Pages.
+Каждый deploy `main` даёт новый `sw.js` (суффикс commit) → браузер ставит новый SW при следующем запуске/навигации
+(`sw.js` отдаётся с `Cache-Control: no-cache`), `install` берёт файлы мимо HTTP-кэша, `activate` удаляет старый
+кэш приложения (кэши шрифтов и журнала уведомлений сохраняются), `clients.claim()`.
+`skipWaiting()` используется сознательно: SW не хранит и не трогает данные (localStorage/IndexedDB), все модули
+приложения загружаются статически при старте (динамически — только pdf.js, он не меняется между сборками), а без
+`skipWaiting` PWA на iPhone, которую почти никогда не закрывают полностью, могла бы неделями оставаться на старой
+версии. Новый код начинает работать со следующего запуска приложения. Ручной `CACHE_VERSION` (`lexlife-vNN`) всё
+равно поднимается при изменении ассетов — это версия для GitHub Pages, где сборки нет.
+
+## D1 migrations
+
+Только вручную и осознанно, никогда из pipeline:
+
+```
+npx wrangler d1 migrations list lexlife --remote     # что применено
+npx wrangler d1 time-travel info lexlife             # закладка ДО миграции — записать
+npm run db:migrate:remote                            # применить
+```
+
+Миграция — отдельный коммит + отдельное решение; схема только расширяется (новый код должен работать и со
+старой схемой до применения миграции).
+
+## Secrets
+
+| Имя | Где | Примечание |
+|---|---|---|
+| `VAPID_PRIVATE_KEY` | Cloudflare secret | никогда в Git/логах/README; deploy кода его не требует и не меняет |
+| `VAPID_SUBJECT` | Cloudflare secret | `mailto:` оператора |
+| `VAPID_PUBLIC_KEY` | `wrangler.jsonc` vars | публичный |
+
+Проверка: `npx wrangler secret list` (только имена). Секреты привязаны к Worker, а не к сборке: Workers Builds их не
+видит. Смена пары VAPID = все подписки устройств станут недействительны (устройства переподпишутся при запуске).
+
+## Cron и Web Push — эксплуатация
+
+- Один Cron Trigger `* * * * *` (из `wrangler.jsonc`). Пустая система: 2 запроса чтения D1 в минуту, 0 записей
+  (замер 2026-10-03: ~1 440 запусков и ~3 000 прочитанных строк в сутки, CPU ≈ 1,2 мс на запуск).
+- Логи cron — только счётчики, когда что-то было due; endpoint, ключи, токены и данные здоровья не логируются.
+- Здоровье: `GET /api/status` (D1 + VAPID), `npx wrangler tail lexlife --format pretty` (вызовы cron),
+  `npx wrangler d1 info lexlife` (запросы/строки за 24 ч).
+- Тестовый push: приложение → Меню → Уведомления → «Проверить фоновый push».
+
+## Recovery и rollback
+
+Стабильные точки:
+
+| Точка | Git | Worker version | D1 bookmark |
+|---|---|---|---|
+| `cf-stable-2026-10-03` | `dfb8b33` | `ea6631f7-ffc5-4041-948a-413da3b6b8fd` | `00000004-00000012-000050f9-cdfa24c76977369578f61a5db0c9cf91` (16:46Z) |
+
+Сценарии:
+
+1. **Плохой deploy кода** (самое частое): `npx wrangler deployments list` → `npx wrangler rollback <version-id>`
+   (мгновенно, без сборки; секреты сохраняются). Затем исправить в Git — следующий push в `main` задеплоит исправление.
+   Важно: пока `main` не исправлен, любой новый push снова задеплоит проблемный код.
+2. **Откат на стабильный тег**: `git revert` проблемных коммитов в `main` (не force-push) → автодеплой;
+   либо аварийно `git checkout cf-stable-2026-10-03 && npm ci && npm run deploy`.
+3. **Повреждена D1** (только инфраструктура push): `npx wrangler d1 time-travel restore lexlife --bookmark=<bookmark>`
+   (Free plan — 7 дней). Даже полная потеря D1 не затрагивает данные здоровья: устройство перерегистрируется,
+   правила синхронизируются заново при следующем запуске приложения.
+4. **Cloudflare недоступен**: GitHub Pages (резерв) открывается с тем же кодом и локальными напоминаниями
+   (только пока приложение открыто); данные там — те, что были на старом адресе.
+
+Откат Worker не трогает localStorage/IndexedDB на iPhone. Откат на версию со старым `CACHE_VERSION` браузер
+воспримет как новую версию SW (байты `sw.js` другие) — это безопасно.
+
+## GitHub Pages (legacy backup)
+
+- Источник — ветка `main`, корень репозитория (без сборки). После merge в `main` получает тот же код.
+- Не отключать, не делать redirect, не менять DNS, не удалять старую PWA с iPhone до отдельного решения.
+- Роль `legacy`: ни одного запроса к `/api` (проверено e2e по логу сервера), плашка «Резервная версия» со ссылкой
+  на основной адрес (без автоматического перехода), `notificationclick` открывает только свой origin (относительные
+  маршруты `./#/…`), абсолютных ссылок на Cloudflare в коде нет, кроме `PRIMARY_URL` для плашки и экрана переноса.
+- Обновление старой копии: SW v34 → v36 проверено с `Cache-Control: max-age=600` (как у Pages): данные и PDF
+  сохраняются, старый кэш удаляется, офлайн работает.
+
+## Release checklist (каждый релиз в `main`)
+
+1. `npm test` — зелёный (в т. ч. Node 24, как в Workers Builds).
+2. Секретов нет: `git diff origin/main..HEAD` без ключей/токенов/endpoint, без `private/` и бэкапов.
+3. D1: `npx wrangler d1 migrations list lexlife --remote` — новых миграций нет, или применены отдельно до релиза.
+4. Если менялись ассеты — поднят `CACHE_VERSION` в `sw.js` (для GitHub Pages).
+5. Push в `main` → Workers Builds зелёный (Dashboard → lexlife → Deployments). Второй deploy вручную не делать.
+6. `GET /api/status` → `200`, `db: ok`, `push: configured`, `build.sha` = commit из `main`.
+7. SW обновился: «Настройки → О приложении» показывает новый `build`, офлайн открывается.
+8. Push: «Проверить фоновый push» на iPhone приходит; число устройств/подписок в D1 не выросло.
+9. Cron: `npx wrangler tail lexlife` — вызовы раз в минуту без исключений; D1 без ошибок (`d1 info`).
+10. GitHub Pages: `https://adar4026.github.io/LexLife/` открывается, показывает «Резервная версия», к `/api` не обращается.
+11. Записать новую стабильную точку (тег + Worker version), если релиз подтверждён на iPhone.
 
 ## Локальная разработка
 
@@ -168,27 +268,3 @@ npm run db:migrate:local
 npm run dev                # http://127.0.0.1:8787, cron: GET /__scheduled
 npm test                   # все тесты (node:sqlite вместо D1, заглушка push-сервиса)
 ```
-
-## Стабильная точка отката (2026-10-03)
-
-Зафиксирована после переноса данных пользователем и проверки целостности.
-
-| | |
-|---|---|
-| Git | тег `cf-stable-2026-10-03` → коммит `dfb8b33` (ветка `cloudflare-push`) |
-| Worker | `lexlife`, версия `ea6631f7-ffc5-4041-948a-413da3b6b8fd` (код + секреты VAPID) |
-| Static assets | 29 файлов, побайтно совпадают со сборкой `npm run build` из `dfb8b33`; SW `lexlife-v35` |
-| D1 | `lexlife` `c8eaba54-3002-484a-924d-e0ef5a896012`, bookmark `00000004-00000012-000050f9-cdfa24c76977369578f61a5db0c9cf91` (2026-10-03T16:46Z) |
-| Cron | `* * * * *` |
-
-Откат:
-
-```
-npx wrangler rollback ea6631f7-ffc5-4041-948a-413da3b6b8fd     # код/конфиг Worker
-git checkout cf-stable-2026-10-03 && npm run deploy            # или пересобрать из тега
-npx wrangler d1 time-travel restore lexlife --bookmark=<bookmark>   # только если повреждена D1
-```
-
-D1 Time Travel на Free plan хранит 7 дней. В D1 только инфраструктура push: при её потере устройство
-перерегистрируется и заново синхронизирует правила; данные здоровья живут на устройстве и в бэкапах пользователя.
-Откат Worker не трогает localStorage/IndexedDB на iPhone.

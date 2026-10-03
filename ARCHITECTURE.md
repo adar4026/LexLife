@@ -182,17 +182,17 @@ fallback → home
 [
   {
     "id": "v_a1b2",
-    "date": "2026-06-11",
+    "date": "2026-02-14",
     "doctor": "Dr. Ivanov",
     "specialty": "Терапевт",
     "clinic": "Клиника №1",
     "reason": "Плановый осмотр",
     "conclusion": "Без отклонений.",
     "recommendations": "Повторный визит через год",
-    "nextDate": "2027-06-11",
+    "nextDate": "2027-02-14",
     "status": "done | planned",
     "attachments": [ { "id": "att_1", "kind": "pdf|image", "name": "Заключение.pdf", "mime": "application/pdf", "size": 182734, "blobRef": "att_1", "addedAt": "ISO" } ],
-    "links": { "testIds": ["t_0611"], "medIds": ["m_ator"], "reminderIds": [] }
+    "links": { "testIds": ["t_0214"], "medIds": ["m_ator"], "reminderIds": [] }
   }
 ]
 ```
