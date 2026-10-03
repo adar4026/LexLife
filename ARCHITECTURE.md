@@ -28,9 +28,14 @@ _Физическая папка проекта на диске: `/Users/MacPro/
 LexLife/
 ├── ARCHITECTURE.md             # Этот документ
 ├── docs/FULL_BACKUP.md          # Документы анализов, формат полной копии (ZIP), импорт анализа
+├── docs/CLOUDFLARE.md           # Cloudflare Worker + D1 + cron + Web Push, перенос данных между адресами
+├── wrangler.jsonc, package.json # Конфиг Worker'а (без секретов), npm-скрипты (build/dev/test/deploy)
+├── worker/                      # Cloudflare Worker: API, cron, Web Push (VAPID + aes128gcm), headers
+├── migrations/                  # D1: только инфраструктура уведомлений
+├── scripts/                     # build-assets (dist/ из allowlist), gen-vapid
 ├── index.html                  # Оболочка: <main id="screen">, таб-бар, ☰, Drawer, scrim
 ├── manifest.json                # PWA-манифест
-├── sw.js                        # Service Worker (app-shell + кэш шрифтов + notificationclick + push-задел)
+├── sw.js                        # Service Worker (app-shell + кэш шрифтов + notificationclick + Web Push)
 ├── css/styles.css               # Все стили: токены, тёмная/светлая тема, компоненты
 ├── js/
 │   ├── app.js                   # Роутер, Drawer, тема, все экраны, доменная логика
@@ -38,11 +43,16 @@ LexLife/
 │   ├── services/analytics.js    # Чистые функции аналитики для «Статистики» (§8.7)
 │   ├── services/notifySchedule.js # Расписание уведомлений: nextFire/prevFire/dueFire (§8.5)
 │   ├── services/notifier.js     # Локальная доставка + честный статус уведомлений (§8.5)
+│   ├── services/zonedSchedule.js # Расписание в IANA timezone (сервер + occurrenceId), DST
+│   ├── services/pushClient.js   # Фоновые уведомления: устройство, подписка, синхронизация правил
+│   ├── services/occurrenceStore.js # Журнал показанных срабатываний (Cache API, общий со SW)
+│   ├── services/deployment.js   # Где запущено приложение; адрес для экрана переноса
 │   ├── services/attachments.js  # Документы анализов (PDF/фото) в IndexedDB (§7.2)
 │   ├── services/fullBackup.js   # Полная резервная копия с документами (ZIP, §7.2)
 │   ├── services/zip.js          # Минимальный ZIP без зависимостей (STORE + CRC-32)
 │   ├── services/preparedImport.js # Импорт подготовленного анализа из JSON (§7.2)
 │   ├── services/testsJournal.js # Журнал анализов: порядок, годы, разделы, история показателя (§8.8)
+│   ├── services/homeSummary.js  # Данные Главной: прогресс воды, «Ближайшее», «Требует внимания», «Последняя активность»
 │   ├── ui/charts.js             # Лёгкие интерактивные SVG-графики (линия/столбцы)
 │   ├── ui/docViewer.js          # «Документ анализа»: PDF все страницы / фото с масштабом (§8.8)
 │   └── vendor/pdfjs/            # Локальная копия pdf.js 4.10.38 (Apache-2.0), без CDN
@@ -90,7 +100,7 @@ fallback → home
 
 | Экран | Маршрут | В нав. | Содержимое |
 |---|---|---|---|
-| 🏠 Главная | `home` | таб | Приветствие+дата · 4 карточки показателей (Вес/Давление/Пульс/Вода → модуль) · предупреждения · «Ближайшее» · последние анализы |
+| 🏠 Главная | `home` | таб | Дата · «Вода сегодня» (выпито / цель, прогресс, «Осталось», +250 мл через `addWaterEntry`) · «Показатели»: Вес/Пульс/Давление — последнее значение и дата или «Добавить» (→ модуль) · «Ближайшее»: одно ближайшее предстоящее лекарство по его `reminder_time` / `every_days` и отметке «принял сегодня» (→ Лекарства), скрыт без событий · «Требует внимания»: до 3 последних значений анализов вне диапазона (`evaluateField` / `outOfLabRange`, без новых правил), скрыт без отклонений · «Последняя активность»: самый поздний по дате из последнего анализа, измерения и прошедшего визита (будущие не участвуют) |
 | 📊 Показатели | `metrics` | таб | Сетка 7 карточек-модулей |
 | 💊 Лекарства | `meds` | таб | Список + чекбокс «принял сегодня» |
 | 🩸 Анализы | `tests` | таб | Компактный журнал (§8.8): одна запись — одна строка (дата · группы · документ · ›), заголовки годов, фильтр «Все / год» · «+ Добавить анализ» · импорт подготовленного анализа (JSON) |
@@ -166,24 +176,24 @@ fallback → home
 ```jsonc
 { "name": "", "photo": "data:image/jpeg;base64,..." | null }
 ```
-`name` пустая по умолчанию — пользователь задаёт своё имя сам в экране «Профиль»; до этого Главная показывает нейтральное приветствие («Привет 👋»).
+`name` пустая по умолчанию — пользователь задаёт своё имя сам в экране «Профиль» (боковое меню); на Главной приветствия нет — только дата.
 
 ### 5.6 `health_visits` — врачи и визиты (расширено в v7)
 ```jsonc
 [
   {
     "id": "v_a1b2",
-    "date": "2026-06-11",
+    "date": "2026-02-14",
     "doctor": "Dr. Ivanov",
     "specialty": "Терапевт",
     "clinic": "Клиника №1",
     "reason": "Плановый осмотр",
     "conclusion": "Без отклонений.",
     "recommendations": "Повторный визит через год",
-    "nextDate": "2027-06-11",
+    "nextDate": "2027-02-14",
     "status": "done | planned",
     "attachments": [ { "id": "att_1", "kind": "pdf|image", "name": "Заключение.pdf", "mime": "application/pdf", "size": 182734, "blobRef": "att_1", "addedAt": "ISO" } ],
-    "links": { "testIds": ["t_0611"], "medIds": ["m_ator"], "reminderIds": [] }
+    "links": { "testIds": ["t_0214"], "medIds": ["m_ator"], "reminderIds": [] }
   }
 ]
 ```
@@ -332,7 +342,8 @@ fallback → home
 - **Расписание** (`services/notifySchedule.js`): `nextFire`/`prevFire`/`dueFire` — чистые функции, всё в локальном времени устройства (`new Date(y,m,d,h,min)`), без UTC и без зашитой timezone; DST и полночь — движок Date. Тесты — `tests/notifications.test.mjs` в 4 timezone.
 - **Доставка** (`services/notifier.js`, `createNotifier`): проверка каждые 30 с (`setInterval`) + `visibilitychange`/`pageshow`; правило с `dueFire` (срабатывание в последние 10 мин, позже `lastFiredAt`) сначала помечается, потом показывается через `registration.showNotification` (данные `route` → клик открывает нужный экран). Параллельные проверки склеиваются — одно срабатывание = одно уведомление.
 - **Ограничение платформы (главное)**: это код страницы. Он выполняется, только пока LexLife открыт на экране. Свёрнутое приложение, заблокированный экран, закрытое PWA — iOS замораживает/выгружает страницу, таймер не идёт, напоминание не приходит (при возврате в течение 10 мин — покажется с опозданием). В Safari нет Notification Triggers и Periodic Background Sync — локально «разбудить» приложение в нужное время нечем. Экран статуса говорит об этом прямо.
-- **Push (задел, не подключён)**: `sw.js` обрабатывает `push` (всегда показывает уведомление — требование iOS) и `notificationclick` (фокус окна + `postMessage` маршрута либо `openWindow('./#/…')`). Подписка (`pushManager.subscribe`) не создаётся: нужен VAPID-ключ и сервер-отправитель с планировщиком — на GitHub Pages его нет.
+- **Фоновая доставка (Web Push, Cloudflare)** — подробно в `docs/CLOUDFLARE.md`. `services/pushClient.js`: устройство (UUID + токен, вне бэкапа), `pushManager.subscribe({ userVisibleOnly: true })`, зеркало расписания на сервере (без текстов) с синхронизацией по «отпечатку» (offline, restore, смена timezone). Сервер (`worker/`, D1, cron раз в минуту) шлёт push; `sw.js` показывает его с `tag = occurrenceId` и пишет occurrence в Cache API (`services/occurrenceStore.js`). Локальный планировщик не показывает то, что пришло push'ем, а пока push основной — ждёт его 2 мин (запасной показ). На GitHub Pages `/api` нет — экран честно пишет «нет на этом адресе», работает только локальная доставка.
+- **Экран статуса**: системное разрешение, Service Worker, push-подписка, сервер уведомлений, фоновая доставка, последняя синхронизация, последний серверный push; кнопки «Проверить локальное уведомление», «Проверить фоновый push», «Включить/Отключить фоновые уведомления».
 
 ### 8.6 Календарь здоровья (`calendar`)
 **Агрегатор без собственной модели данных** — читает `health_visits`, `health_tests`, `health_meds` (+ вычисляемая следующая доза `nextDose`), `notifications`, `health_metrics.water.goal`. Режимы: **Месяц** (сетка Пн-первая, точки на днях с разовыми событиями), **Неделя** (7-дневная полоса), **Список** (ближайшие 60 дней, только дни с разовыми событиями).
@@ -362,17 +373,18 @@ fallback → home
 ## 9. Тема, профиль, офлайн
 - **Тема** — `app_theme` в `localStorage`, `applyTheme()` ставит `data-theme` на `<html>`; светлая палитра в `[data-theme="light"]`.
 - **Профиль** — имя + аватар (фото сжимается в 200×200 JPEG, хранится data-URL).
-- **Service Worker** `lexlife-v34` — предкэш оболочки (запросы предкэша с `cache: 'reload'`, мимо HTTP-кэша) (HTML/CSS/JS/manifest/иконка) + кэш Google Fonts (stale-while-revalidate) + обработчики `notificationclick` (открытие нужного экрана) и `push` (задел). Обновление ассетов — инкремент `CACHE_VERSION`.
+- **Service Worker** `lexlife-v35` — предкэш оболочки (запросы предкэша с `cache: 'reload'`, мимо HTTP-кэша) (HTML/CSS/JS/manifest/иконка) + кэш Google Fonts (stale-while-revalidate) + обработчики `notificationclick` (открытие нужного экрана) и `push` (Web Push сервера LexLife, журнал occurrence `lexlife-occ-v1`). Запросы `<scope>api/*` не кэшируются. Обновление ассетов — инкремент `CACHE_VERSION`.
 
 ---
 
-## 10. Развёртывание (GitHub Pages)
+## 10. Развёртывание (GitHub Pages; Cloudflare — параллельно, см. `docs/CLOUDFLARE.md`)
 
 Приложение — статический сайт без сборки, поэтому подходит для GitHub Pages «как есть»:
 - Все пути (CSS/JS/manifest/иконки) относительные, без ведущего `/` — работает и из корня, и из подкаталога `https://<user>.github.io/<repo>/`.
 - `manifest.json`: `start_url: "./index.html"`, `scope: "./"` — относительные.
 - SW регистрируется как `navigator.serviceWorker.register('sw.js')` (без ведущего `/`) — scope автоматически совпадает с каталогом сайта.
 - Роутинг — hash-based (`#/route`), сервер не участвует в маршрутизации, обновление страницы не ломает навигацию.
+- Тот же код без изменений отдаётся Cloudflare Worker'ом от корня `/` (`dist/` собирается allowlist'ом `scripts/build-assets.mjs`; `worker/`, `tests/`, `private/` туда не попадают).
 - `.nojekyll` в корне отключает обработку Jekyll на GitHub Pages (не нужна для чистого статического сайта).
 - Новый пользователь (в т.ч. первый запуск на iPhone) получает пустую базу — см. §6, §12 «Приватность».
 
@@ -387,7 +399,7 @@ fallback → home
 1. ~~Вода~~ · ~~Показатели~~ · ~~Врачи и визиты~~ · ~~Центр уведомлений~~ · ~~Календарь здоровья~~ · ~~Статистика здоровья~~ — готово.
 2. 📎 Фото/PDF вложения: к анализам — готово (IndexedDB, §7.2); к визитам — следующий шаг.
 3. 📤 Экспорт медицинской истории в PDF (сейчас есть только JSON-бэкап).
-4. 🔔 Настоящие push-уведомления — нужен сервер-отправитель (VAPID + планировщик, например Supabase Edge Function + pg_cron или Cloudflare Worker cron); Notification Triggers в браузерах не вышли. Клиентская часть (`push`/`notificationclick` в SW, модель `channel`/`ref`) готова.
+4. 🔔 Push-уведомления — Cloudflare Worker + D1 + cron подготовлены и проверены локально (`docs/CLOUDFLARE.md`); production — после подтверждения владельца. Следом — индивидуальные напоминания по лекарствам (`reminder_time`).
 5. ☁️ Синхронизация между устройствами.
 
 Отдельно (не блокирует roadmap выше):

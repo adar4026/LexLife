@@ -15,8 +15,13 @@ import { createFullBackup, prepareFullRestore, applyFullRestore, isZipFile, coun
 import { parsePreparedTest, importPreparedTest, PreparedImportError } from './services/preparedImport.js';
 import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
 import { openDocViewer as showDocViewer } from './ui/docViewer.js';
+import { setActiveTab } from './ui/bottomNav.js';
+import { waterProgress, attentionItems, recentActivity, upcomingMed, nextDose } from './services/homeSummary.js';
 import { nextFire } from './services/notifySchedule.js';
 import { createNotifier, describeNotifyState, armPatch, waterRulePatch, NOTIF_ROUTES, isSafeRoute } from './services/notifier.js';
+import { createPushClient, SYNC_FAIL_TEXT, SERVER_FALLBACK_MS } from './services/pushClient.js';
+import { createOccurrenceStore } from './services/occurrenceStore.js';
+import { NEW_HOME_URL, PRIMARY_URL, migrationMode, deploymentRole, serverPushAllowed } from './services/deployment.js';
 
 /* Документы анализов: файлы в IndexedDB (только на этом устройстве), метаданные — в health_tests */
 const Attachments = new AttachmentService(Storage, new IdbAttachmentStore());
@@ -60,7 +65,6 @@ const METRICS = {
   glucose: { key: 'glucose', name: 'Глюкоза', emoji: '🍬', unit: 'ммоль/л', kind: 'single', step: '0.1' },
 };
 const METRIC_ORDER = ['weight', 'pressure', 'pulse', 'water', 'temperature', 'spo2', 'glucose'];
-const HOME_METRICS = ['weight', 'pressure', 'pulse', 'water'];
 
 const fmtMl = (ml) => (ml == null ? '—' : Math.round(ml).toLocaleString('ru-RU'));
 const fmtMetric = (key, v) => {
@@ -81,15 +85,6 @@ const chartVal = (key, v) => {
 /* ---------- доменная логика анализов ---------- */
 /* Цветовая отметка основных полей по справочным значениям приложения (REFERENCE) */
 const evaluate = evaluateField;
-function nextDose(med) {
-  if (!med.every_days || !med.start) return null;
-  const ms = 86400000;
-  const start = new Date(med.start + 'T00:00:00');
-  const today = new Date(dateKey() + 'T00:00:00');
-  if (start > today) return med.start;
-  const cycles = Math.ceil((today - start) / ms / med.every_days);
-  return dateKey(new Date(start.getTime() + cycles * med.every_days * ms));
-}
 
 /* ---------- тема ---------- */
 const getTheme = () => localStorage.getItem('app_theme') || 'dark';
@@ -111,104 +106,245 @@ function metricCard(key, latest) {
 
 /* =========================================================
    Вкладка 1 — Главная (Dashboard)
+   Отвечает на три вопроса: что сегодня (вода, показатели) · что требует внимания
+   (отклонения последних анализов) · куда перейти (последняя активность).
+   Данные — только из Storage; расчёты — js/services/homeSummary.js.
    ========================================================= */
+const HOME_QUICK_METRICS = ['weight', 'pulse', 'pressure'];
+const HOME_WATER_ADD = 250; // мл — та же запись, что и быстрый ввод модуля воды (Storage.addWaterEntry)
+
+/* Линейные иконки одного семейства с таб-баром (24×24, обводка currentColor) */
+const HOME_ICONS = {
+  water: '<path d="M12 3.6c3.3 4.1 5.6 7.3 5.6 10.2a5.6 5.6 0 0 1-11.2 0c0-2.9 2.3-6.1 5.6-10.2z"/>',
+  weight: '<rect x="4" y="4" width="16" height="16" rx="4.5"/><path d="M8.3 10.4a5.2 5.2 0 0 1 7.4 0"/><path d="m12 11.4 1.5-2"/>',
+  pulse: '<path d="M12 19.5s-7.5-4.4-7.5-10a4.2 4.2 0 0 1 7.5-2.6 4.2 4.2 0 0 1 7.5 2.6c0 5.6-7.5 10-7.5 10z"/><path d="M7.5 11.5h2.2l1.3-2.2 2 4.4 1.3-2.2h2.2"/>',
+  pressure: '<path d="M4.6 16.8a8 8 0 1 1 14.8 0"/><path d="m12 13.2 3.2-3.6"/><circle cx="12" cy="13.6" r="1.1"/>',
+  lab: '<path d="M9 3.5h6"/><path d="M10 3.5v6L5 18.3a1.8 1.8 0 0 0 1.6 2.7h10.8a1.8 1.8 0 0 0 1.6-2.7L14 9.5v-6"/><path d="M7.4 15h9.2"/>',
+  med: '<rect x="2.8" y="8.3" width="18.4" height="7.4" rx="3.7" transform="rotate(-45 12 12)"/><path d="m9.4 9.4 5.2 5.2"/>',
+  visit: '<path d="M6 3.5v5a4 4 0 0 0 8 0v-5"/><path d="M10 12.5v2a4.5 4.5 0 0 0 9 0V13"/><circle cx="19" cy="11" r="2"/>',
+  chevron: '<path d="m9.5 6 6 6-6 6"/>',
+  plus: '<path d="M12 5.5v13M5.5 12h13"/>',
+  check: '<path d="m5.5 12.5 4.2 4.2 8.8-9.2"/>',
+};
+HOME_ICONS.temperature = HOME_ICONS.pulse;
+HOME_ICONS.spo2 = HOME_ICONS.pulse;
+HOME_ICONS.glucose = HOME_ICONS.lab;
+const homeIcon = (name, cls = '') => `<svg class="hi ${cls}" viewBox="0 0 24 24" aria-hidden="true">${HOME_ICONS[name] || HOME_ICONS.lab}</svg>`;
+
+const fmtLongDate = (iso) => new Date(iso + 'T00:00:00').toLocaleDateString(RU, { day: 'numeric', month: 'long', year: 'numeric' }).replace(/\s*г\.$/, '');
+function fmtWhen(iso, today) {
+  if (iso === today) return 'сегодня';
+  const y = new Date(today + 'T00:00:00');
+  y.setDate(y.getDate() - 1);
+  if (iso === dateKey(y)) return 'вчера';
+  const d = new Date(iso + 'T00:00:00');
+  return d.toLocaleDateString(RU, d.getFullYear() === y.getFullYear() ? { day: 'numeric', month: 'short' } : { day: 'numeric', month: 'short', year: 'numeric' }).replace(/\s*г\.$/, '');
+}
+function homeSection(title, route, label) {
+  return el(`
+    <section class="hsec">
+      <div class="hsec__head">
+        <h2 class="hsec__title">${esc(title)}</h2>
+        ${route ? `<a class="hsec__more" href="#/${route}" aria-label="${esc(label)}">Все${homeIcon('chevron', 'hsec__chev')}</a>` : ''}
+      </div>
+    </section>
+  `);
+}
+
 async function HomeScreen() {
-  const [alerts, allMeds, latestTest, profile, ...latests] = await Promise.all([
-    Storage.getAlerts(),
-    Storage.getMeds(),
-    Storage.getLatestTest(),
-    Storage.getProfile(),
-    ...HOME_METRICS.map((k) => Storage.getMetricLatest(k)),
+  const today = dateKey();
+  const [water, goal, tests, metricsLog, visits, meds, takenToday] = await Promise.all([
+    Storage.getWater(today), Storage.getWaterGoal(), Storage.getTests(), Storage.getMetricsLog(), Storage.getVisits(),
+    Storage.getMeds(), Storage.getMedLog(today),
   ]);
-  const meds = allMeds.filter((m) => m.active);
-  const screen = el('<div></div>');
-  const greeting = profile?.name ? `Привет, ${esc(profile.name)} 👋` : 'Привет 👋';
+  const screen = el('<div class="home"></div>');
 
-  screen.appendChild(
-    el(`
-    <header class="header">
-      <p class="header__eyebrow">${esc(fmtFull(new Date()))}</p>
-      <h1 class="header__title">${greeting}</h1>
-    </header>
-  `)
-  );
+  /* дата — единственный заголовок; справа — общая кнопка ☰ (index.html) */
+  screen.appendChild(el(`<header class="home-head"><p class="home-head__date">${esc(fmtFull(new Date()))}</p></header>`));
+  if (deploymentRole() === 'legacy') screen.appendChild(legacyNotice());
 
-  /* Сегодня — 4 краткие карточки показателей (тап → модуль) */
-  const sec = el('<section class="section" style="margin-top:14px"><div class="section__head"><h2 class="section__title">Сегодня</h2><button class="section__action" data-route="metrics">Все</button></div><div class="mcard-grid"></div></section>');
-  const grid = $('.mcard-grid', sec);
-  HOME_METRICS.forEach((k, i) => grid.appendChild(metricCard(k, latests[i])));
-  screen.appendChild(sec);
-
-  /* Предупреждения */
-  if (alerts.length) {
-    const s = el('<section class="section"><div class="section__head"><h2 class="section__title">Требует внимания</h2></div><div class="alerts"></div></section>');
-    const box = $('.alerts', s);
-    alerts.forEach((a) => {
-      box.appendChild(
-        el(`
-        <div class="alert alert--${esc(a.type)}">
-          <span class="alert__dot"></span>
-          <div class="alert__body">
-            <p class="alert__title">${esc(a.title)}</p>
-            <p class="alert__meta">${esc(a.note || (a.norm ? 'Норма: ' + a.norm : ''))}</p>
-          </div>
-          ${a.value ? `<span class="alert__value">${esc(a.value)}</span>` : ''}
-        </div>
-      `)
-      );
-    });
-    screen.appendChild(s);
-  }
-
-  /* Ближайшее */
-  const upcoming = [];
-  meds.forEach((m) => {
-    if (m.reminder_time) upcoming.push({ icon: m.icon, title: m.name, sub: 'Приём сегодня', trailing: m.reminder_time });
-    const nd = nextDose(m);
-    if (nd) upcoming.push({ icon: m.icon, title: m.name, sub: 'Следующая доза', trailing: fmtDate(nd) });
-  });
-  const repeatNote = alerts.find((a) => a.type === 'info' && a.note);
-  if (repeatNote) upcoming.push({ icon: '🩸', title: repeatNote.title, sub: repeatNote.note, trailing: '' });
-  if (upcoming.length) {
-    const s = el('<section class="section"><div class="section__head"><h2 class="section__title">Ближайшее</h2></div><div class="list-card"></div></section>');
-    const box = $('.list-card', s);
-    upcoming.forEach((u) => {
-      box.appendChild(
-        el(`
-        <div class="row">
-          <span class="row__icon">${esc(u.icon || '📌')}</span>
-          <div class="row__body"><p class="row__title">${esc(u.title)}</p><p class="row__sub">${esc(u.sub)}</p></div>
-          ${u.trailing ? `<span class="row__trailing">${esc(u.trailing)}</span>` : ''}
-        </div>
-      `)
-      );
-    });
-    screen.appendChild(s);
-  }
-
-  /* Последние анализы */
-  if (latestTest) {
-    const fields = ['ldl', 'trig', 'glucose', 'vitd'];
-    const s = el('<section class="section"><div class="section__head"><h2 class="section__title">Последние анализы</h2><button class="section__action" data-route="tests">Все</button></div><div class="metric-grid"></div></section>');
-    const g = $('.metric-grid', s);
-    fields.forEach((f) => {
-      const ref = REFERENCE[f];
-      const val = latestTest[f];
-      const st = evaluate(f, val);
-      g.appendChild(
-        el(`
-        <div class="metric-tile" role="button" data-route="test-history/${f}">
-          <div class="metric-tile__top"><span class="metric-tile__name">${esc(ref.label)}</span><span class="dot-status dot-status--${st}"></span></div>
-          <div class="metric-tile__value">${val ?? '—'}<span class="metric-tile__unit">${esc(ref.unit)}</span></div>
-        </div>
-      `)
-      );
-    });
-    screen.appendChild(s);
-  }
-
-  screen.addEventListener('click', onRouteClick);
+  screen.appendChild(renderWaterHero(water, goal));
+  screen.appendChild(renderQuickMetrics(metricsLog, today));
+  const upcoming = renderUpcoming(meds, takenToday);
+  if (upcoming) screen.appendChild(upcoming);
+  const attention = renderAttentionSection(tests);
+  if (attention) screen.appendChild(attention);
+  const recent = renderRecentActivity({ tests, metricsLog, visits, today });
+  if (recent) screen.appendChild(recent);
   return screen;
+}
+
+/* ---------- Вода сегодня (hero) ---------- */
+function renderWaterHero(water, goal) {
+  const card = el(`
+    <section class="hw" aria-label="Вода сегодня">
+      <a class="hw__head" href="#/metric/water" aria-label="Вода: открыть модуль воды">
+        <span class="hw__icon">${homeIcon('water')}</span>
+        <span class="hw__title">Вода сегодня</span>
+        ${homeIcon('chevron', 'hw__chev')}
+      </a>
+      <p class="hw__val"><span class="hw__cur"></span><span class="hw__goal"></span></p>
+      <div class="hw__bar" role="progressbar" aria-label="Выпито от цели" aria-valuemin="0" aria-valuemax="100"><span class="hw__fill"></span></div>
+      <div class="hw__foot">
+        <p class="hw__status" aria-live="polite"></p>
+        <button class="hw__add" type="button" aria-label="Добавить ${HOME_WATER_ADD} мл воды">${homeIcon('plus')}${HOME_WATER_ADD} мл</button>
+      </div>
+    </section>
+  `);
+  const paint = (cur) => {
+    const p = waterProgress(cur, goal);
+    $('.hw__cur', card).textContent = fmtMl(p.current);
+    $('.hw__goal', card).textContent = ` / ${fmtMl(p.goal)} мл`;
+    const pct = Math.round(p.progress * 100);
+    $('.hw__fill', card).style.width = `${pct}%`;
+    const bar = $('.hw__bar', card);
+    bar.setAttribute('aria-valuenow', String(pct));
+    bar.setAttribute('aria-valuetext', `${fmtMl(p.current)} из ${fmtMl(p.goal)} мл`);
+    const st = $('.hw__status', card);
+    st.classList.toggle('is-done', p.reached);
+    st.innerHTML = p.reached
+      ? `${homeIcon('check')}Цель выполнена${p.over ? ` <span class="hw__over">+${esc(fmtMl(p.over))} мл</span>` : ''}`
+      : `Осталось <b>${esc(fmtMl(p.remaining))} мл</b>`;
+  };
+  paint(water);
+
+  /* значение и прогресс тоже ведут в модуль воды (ссылка в заголовке — путь для VoiceOver) */
+  card.addEventListener('click', (e) => {
+    if (e.target.closest('.hw__add, .hw__head')) return;
+    location.hash = '#/metric/water';
+  });
+  const add = $('.hw__add', card);
+  add.addEventListener('click', async () => {
+    if (add.disabled) return;
+    add.disabled = true;
+    try {
+      paint(await Storage.addWaterEntry(HOME_WATER_ADD));
+      flash(`+${HOME_WATER_ADD} мл`);
+    } finally {
+      add.disabled = false;
+    }
+  });
+  return card;
+}
+
+/* ---------- Показатели: вес · пульс · давление ---------- */
+function renderQuickMetrics(metricsLog, today) {
+  const sec = homeSection('Показатели', 'metrics', 'Все показатели');
+  const grid = el('<div class="qm-grid"></div>');
+  const cells = HOME_QUICK_METRICS.map((key) => {
+    const M = METRICS[key];
+    const log = (metricsLog && metricsLog[key]) || {};
+    const date = Object.keys(log).filter((d) => log[d] != null && d <= today).sort().pop();
+    const value = date ? fmtMetric(key, log[date]) : null;
+    /* давление «120/80» читается без единицы — в карточке её нет, в aria-label есть */
+    const unit = key === 'pressure' ? '' : M.unit;
+    return { key, M, date, value, unit };
+  });
+  /* один размер цифр для всего ряда: по самой длинной записи (CSS: --qm-chars) */
+  const chars = Math.max(3, ...cells.filter((c) => c.value).map((c) => c.value.length + c.unit.length * 0.5));
+  grid.style.setProperty('--qm-chars', String(chars));
+  cells.forEach(({ key, M, date, value, unit }) => {
+    const label = value
+      ? `${M.name}: ${value} ${M.unit}, ${fmtWhen(date, today)}. Открыть`
+      : `${M.name}: нет записей. Добавить`;
+    grid.appendChild(el(`
+      <a class="qm${value ? '' : ' qm--empty'}" href="#/metric/${key}" aria-label="${esc(label)}">
+        ${homeIcon(key, 'qm__icon')}
+        <span class="qm__name">${esc(M.name)}</span>
+        ${value
+          ? `<span class="qm__val">${esc(value)}${unit ? `<span class="qm__unit">${esc(unit)}</span>` : ''}</span><span class="qm__when">${esc(fmtWhen(date, today))}</span>`
+          : `<span class="qm__val qm__val--none" aria-hidden="true">—</span><span class="qm__add">${homeIcon('plus')}Добавить</span>`}
+      </a>
+    `));
+  });
+  sec.appendChild(grid);
+  return sec;
+}
+
+/* ---------- Ближайшее: одно предстоящее лекарство (расписание и отметки — экран «Лекарства») ---------- */
+function renderUpcoming(meds, takenToday) {
+  const now = new Date();
+  const u = upcomingMed(meds, { now, takenToday });
+  if (!u) return null;
+  const today = dateKey(now);
+  const tomorrow = dateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1));
+  const day = u.date === today ? 'Сегодня' : u.date === tomorrow ? 'Завтра' : fmtWhen(u.date, today);
+  const when = [day, u.time].filter(Boolean).join(', ');
+  const sub = [when, u.dose].filter(Boolean).join(' · ');
+  const sec = homeSection('Ближайшее');
+  const row = el(`
+    <a class="hrow hrow--compact" href="#/meds">
+      <span class="hrow__icon">${homeIcon('med')}</span>
+      <span class="hrow__body"><span class="hrow__title"></span><span class="hrow__sub hrow__sub--one"></span></span>
+      ${homeIcon('chevron', 'hrow__chev')}
+    </a>
+  `);
+  $('.hrow__title', row).textContent = u.name;
+  $('.hrow__sub', row).textContent = sub;
+  row.setAttribute('aria-label', `Ближайшее: ${u.name}, ${sub}; открыть лекарства`);
+  const list = el('<div class="hlist"></div>');
+  list.appendChild(row);
+  sec.appendChild(list);
+  return sec;
+}
+
+/* ---------- Требует внимания: только то, что приложение уже отмечает как вне диапазона ---------- */
+function renderAttentionSection(tests) {
+  const { items } = attentionItems(tests, { limit: 3 });
+  if (!items.length) return null;
+  const sec = homeSection('Требует внимания', 'tests', 'Все анализы');
+  const list = el('<div class="hlist"></div>');
+  items.forEach((it) => {
+    const value = `${fmtNum(it.value)}${it.unit ? ` ${it.unit}` : ''}`;
+    const row = el(`
+      <a class="hrow" href="#/test-history/${encodeURIComponent(it.key)}">
+        <span class="hrow__icon hrow__icon--${it.level}">${homeIcon('lab')}</span>
+        <span class="hrow__body"><span class="hrow__title"></span><span class="hrow__sub">${esc(value)}</span></span>
+        <span class="hrow__status hrow__status--${it.level}">${esc(it.label)}</span>
+        ${homeIcon('chevron', 'hrow__chev')}
+      </a>
+    `);
+    $('.hrow__title', row).textContent = it.name;
+    row.setAttribute('aria-label', `${it.name}: ${value}, ${it.label.toLowerCase()}, анализ от ${fmtLongDate(it.date)}. История показателя`);
+    list.appendChild(row);
+  });
+  sec.appendChild(list);
+  sec.appendChild(el('<p class="hsec__note">По справочным значениям приложения и диапазонам бланка лаборатории — это не медицинская оценка.</p>'));
+  return sec;
+}
+
+/* ---------- Последняя активность: анализ → измерение → визит ---------- */
+function renderRecentActivity(data) {
+  const a = recentActivity(data);
+  if (!a) return null;
+  let icon, title, sub, href;
+  if (a.kind === 'test') {
+    /* группы бланка («Гематология · Биохимия») — заголовок; без них просто «Анализы» */
+    icon = 'lab'; title = a.summary || 'Анализы'; href = `#/test/${encodeURIComponent(a.testId)}`;
+    sub = fmtLongDate(a.date);
+  } else if (a.kind === 'metric') {
+    const M = METRICS[a.key];
+    icon = a.key; title = M.name; href = `#/metric/${a.key}`;
+    sub = `${fmtMetric(a.key, a.value)} ${M.unit} · ${fmtLongDate(a.date)}`;
+  } else {
+    icon = 'visit'; title = a.title; href = `#/visit/${encodeURIComponent(a.visitId)}`;
+    sub = fmtLongDate(a.date);
+  }
+  const sec = homeSection('Последняя активность');
+  const row = el(`
+    <a class="hrow" href="${href}">
+      <span class="hrow__icon">${homeIcon(icon)}</span>
+      <span class="hrow__body"><span class="hrow__title"></span><span class="hrow__sub hrow__sub--one"></span></span>
+      ${homeIcon('chevron', 'hrow__chev')}
+    </a>
+  `);
+  $('.hrow__title', row).textContent = title;
+  $('.hrow__sub', row).textContent = sub;
+  row.setAttribute('aria-label', `${title}: ${sub}. Открыть`);
+  const list = el('<div class="hlist"></div>');
+  list.appendChild(row);
+  sec.appendChild(list);
+  return sec;
 }
 
 /* =========================================================
@@ -653,7 +789,7 @@ async function WaterScreen() {
               ${[60, 90, 120, 180].map((m) => `<option value="${m}" ${hyd.slotMinutes === m ? 'selected' : ''}>${m === 60 ? '1 ч' : m === 90 ? '1,5 ч' : m === 120 ? '2 ч' : '3 ч'}</option>`).join('')}
             </select>
           </div>
-          <div class="rs-row"><div><div class="field__label" style="margin:0">Напоминания</div><div style="font-size:11px; color:var(--text2)">${on ? esc(repeatSummary(waterRule)) + ' · ' : ''}только пока LexLife открыт · <a href="#/notifications" style="color:var(--blue)">статус</a></div></div>
+          <div class="rs-row"><div><div class="field__label" style="margin:0">Напоминания</div><div style="font-size:11px; color:var(--text2)">${on ? esc(repeatSummary(waterRule)) + ' · ' : ''}${pushClient.state().enabled ? 'фоновые (сервер)' : 'только пока LexLife открыт'} · <a href="#/notifications" style="color:var(--blue)">статус</a></div></div>
             <button class="rs-toggle ${on ? 'is-on' : ''}" id="rs-notify" type="button" role="switch" aria-checked="${on}" ${waterRule ? '' : 'disabled'}><span class="rs-toggle__knob"></span></button>
           </div>
         </div>
@@ -662,7 +798,7 @@ async function WaterScreen() {
     const save = async (patch) => {
       const next = await Storage.setHydration(patch);
       /* включённые интервальные напоминания следуют за окном и интервалом плана */
-      if (waterRule && waterRule.enabled && waterRule.repeat === 'interval') await Storage.updateNotification(waterRule.id, armPatch(waterRulePatch(next)));
+      if (waterRule && waterRule.enabled && waterRule.repeat === 'interval') { await Storage.updateNotification(waterRule.id, armPatch(waterRulePatch(next))); rulesChanged(); }
       await paint();
     };
     $('#rs-wake', sec).addEventListener('change', (e) => save({ wakeStart: e.target.value }));
@@ -675,6 +811,7 @@ async function WaterScreen() {
       await Storage.updateNotification(waterRule.id, next ? armPatch({ enabled: true, ...waterRulePatch(hyd) }) : { enabled: false });
       await Storage.setHydration({ notify: next });
       notifier.check();
+      rulesChanged();
       await paint();
       if (next) flashNotifyResult(granted, 'Напоминания включены'); else flash('Напоминания выключены');
     });
@@ -2125,11 +2262,36 @@ async function SettingsScreen() {
       <h2 class="group-label">О приложении</h2>
       <div class="list-card">
         <div class="row"><div class="row__body"><p class="row__title">Версия приложения</p></div><span class="row__trailing">${esc(APP_VERSION)}</span></div>
+        ${aboutBuildRows(await readBuildInfo())}
       </div>
     </section>
   `));
   screen.appendChild(appFooter());
   return screen;
+}
+
+/* Сборка: build-info.json (Cloudflare — commit и время сборки; в репозитории/GitHub Pages — без них) */
+async function readBuildInfo() {
+  try { const r = await fetch('build-info.json'); return r.ok ? await r.json() : null; } catch { return null; }
+}
+const ROLE_LABEL = { primary: 'основной', legacy: 'резервный (GitHub Pages)', dev: 'локальная разработка', other: 'другой адрес' };
+function aboutBuildRows(info) {
+  const row = (t, v) => `<div class="row"><div class="row__body"><p class="row__title">${t}</p></div><span class="row__trailing">${esc(v)}</span></div>`;
+  const sha = info && typeof info.sha === 'string' && /^[0-9a-f]{7,40}$/.test(info.sha) ? info.sha.slice(0, 7) : null;
+  const at = info && info.builtAt && !Number.isNaN(Date.parse(info.builtAt))
+    ? new Date(info.builtAt).toLocaleString('ru-RU', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
+  return row('Сборка', sha ? `build ${sha}${info.dirty ? '+' : ''}${at ? ` · ${at}` : ''}` : 'без номера сборки') + row('Адрес', ROLE_LABEL[deploymentRole()]);
+}
+
+/* Резервная копия на GitHub Pages: предупреждение без редиректа (данные этой копии остаются здесь) */
+function legacyNotice() {
+  const host = new URL(PRIMARY_URL).host;
+  return el(`
+    <section class="notif-status notif-status--warn" role="note" style="margin-top:12px">
+      <div class="notif-status__head"><span class="notif-status__dot"></span><span class="notif-status__title">Резервная версия LexLife</span></div>
+      <p class="notif-status__detail">Основная версия: <b>${esc(host)}</b>. Данные этой копии с ней не синхронизируются, фоновые уведомления здесь отключены.</p>
+      <div class="notif-status__actions"><a class="doc-btn" href="${esc(PRIMARY_URL)}" target="_blank" rel="noopener">Открыть основную версию</a></div>
+    </section>`);
 }
 
 /* Footer с версией (Настройки, Drawer): номер — из APP_VERSION, дата релиза — из APP_UPDATED */
@@ -2382,8 +2544,12 @@ function repeatSummary(r) {
   return `${r.time} · ежедневно`;
 }
 
-/* Локальная доставка: проверка расписания кодом страницы — только пока LexLife
-   открыт (см. js/services/notifier.js). Показ — через Service Worker. */
+/* Доставка напоминаний.
+   - Фоновая (основная, если включена): Web Push с сервера LexLife (Cloudflare Worker +
+     cron) — приходит и при закрытом приложении. js/services/pushClient.js
+   - Локальная (запасная): проверка расписания кодом страницы — только пока LexLife
+     открыт (js/services/notifier.js). Если push активен, ждёт его SERVER_FALLBACK_MS.
+   Одно срабатывание показывается один раз: общий с SW журнал occurrenceId + tag. */
 const notifyPermission = () => ('Notification' in window ? Notification.permission : 'unsupported');
 async function showSystemNotification(title, opts) {
   const reg = 'serviceWorker' in navigator ? await navigator.serviceWorker.getRegistration() : null;
@@ -2392,14 +2558,38 @@ async function showSystemNotification(title, opts) {
   new Notification(title, opts); // без Service Worker (не iOS)
   return undefined;
 }
-function showRuleNotification(r) {
+function showRuleNotification(r, fireAt, occ) {
   const t = NOTIF_TYPES[r.type] || {};
   return showSystemNotification(`${t.emoji || '🔔'} ${t.name || 'Напоминание'}`, {
-    body: r.text || '', tag: r.id, icon: 'icons/lexlife-icon-192.png', data: { route: NOTIF_ROUTES[r.type] || '#/notifications' },
+    body: r.text || '', tag: occ || r.id, icon: 'icons/lexlife-icon-192.png', data: { route: NOTIF_ROUTES[r.type] || '#/notifications', occurrenceId: occ || '' },
   });
 }
+
+const localKv = {
+  get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch { /* нет места — синхронизация повторится */ } },
+  remove: (k) => { try { localStorage.removeItem(k); } catch { /* ignore */ } },
+};
+/* SW мог ещё не зарегистрироваться (первый запуск) — не ждём бесконечно */
+async function readyRegistration(ms = 5000) {
+  if (!('serviceWorker' in navigator)) return null;
+  return Promise.race([navigator.serviceWorker.ready, new Promise((r) => setTimeout(() => r(null), ms))]);
+}
+const pushClient = createPushClient({
+  kv: localKv,
+  fetchImpl: (...a) => fetch(...a),
+  apiBase: new URL('api/', document.baseURI), // Cloudflare: /api/ · GitHub Pages: /LexLife/api/ (нет → «нет на этом адресе»)
+  getRules: () => Storage.getNotifications(),
+  timeZone: () => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+  pushManager: async () => { const reg = await readyRegistration(); return reg && 'pushManager' in reg ? reg.pushManager : null; },
+  permission: notifyPermission,
+  serverAllowed: serverPushAllowed(), // GitHub Pages (резерв): без /api, подписок и правил на сервере
+});
+const occurrences = 'caches' in window ? createOccurrenceStore({ base: document.baseURI }) : null;
+
 const notifier = createNotifier({
-  storage: Storage, show: showRuleNotification, permission: notifyPermission,
+  storage: Storage, show: showRuleNotification, permission: notifyPermission, occurrences,
+  deferMs: async () => ((await pushClient.isServerPrimary()) ? SERVER_FALLBACK_MS : 0),
   onError: (err) => console.warn('[notify] не показано:', err && (err.message || err.name)),
 });
 let notifyTimer = null;
@@ -2410,8 +2600,16 @@ function startNotifier() {
   notifier.check();
 }
 
-/* Реальное состояние: поддержка, разрешение, режим PWA, Service Worker, push-подписка */
-async function readNotifyEnv() {
+/* Правила изменились (экран уведомлений, вода, restore): отправить расписание на сервер.
+   Ошибка — честное сообщение; изменение не теряется и уйдёт при следующей синхронизации. */
+async function rulesChanged({ quiet = false } = {}) {
+  const r = await pushClient.sync();
+  if (!r.ok && !quiet) flash(SYNC_FAIL_TEXT);
+  return r;
+}
+
+/* Реальное состояние: поддержка, разрешение, режим PWA, Service Worker, push-подписка, сервер */
+async function readNotifyEnv({ server = true } = {}) {
   const ua = navigator.userAgent || '';
   const ios = /iPad|iPhone|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
   const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
@@ -2419,9 +2617,26 @@ async function readNotifyEnv() {
   try { reg = 'serviceWorker' in navigator ? await navigator.serviceWorker.getRegistration() : null; } catch { reg = null; }
   let subscribed = false;
   try { subscribed = !!(reg && reg.pushManager && await reg.pushManager.getSubscription()); } catch { subscribed = false; }
+  const st = pushClient.state();
+  const background = { backend: 'error', enabled: !!st.enabled, subscription: st.subscription || 'none', syncError: !!st.lastError, pending: await pushClient.pendingSync(), lastSyncAt: st.syncedAt || null, lastPushAt: null };
+  if (!pushClient.serverAllowed) {
+    background.backend = 'legacy';
+    background.primaryHost = new URL(PRIMARY_URL).host;
+  } else if (server) {
+    const cfg = await pushClient.config();
+    background.backend = cfg.available ? 'ok' : cfg.offline ? 'offline' : 'absent';
+    if (cfg.available && st.enabled) {
+      const r = await pushClient.status();
+      if (r.ok) {
+        background.lastPushAt = r.data.lastPushAt;
+        if (r.data.subscription !== 'active') background.subscription = 'lost';
+      } else if (r.status !== 0) background.backend = 'error';
+    }
+  }
+  if (st.enabled && !subscribed) background.subscription = 'lost';
   return {
     supported: 'Notification' in window, permission: notifyPermission(), ios, standalone,
-    swActive: !!(reg && reg.active), pushSupported: !!(reg && 'pushManager' in reg), subscribed,
+    swActive: !!(reg && reg.active), pushSupported: !!(reg && 'pushManager' in reg), subscribed, background,
   };
 }
 
@@ -2441,11 +2656,13 @@ async function NotificationsScreen() {
     screen.appendChild(wrap);
   }
 
-  /* Честный статус системы + тестовое уведомление */
+  /* Честный статус системы: локальная и фоновая доставка + проверки */
   async function statusPanel() {
     const env = await readNotifyEnv();
-    const { status, items, limit } = describeNotifyState(env);
-    const canTest = env.supported && env.permission === 'granted';
+    const { status, items, limit, active } = describeNotifyState(env);
+    const bg = env.background;
+    const canLocal = env.supported && env.permission === 'granted';
+    const canEnable = canLocal && env.swActive && env.pushSupported && bg.backend === 'ok';
     const p = el(`
       <section class="notif-status notif-status--${status.level}">
         <div class="notif-status__head"><span class="notif-status__dot"></span><span class="notif-status__title">${esc(status.title)}</span></div>
@@ -2453,29 +2670,59 @@ async function NotificationsScreen() {
         ${status.ask ? '<button class="notif-perm__btn notif-status__ask" type="button">Разрешить</button>' : ''}
         <dl class="notif-status__facts">${items.map((i) => `<dt>${esc(i.label)}</dt><dd>${esc(i.value)}</dd>`).join('')}</dl>
         <p class="notif-status__limit">${esc(limit)}</p>
-        ${canTest ? `<div class="notif-status__actions">
-          <button class="doc-btn" type="button" data-test="0">Отправить тестовое уведомление</button>
-          <button class="doc-btn" type="button" data-test="10">Через 10 с</button>
+        <div class="notif-status__actions">
+          ${canLocal ? '<button class="doc-btn" type="button" data-act="local">Проверить локальное уведомление</button>' : ''}
+          ${bg.enabled && bg.backend === 'ok' ? `<button class="doc-btn" type="button" data-act="push" ${active || bg.subscription === 'active' ? '' : 'disabled'}>Проверить фоновый push</button>` : ''}
+          ${canEnable && (!bg.enabled || bg.subscription !== 'active') ? '<button class="doc-btn" type="button" data-act="enable">Включить фоновые уведомления</button>' : ''}
+          ${bg.enabled && bg.syncError ? '<button class="doc-btn" type="button" data-act="sync">Синхронизировать снова</button>' : ''}
+          ${bg.enabled ? '<button class="doc-btn" type="button" data-act="disable">Отключить фоновые уведомления</button>' : ''}
         </div>
-        <p class="notif-status__result" aria-live="polite"></p>` : ''}
+        <p class="notif-status__result" aria-live="polite"></p>
       </section>
     `);
     const ask = $('.notif-status__ask', p);
     if (ask) ask.addEventListener('click', async () => { await ensureNotifyPermission(); startNotifier(); await paint(); });
     const result = $('.notif-status__result', p);
-    $$('[data-test]', p).forEach((b) => b.addEventListener('click', () => {
-      const delay = Number(b.dataset.test);
-      const send = async () => {
-        try {
-          await showSystemNotification('🔔 LexLife · тест', { body: 'Тестовое уведомление LexLife доставлено.', tag: 'lexlife-test', icon: 'icons/lexlife-icon-192.png', data: { route: '#/notifications' } });
-          if (result.isConnected) result.textContent = `Передано системе в ${new Date().toTimeString().slice(0, 5)}. Нет баннера — проверьте Настройки → Уведомления → LexLife.`;
-        } catch (err) {
-          if (result.isConnected) result.textContent = `Ошибка: ${err && (err.message || err.name) || 'неизвестно'}`;
-        }
-      };
-      if (!delay) { send(); return; }
-      result.textContent = `Через ${delay} с… Не сворачивайте LexLife: в фоне iPhone остановит таймер.`;
-      setTimeout(send, delay * 1000);
+    const say = (t) => { if (result.isConnected) result.textContent = t; };
+    const hhmm = () => new Date().toTimeString().slice(0, 5);
+    const ENABLE_ERR = {
+      permission: 'Нет разрешения на уведомления.', offline: 'Нет сети — попробуйте позже.',
+      backend_unavailable: 'Сервер уведомлений недоступен по этому адресу.', legacy: 'Это резервная версия: фоновые уведомления — только в основной.', push_unsupported: 'Push не поддерживается: откройте LexLife с экрана «Домой».',
+      register_failed: 'Сервер не зарегистрировал устройство.', subscribe_failed: 'iPhone не выдал push-подписку.',
+      server: 'Сервер не принял подписку.', sync_failed: SYNC_FAIL_TEXT,
+    };
+    const actions = {
+      local: async () => {
+        await showSystemNotification('🔔 LexLife · тест', { body: 'Тестовое уведомление LexLife доставлено.', tag: 'lexlife-test', icon: 'icons/lexlife-icon-192.png', data: { route: '#/notifications' } });
+        say(`Передано системе в ${hhmm()} (локально, без сервера). Нет баннера — проверьте Настройки → Уведомления → LexLife.`);
+      },
+      push: async () => {
+        say('Отправка через сервер LexLife…');
+        const r = await pushClient.testPush();
+        if (r.ok) say(`Сервер отправил push в ${hhmm()}. Он придёт и при свёрнутом приложении — можно заблокировать экран.`);
+        else if (r.status === 429) say(`Слишком часто: повторите через ${r.data.retryAfter || 20} с.`);
+        else if (r.status === 0) say('Нет сети — сервер недоступен.');
+        else if (r.status === 409) say('Push-подписка не найдена на сервере. Включите фоновые уведомления заново.');
+        else say(`Сервер не смог отправить push (${r.data.error || r.status}).`);
+      },
+      enable: async () => {
+        say('Подключение фоновых уведомлений…');
+        const r = await pushClient.enable();
+        await paint();
+        flash(r.ok ? 'Фоновые уведомления включены ✓' : ENABLE_ERR[r.error] || 'Не удалось включить');
+      },
+      sync: async () => { const r = await rulesChanged(); await paint(); if (r.ok) flash('Синхронизировано ✓'); },
+      disable: async () => {
+        if (!confirm('Отключить фоновые уведомления? Подписка и расписание будут удалены с сервера. Напоминания останутся только пока LexLife открыт.')) return;
+        const r = await pushClient.disable();
+        await paint();
+        flash(r.ok ? 'Фоновые уведомления отключены' : 'Отключено на устройстве; сервер будет уведомлён при появлении сети');
+      },
+    };
+    $$('[data-act]', p).forEach((b) => b.addEventListener('click', async () => {
+      $$('[data-act]', p).forEach((x) => { x.disabled = true; });
+      try { await actions[b.dataset.act](); } catch (err) { say(`Ошибка: ${err && (err.message || err.name) || 'неизвестно'}`); }
+      $$('[data-act]', p).forEach((x) => { if (x.isConnected) x.disabled = false; });
     }));
     return p;
   }
@@ -2503,6 +2750,7 @@ async function NotificationsScreen() {
       const granted = on ? await ensureNotifyPermission() : false;
       await Storage.updateNotification(r.id, on ? armPatch({ enabled: true }) : { enabled: false });
       startNotifier();
+      rulesChanged();
       await paint();
       if (on) flashNotifyResult(granted, 'Включено');
     });
@@ -2550,6 +2798,7 @@ async function NotificationsScreen() {
       else if (rep === 'once') { patch.date = $('#e-date', wrap).value; patch.time = $('#e-time', wrap).value; }
       else { patch.time = $('#e-time', wrap).value; if (rep === 'weekly') patch.days = $$('.wd-chip.is-on', wrap).map((c) => Number(c.dataset.d)); }
       await Storage.updateNotification(r.id, armPatch(patch)); editing = null; startNotifier(); await paint(); flash('Сохранено ✓');
+      rulesChanged();
     });
     wrap.appendChild(save);
     return wrap;
@@ -3293,12 +3542,54 @@ function flash(text) {
   let n = $('#flash');
   if (!n) {
     n = el('<div id="flash"></div>');
-    Object.assign(n.style, { position: 'fixed', left: '50%', bottom: 'calc(var(--tab-h) + 20px)', transform: 'translateX(-50%)', background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--text)', padding: '10px 18px', borderRadius: '999px', fontSize: '14px', fontWeight: '700', zIndex: '400', boxShadow: '0 8px 24px rgba(0,0,0,0.5)', transition: 'opacity .2s', pointerEvents: 'none' });
+    Object.assign(n.style, { position: 'fixed', left: '50%', bottom: 'calc(var(--tab-bottom) + var(--tab-h) + 12px)', transform: 'translateX(-50%)', background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--text)', padding: '10px 18px', borderRadius: '999px', fontSize: '14px', fontWeight: '700', zIndex: '400', boxShadow: '0 8px 24px rgba(0,0,0,0.5)', transition: 'opacity .2s', pointerEvents: 'none' });
     document.body.appendChild(n);
   }
   n.textContent = text; n.style.opacity = '1';
   clearTimeout(flashTimer);
   flashTimer = setTimeout(() => (n.style.opacity = '0'), 1600);
+}
+
+/* =========================================================
+   Перенос на новый адрес (GitHub Pages → Cloudflare).
+   localStorage и IndexedDB привязаны к origin: на новом адресе данных
+   старой копии НЕТ, и сами они туда не попадут. На iPhone у приложения
+   с экрана «Домой» ещё и своё хранилище, отдельное от Safari, — поэтому
+   «мост» через окно/iframe не увидит данные. Единственный надёжный путь:
+   полная копия (ZIP с документами) внутри старого приложения → файл в «Файлах»
+   → «Восстановить из копии» внутри нового установленного приложения.
+   Данные не проходят через сервер.
+   ========================================================= */
+async function MoveScreen() {
+  const screen = el('<div></div>');
+  const mode = migrationMode();
+  screen.appendChild(backHeader(mode === 'export' ? 'Перенос LexLife' : mode === 'import' ? 'Перенос из старой версии' : 'Перенос', { label: 'Назад', onBack: goBack }));
+  if (!mode) { screen.appendChild(el('<div class="empty">Перенос сейчас не требуется</div>')); return screen; }
+  const url = esc(NEW_HOME_URL);
+  const steps = mode === 'export' ? [
+    'Здесь, в старом приложении: <a href="#/export" style="color:var(--blue)">Резервная копия</a> → <b>«Полная резервная копия с документами»</b> → сохраните ZIP в «Файлы» (iCloud Drive или «На iPhone»).',
+    `Откройте в Safari новый адрес: <b>${url}</b> → Поделиться → <b>«На экран „Домой“»</b>.`,
+    'Запустите <b>новый</b> LexLife с экрана «Домой» (не во вкладке Safari — у неё отдельное хранилище) → Меню → Резервная копия → <b>«Восстановить из копии»</b> → выберите ZIP.',
+    'Проверьте в новом приложении показатели, анализы с документами и воду. Затем включите там фоновые уведомления (Меню → Уведомления).',
+    'Старое приложение пока не удаляйте: оно продолжит работать как раньше, пока вы не убедитесь, что всё перенесено.',
+  ] : [
+    'В <b>старом</b> LexLife (иконка, открывающая adar4026.github.io): Меню → Резервная копия → <b>«Полная резервная копия с документами»</b> → сохраните ZIP в «Файлы».',
+    'Здесь, в новом приложении, открытом с экрана «Домой»: Меню → <a href="#/export" style="color:var(--blue)">Резервная копия</a> → <b>«Восстановить из копии»</b> → выберите этот ZIP.',
+    'Проверьте данные, затем включите фоновые уведомления: Меню → Уведомления.',
+  ];
+  screen.appendChild(el(`
+    <div class="input-card">
+      <p class="backup-note"><b>Данные не переносятся автоматически.</b> Старый и новый адрес — разные сайты: каждый видит только своё хранилище на этом iPhone. Перенос — через файл полной резервной копии, который остаётся у вас; на сервер данные не отправляются.</p>
+    </div>
+  `));
+  const list = el('<div class="input-card"><ol class="move-steps" style="margin:0; padding-left:20px; display:grid; gap:10px"></ol></div>');
+  steps.forEach((t) => $('.move-steps', list).appendChild(el(`<li class="backup-note" style="margin:0">${t}</li>`)));
+  screen.appendChild(list);
+  if (mode === 'export') {
+    const open = el(`<a class="btn-primary" style="display:block; text-align:center; text-decoration:none; margin-top:12px" href="${url}" target="_blank" rel="noopener">Открыть новый адрес</a>`);
+    screen.appendChild(open);
+  }
+  return screen;
 }
 
 /* =========================================================
@@ -3338,7 +3629,12 @@ async function buildDrawer() {
   drawer.appendChild(head);
   const scroller = el('<div class="drawer-scroll"></div>');
   drawer.appendChild(scroller);
-  DRAWER_SECTIONS.forEach((items) => {
+  const mode = migrationMode();
+  /* Пункт переноса — только в резервной копии; на основном адресе перенос уже выполнен (#/move остаётся доступен) */
+  const sections = mode === 'export'
+    ? [[{ route: 'move', icon: '🚚', title: 'Перенести LexLife на новый адрес' }], ...DRAWER_SECTIONS]
+    : DRAWER_SECTIONS;
+  sections.forEach((items) => {
     const sec = el('<div class="drawer-sec"></div>');
     items.forEach((it) => {
       sec.appendChild(el(`
@@ -3408,6 +3704,7 @@ const SCREENS = {
   notifications: NotificationsScreen, goals: () => Stub('🎯', 'Цели'),
   calendar: CalendarScreen, stats: StatsScreen,
   security: () => Stub('🔒', 'Безопасность'),
+  move: MoveScreen,
 };
 
 function resolve() {
@@ -3462,7 +3759,7 @@ async function render() {
   currentRoute = route;
   const token = ++renderToken;
   closeDrawer();
-  $$('.tab').forEach((t) => t.classList.toggle('is-active', t.dataset.route === tab));
+  setActiveTab($('#tab-bar'), tab);
   $('#menu-btn').classList.toggle('hidden', !main);
   const node = await fn();
   if (token !== renderToken) return;
@@ -3477,7 +3774,6 @@ async function render() {
 }
 
 function initChrome() {
-  $('#tab-bar').addEventListener('click', (e) => { const tab = e.target.closest('.tab'); if (tab) location.hash = `#/${tab.dataset.route}`; });
   $('#menu-btn').addEventListener('click', openDrawer);
   $('#scrim').addEventListener('click', closeDrawer);
   /* затемнение не пропускает жест прокрутки на страницу (тап по-прежнему закрывает) */
@@ -3503,11 +3799,15 @@ async function boot() {
   window.addEventListener('hashchange', render);
   window.addEventListener('scroll', () => { clearTimeout(scrollSaveTimer); scrollSaveTimer = setTimeout(saveScrollState, 250); }, { passive: true });
   document.addEventListener('click', saveScrollState, true); // до перехода по ссылке/кнопке
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) { render(); notifier.check(); } });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { render(); notifier.check(); rulesChanged({ quiet: true }); } });
+  window.addEventListener('online', () => { rulesChanged({ quiet: true }); });
   window.addEventListener('pageshow', (e) => { if (e.persisted) notifier.check(); });
   await render();
   registerSW();
   startNotifier();
+  /* фоновые уведомления: подписка на месте? неотправленные изменения правил (offline, restore) */
+  pushClient.checkSubscription().then(() => rulesChanged({ quiet: true })).catch(() => {});
+  if (occurrences) occurrences.prune().catch(() => {});
   /* «висячие» документы (анализ удалён/заменён при восстановлении) — фоном, безопасно */
   if (IdbAttachmentStore.available()) Attachments.cleanupOrphans().catch((err) => console.warn('[attachments] очистка пропущена', err && err.name));
 }

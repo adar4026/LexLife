@@ -1,0 +1,50 @@
+/* LexLife — Cloudflare Workers + Static Assets + D1 + Cron.
+   Секретов здесь нет: VAPID_PRIVATE_KEY и VAPID_SUBJECT задаются через
+   `wrangler secret put` (production) или .dev.vars (локально). */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "lexlife",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-09-30",
+  "workers_dev": true,
+  /* Preview-адреса версий отключены: они работали бы с той же production D1 */
+  "preview_urls": false,
+
+  /* PWA из dist/ (npm run build: allowlist файлов приложения).
+     run_worker_first — Worker видит каждый запрос: /api/*, /index.html без редиректа,
+     security headers. */
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+
+  /* D1: только инфраструктура уведомлений (devices, push_subscriptions,
+     notification_rules, notification_deliveries). database_id появится
+     после `wrangler d1 create lexlife` — production-шаг, требует подтверждения. */
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "lexlife",
+      "database_id": "c8eaba54-3002-484a-924d-e0ef5a896012",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  /* Один cron на все уведомления — раз в минуту */
+  "triggers": { "crons": ["* * * * *"] },
+
+  /* Ограничение регистрации устройств: 20 в минуту с одного IP */
+  "ratelimits": [
+    { "name": "RATE_LIMITER", "namespace_id": "4026", "simple": { "limit": 20, "period": 60 } }
+  ],
+
+  /* Публичные значения. VAPID_PUBLIC_KEY production-пары подставляется при её создании
+     (локально его переопределяет .dev.vars). */
+  "vars": {
+    "VAPID_PUBLIC_KEY": "BLy1I-G7yb3M-h5FQNIJDwiFzgmp1tBIC_HGC3xk8KfOHiG4K03bQxSWlvoMqp0yo9y0gF69kAMyatmCPilJ28I",
+    "PUSH_TEST_INTERVAL_SEC": "20"
+  },
+
+  "observability": { "enabled": true }
+}

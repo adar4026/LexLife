@@ -16,7 +16,9 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { nextFire, prevFire, dueFire, NOTIF_GRACE_MS } from '../js/services/notifySchedule.js';
-import { createNotifier, armPatch, waterRulePatch, describeNotifyState, isSafeRoute } from '../js/services/notifier.js';
+import { createNotifier, armPatch, waterRulePatch, describeNotifyState, isSafeRoute, backgroundActive } from '../js/services/notifier.js';
+import { nextFireUtc, prevFireUtc, zonedToUtc, wallLabel, localWallLabel, occurrenceId } from '../js/services/zonedSchedule.js';
+import { createFakeCaches, loadServiceWorker } from './helpers/fakeBrowser.mjs';
 import { StorageService, MemoryDriver, parseBackup } from '../js/services/storage.js';
 
 const ZONES = ['Europe/Madrid', 'UTC', 'America/New_York', 'Asia/Tokyo'];
@@ -229,10 +231,60 @@ test('статус: Safari-вкладка на iPhone, запрет, нет ра
   assert.equal(describeNotifyState({ ...base, swActive: false }).status.level, 'warn');
   const ok = describeNotifyState(base);
   assert.equal(ok.status.title, 'Уведомления разрешены');
-  assert.ok(ok.items.some((i) => i.label === 'Доставка' && /только пока LexLife открыт/.test(i.value)));
-  assert.ok(ok.items.some((i) => i.label === 'Push-сервер' && i.value === 'не подключён'));
+  assert.ok(ok.items.some((i) => i.label === 'Фоновая доставка' && i.value === 'неактивна'));
+  assert.ok(ok.items.some((i) => i.label === 'Push-подписка' && i.value === 'отсутствует'));
+  assert.ok(ok.items.some((i) => i.label === 'Системное разрешение' && i.value === 'разрешено'));
+  assert.match(ok.limit, /пока LexLife открыт|останавливает его код/);
   const all = JSON.stringify(describeNotifyState(base));
   assert.ok(!/работают/.test(all), 'нет обещания «уведомления работают»');
+});
+
+test('статус фоновой доставки: активна только при сервере + подписке + синхронизированных правилах', () => {
+  const base = { supported: true, permission: 'granted', ios: true, standalone: true, swActive: true, pushSupported: true, subscribed: true };
+  const bg = { backend: 'ok', enabled: true, subscription: 'active', syncError: false, pending: false, lastSyncAt: '2031-03-10T08:00:00.000Z', lastPushAt: '2031-03-10T09:00:00.000Z' };
+  const on = describeNotifyState({ ...base, background: bg });
+  assert.equal(on.active, true); assert.equal(on.status.title, 'Фоновые уведомления активны');
+  const facts = Object.fromEntries(on.items.map((i) => [i.label, i.value]));
+  assert.equal(facts['Сервер уведомлений'], 'доступен'); assert.equal(facts['Фоновая доставка'], 'активна');
+  assert.notEqual(facts['Последняя синхронизация'], '—'); assert.notEqual(facts['Последний серверный push'], '—');
+  const err = describeNotifyState({ ...base, background: { ...bg, syncError: true } });
+  assert.equal(err.active, false); assert.equal(err.status.title, 'Не удалось синхронизировать фоновые уведомления');
+  assert.equal(describeNotifyState({ ...base, background: { ...bg, pending: true } }).active, false, 'неотправленные изменения — не «активна»');
+  assert.equal(describeNotifyState({ ...base, background: { ...bg, subscription: 'lost' } }).status.title, 'Push-подписка потеряна');
+  const pages = describeNotifyState({ ...base, subscribed: false, background: { ...bg, backend: 'absent', enabled: false, subscription: 'none' } });
+  assert.equal(pages.active, false);
+  assert.equal(Object.fromEntries(pages.items.map((i) => [i.label, i.value]))['Сервер уведомлений'], 'нет на этом адресе');
+  assert.match(pages.limit, /По этому адресу фоновые уведомления не работают/);
+  assert.equal(backgroundActive(null), false);
+});
+
+/* ---------- сервер = локальное расписание (одинаковые occurrence в любой timezone) ---------- */
+test('zonedSchedule совпадает с локальным планировщиком: год × 7 правил (DST, полночь, окна, разовые)', () => {
+  const rules = [rule({ time: '02:30' }), rule({ time: '00:05' }), rule({ repeat: 'interval', intervalMinutes: 90, startTime: '22:00', endTime: '02:00' }),
+    rule({ repeat: 'interval', intervalMinutes: 60, startTime: '01:00', endTime: '04:00' }), rule({ repeat: 'weekly', days: [0, 3], time: '02:15' }),
+    rule({ repeat: 'weekdays', time: '23:59' }), rule({ repeat: 'once', date: '2031-03-30', time: '02:30' })];
+  let n = 0;
+  for (let t = Date.UTC(2031, 0, 1); t < Date.UTC(2032, 0, 3); t += 151 * 60000) {
+    for (const r of rules) {
+      const a = nextFire(r, new Date(t)); const b = nextFireUtc(r, t, TZ);
+      const c = prevFire(r, new Date(t)); const d = prevFireUtc(r, t, TZ);
+      assert.equal(b, a ? a.getTime() : null, `next ${JSON.stringify(r)} @ ${new Date(t).toISOString()}`);
+      assert.equal(d, c ? c.getTime() : null, `prev ${JSON.stringify(r)} @ ${new Date(t).toISOString()}`);
+      if (a) assert.equal(wallLabel(b, TZ), localWallLabel(a), 'одинаковая локальная метка → одинаковый occurrenceId');
+      n++;
+    }
+  }
+  assert.ok(n > 20000);
+});
+
+test('Europe/Madrid: zonedToUtc на переходах DST', () => {
+  const Z = 'Europe/Madrid';
+  assert.equal(new Date(zonedToUtc(2031, 3, 30, 2, 30, Z)).toISOString(), '2031-03-30T01:30:00.000Z', 'весной 02:30 нет → 03:30 CEST');
+  assert.equal(new Date(zonedToUtc(2031, 3, 30, 3, 0, Z)).toISOString(), '2031-03-30T01:00:00.000Z');
+  assert.equal(new Date(zonedToUtc(2031, 10, 26, 2, 30, Z)).toISOString(), '2031-10-26T00:30:00.000Z', 'осенью 02:30 дважды → первое');
+  assert.equal(new Date(zonedToUtc(2031, 10, 26, 3, 0, Z)).toISOString(), '2031-10-26T02:00:00.000Z');
+  assert.equal(new Date(zonedToUtc(2031, 12, 31, 24, 30, Z)).toISOString(), '2031-12-31T23:30:00.000Z', 'переполнение минут → следующий день/год');
+  assert.equal(occurrenceId('abc', '2031-03-30T03:30'), 'abc@2031-03-30T03:30');
 });
 
 test('isSafeRoute: только внутренние маршруты', () => {
@@ -241,26 +293,14 @@ test('isSafeRoute: только внутренние маршруты', () => {
 });
 
 /* ---------- sw.js: push и notificationclick ---------- */
-function loadSw() {
-  const listeners = {}; const shown = []; const opened = []; const posted = [];
-  const clients = [];
-  const self = {
-    addEventListener: (t, fn) => { listeners[t] = fn; },
-    registration: { showNotification: async (title, opts) => { shown.push({ title, opts }); } },
-    clients: { matchAll: async () => clients, openWindow: async (u) => { opened.push(u); }, claim: async () => {} },
-    skipWaiting: () => {}, location: { origin: 'https://example.test' },
-  };
-  vm.runInNewContext(readFileSync(new URL('../sw.js', import.meta.url), 'utf8'), { self, caches: {}, fetch: () => {}, URL, Request: class {} });
-  const fire = async (type, ev) => { const waits = []; listeners[type]({ ...ev, waitUntil: (p) => waits.push(p) }); await Promise.all(waits); };
-  return { listeners, shown, opened, posted, clients, fire };
-}
+const loadSw = () => loadServiceWorker({ scope: 'https://example.test/LexLife/' });
 
 test('sw.js: CACHE_VERSION поднят, новые модули в APP_SHELL, старые кэши удаляются, данные не трогаются', () => {
   const src = readFileSync(new URL('../sw.js', import.meta.url), 'utf8');
-  assert.match(src, /const CACHE_VERSION = 'lexlife-v35';/);
-  assert.match(src, /'\.\/js\/services\/notifySchedule\.js'/);
-  assert.match(src, /'\.\/js\/services\/notifier\.js'/);
-  assert.match(src, /k !== CACHE_VERSION && k !== FONT_CACHE/);
+  assert.match(src, /const CACHE_VERSION = 'lexlife-v39';/);
+  for (const m of ['notifySchedule', 'notifier', 'zonedSchedule', 'pushClient', 'occurrenceStore', 'deployment']) assert.match(src, new RegExp(`'\\./js/services/${m}\\.js'`), m);
+  assert.match(src, /k !== CACHE_VERSION && k !== FONT_CACHE && k !== OCC_CACHE/);
+  assert.match(src, /startsWith\(new URL\(self\.registration\.scope\)\.pathname \+ 'api\/'\)/, 'API не кэшируется SW');
   assert.ok(!/localStorage|indexedDB/.test(src), 'SW не трогает пользовательские данные');
 });
 
@@ -276,6 +316,38 @@ test('sw.js push: всегда показывает уведомление; ма
   assert.equal(s.shown[1].opts.body, 'plain');
   assert.equal(s.shown[2].title, 'LexLife');
   assert.equal(s.shown[3].opts.data.route, '#/notifications');
+});
+
+test('sw.js push (сервер LexLife): tag = occurrenceId, target → route, журнал occurrence в Cache API, badge/icon; повтор — тот же tag', async () => {
+  const caches = createFakeCaches();
+  const s = loadServiceWorker({ caches, scope: 'https://example.test/LexLife/' });
+  const payload = { v: 1, occurrenceId: 'r1@2031-03-10T09:00', type: 'water', title: 'LexLife', body: 'Пора выпить воду', target: '#/metric/water', scheduledAt: '2031-03-10T08:00:00.000Z' };
+  await s.pushJson(payload);
+  await s.pushJson(payload); // retry сервера / повторная доставка
+  assert.equal(s.shown.length, 2, 'каждый push показывает уведомление (iOS)');
+  assert.equal(s.shown[0].opts.tag, 'r1@2031-03-10T09:00'); assert.equal(s.shown[1].opts.tag, s.shown[0].opts.tag, 'тот же tag → замена, а не второе');
+  assert.equal(s.shown[0].opts.data.route, '#/metric/water'); assert.equal(s.shown[0].opts.data.occurrenceId, payload.occurrenceId);
+  assert.ok(s.shown[0].opts.icon && s.shown[0].opts.badge);
+  const occ = (await caches.open('lexlife-occ-v1'));
+  assert.ok(await occ.match('https://example.test/LexLife/__occ/r1%402031-03-10T09%3A00'), 'журнал в scope приложения (base path /LexLife/)');
+  await s.pushJson({ occurrenceId: 'x'.repeat(500), body: 'y'.repeat(1000), target: 'javascript:alert(1)' });
+  assert.equal(s.shown[2].opts.tag, 'lexlife-push'); assert.equal(s.shown[2].opts.body.length, 200); assert.equal(s.shown[2].opts.data.route, '#/notifications');
+});
+
+test('createNotifier: срабатывание, уже показанное push\'ем, локально не показывается; при активном push — ожидание, затем один запасной показ', async () => {
+  const storage = await memStorage([rule({ id: 'a', time: '09:00' }), rule({ id: 'b', time: '09:00' })]);
+  const seen = new Set(['a@' + localWallLabel(L(2031, 3, 10, 9, 0))]);
+  const occurrences = { has: async (id) => seen.has(id), mark: async (id) => { seen.add(id); } };
+  const shown = [];
+  let t = L(2031, 3, 10, 9, 1);
+  const n = createNotifier({ storage, show: async (r, at, id) => { shown.push(id); }, permission: () => 'granted', now: () => t, occurrences, deferMs: async () => 120000 });
+  await n.check();
+  assert.deepEqual(shown, [], 'a уже пришло push\'ем; b ждёт push 2 мин');
+  assert.ok((await storage.getNotifications()).find((r) => r.id === 'a').lastFiredAt, 'a помечено как сработавшее');
+  t = L(2031, 3, 10, 9, 2, 1);
+  await Promise.all([n.check(), n.check()]); await n.check();
+  assert.deepEqual(shown, ['b@' + localWallLabel(L(2031, 3, 10, 9, 0))]);
+  assert.ok(seen.has(shown[0]), 'запасной показ записан в журнал (SW не покажет push как новое)');
 });
 
 test('sw.js notificationclick: фокус открытого окна + маршрут; иначе — открыть ./#/route', async () => {

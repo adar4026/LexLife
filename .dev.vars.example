@@ -1,0 +1,9 @@
+# Пример переменных для локального `wrangler dev`. Реальные значения — только в .dev.vars
+# (он в .gitignore) или `npm run vapid:dev`, который создаст .dev.vars с локальной парой.
+# В production: VAPID_PRIVATE_KEY и VAPID_SUBJECT — Cloudflare secrets
+# (`wrangler secret put …`), VAPID_PUBLIC_KEY — vars в wrangler.jsonc (он публичный).
+VAPID_PUBLIC_KEY=
+VAPID_PRIVATE_KEY=
+VAPID_SUBJECT=mailto:you@example.com
+# Только локально: разрешить push на http://127.0.0.1 (мок push-сервиса в тестах). НЕ задавать в production.
+DEV_ALLOW_LOCAL_PUSH=

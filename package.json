@@ -1,0 +1,21 @@
+{
+  "name": "lexlife",
+  "private": true,
+  "type": "module",
+  "description": "LexLife PWA + Cloudflare Worker (static assets, Web Push API, cron)",
+  "scripts": {
+    "build": "node scripts/build-assets.mjs",
+    "dev": "npm run build && wrangler dev --port 8787",
+    "test": "node tests/run-all.mjs",
+    "vapid:dev": "node scripts/gen-vapid.mjs --dev-vars",
+    "deploy": "npm run build && wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply lexlife --local",
+    "db:migrate:remote": "wrangler d1 migrations apply lexlife --remote"
+  },
+  "devDependencies": {
+    "wrangler": "4.147.0"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
