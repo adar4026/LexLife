@@ -6,8 +6,10 @@
    Меняйте CACHE_VERSION при обновлении ассетов.
    ========================================================= */
 
-const CACHE_VERSION = 'lexlife-v34';
+const CACHE_VERSION = 'lexlife-v35';
 const FONT_CACHE = 'lexlife-fonts-v1';
+/* Журнал показанных срабатываний (push/локально) — общий со страницей (js/services/occurrenceStore.js) */
+const OCC_CACHE = 'lexlife-occ-v1';
 
 const APP_SHELL = [
   './',
@@ -24,6 +26,10 @@ const APP_SHELL = [
   './js/services/testsJournal.js',
   './js/services/notifySchedule.js',
   './js/services/notifier.js',
+  './js/services/zonedSchedule.js',
+  './js/services/pushClient.js',
+  './js/services/occurrenceStore.js',
+  './js/services/deployment.js',
   './js/ui/charts.js',
   './js/ui/docViewer.js',
   './js/vendor/pdfjs/pdf.min.js',
@@ -49,7 +55,7 @@ self.addEventListener('activate', (event) => {
       .then((keys) =>
         Promise.all(
           keys
-            .filter((k) => k !== CACHE_VERSION && k !== FONT_CACHE)
+            .filter((k) => k !== CACHE_VERSION && k !== FONT_CACHE && k !== OCC_CACHE)
             .map((k) => caches.delete(k))
         )
       )
@@ -57,27 +63,40 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-/* Web Push (задел): сервера-отправителя пока нет и подписка не создаётся, поэтому
-   сейчас это событие не приходит. Каждый push обязан показать уведомление (iOS). */
+/* Маршрут внутри приложения (никаких внешних URL из payload) */
+const safeRoute = (r) => (typeof r === 'string' && r.length <= 80 && /^#\/[\w\-/]*$/.test(r) ? r : '');
+const occKey = (id) => new URL(`__occ/${encodeURIComponent(id)}`, self.registration.scope).href;
+
+/* Web Push с сервера LexLife (Cloudflare Worker, cron раз в минуту).
+   payload: { occurrenceId, type, title, body, target, scheduledAt }.
+   Каждый push обязан показать уведомление (требование iOS). tag = occurrenceId:
+   повтор той же occurrence (retry сервера, локальный показ) заменяет
+   уведомление, а не добавляет второе. */
 self.addEventListener('push', (event) => {
   let p = {};
   try { p = event.data ? event.data.json() : {}; } catch (e) { p = { body: event.data ? event.data.text() : '' }; }
-  const route = typeof p.route === 'string' && /^#\/[\w\-/]*$/.test(p.route) ? p.route : '#/notifications';
-  event.waitUntil(
-    self.registration.showNotification(String(p.title || 'LexLife'), {
-      body: String(p.body || 'Напоминание'),
-      tag: String(p.tag || 'lexlife-push'),
+  if (!p || typeof p !== 'object') p = {};
+  const occ = typeof p.occurrenceId === 'string' && p.occurrenceId.length <= 120 ? p.occurrenceId : '';
+  const route = safeRoute(p.target) || safeRoute(p.route) || '#/notifications';
+  event.waitUntil((async () => {
+    if (occ) {
+      try { await (await caches.open(OCC_CACHE)).put(occKey(occ), new Response(JSON.stringify({ via: 'push', at: Date.now() }))); } catch (e) { /* журнал не критичен */ }
+    }
+    await self.registration.showNotification(String(p.title || 'LexLife').slice(0, 80), {
+      body: String(p.body || 'Напоминание').slice(0, 200),
+      tag: occ || String(p.tag || 'lexlife-push'),
       icon: 'icons/lexlife-icon-192.png',
-      data: { route },
-    })
-  );
+      badge: 'icons/lexlife-icon-192.png',
+      data: { route, occurrenceId: occ, type: typeof p.type === 'string' ? p.type.slice(0, 20) : '' },
+    });
+  })());
 });
 
 /* Клик по уведомлению — открыть приложение на нужном экране */
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   const d = event.notification.data || {};
-  const route = typeof d.route === 'string' && /^#\/[\w\-/]*$/.test(d.route) ? d.route : '';
+  const route = safeRoute(d.route);
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((cs) => {
       for (const c of cs) {
@@ -116,8 +135,9 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  /* Только свой origin */
+  /* Только свой origin; API сервера уведомлений — всегда сеть, без кэша */
   if (url.origin !== self.location.origin) return;
+  if (url.pathname.startsWith(new URL(self.registration.scope).pathname + 'api/')) return;
 
   event.respondWith(
     caches.match(request).then((cached) => {
