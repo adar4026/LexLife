@@ -15,6 +15,7 @@ import { createFullBackup, prepareFullRestore, applyFullRestore, isZipFile, coun
 import { parsePreparedTest, importPreparedTest, PreparedImportError } from './services/preparedImport.js';
 import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
 import { openDocViewer as showDocViewer } from './ui/docViewer.js';
+import { setActiveTab } from './ui/bottomNav.js';
 import { nextFire } from './services/notifySchedule.js';
 import { createNotifier, describeNotifyState, armPatch, waterRulePatch, NOTIF_ROUTES, isSafeRoute } from './services/notifier.js';
 import { createPushClient, SYNC_FAIL_TEXT, SERVER_FALLBACK_MS } from './services/pushClient.js';
@@ -3410,7 +3411,7 @@ function flash(text) {
   let n = $('#flash');
   if (!n) {
     n = el('<div id="flash"></div>');
-    Object.assign(n.style, { position: 'fixed', left: '50%', bottom: 'calc(var(--tab-h) + 20px)', transform: 'translateX(-50%)', background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--text)', padding: '10px 18px', borderRadius: '999px', fontSize: '14px', fontWeight: '700', zIndex: '400', boxShadow: '0 8px 24px rgba(0,0,0,0.5)', transition: 'opacity .2s', pointerEvents: 'none' });
+    Object.assign(n.style, { position: 'fixed', left: '50%', bottom: 'calc(var(--tab-bottom) + var(--tab-h) + 12px)', transform: 'translateX(-50%)', background: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--text)', padding: '10px 18px', borderRadius: '999px', fontSize: '14px', fontWeight: '700', zIndex: '400', boxShadow: '0 8px 24px rgba(0,0,0,0.5)', transition: 'opacity .2s', pointerEvents: 'none' });
     document.body.appendChild(n);
   }
   n.textContent = text; n.style.opacity = '1';
@@ -3627,7 +3628,7 @@ async function render() {
   currentRoute = route;
   const token = ++renderToken;
   closeDrawer();
-  $$('.tab').forEach((t) => t.classList.toggle('is-active', t.dataset.route === tab));
+  setActiveTab($('#tab-bar'), tab);
   $('#menu-btn').classList.toggle('hidden', !main);
   const node = await fn();
   if (token !== renderToken) return;
@@ -3642,7 +3643,6 @@ async function render() {
 }
 
 function initChrome() {
-  $('#tab-bar').addEventListener('click', (e) => { const tab = e.target.closest('.tab'); if (tab) location.hash = `#/${tab.dataset.route}`; });
   $('#menu-btn').addEventListener('click', openDrawer);
   $('#scrim').addEventListener('click', closeDrawer);
   /* затемнение не пропускает жест прокрутки на страницу (тап по-прежнему закрывает) */
