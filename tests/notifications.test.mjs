@@ -257,7 +257,7 @@ function loadSw() {
 
 test('sw.js: CACHE_VERSION поднят, новые модули в APP_SHELL, старые кэши удаляются, данные не трогаются', () => {
   const src = readFileSync(new URL('../sw.js', import.meta.url), 'utf8');
-  assert.match(src, /const CACHE_VERSION = 'lexlife-v34';/);
+  assert.match(src, /const CACHE_VERSION = 'lexlife-v35';/);
   assert.match(src, /'\.\/js\/services\/notifySchedule\.js'/);
   assert.match(src, /'\.\/js\/services\/notifier\.js'/);
   assert.match(src, /k !== CACHE_VERSION && k !== FONT_CACHE/);
