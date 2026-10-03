@@ -184,10 +184,9 @@ function renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, metric
     <section class="hh${enter ? ' hh--enter' : ''}" aria-labelledby="hh-title">
       <div class="hh-ambient" aria-hidden="true"><span class="hh-wave hh-wave--a"></span><span class="hh-wave hh-wave--b"></span><span class="hh-wave hh-wave--c"></span></div>
       <header class="hh__head">
-        <p class="hh__date">${esc(fmtFull(now))}</p>
+        <h1 class="hh__date" id="hh-title">${esc(fmtFull(now))}</h1>
       </header>
       <div class="hh__main">
-        <h1 class="hh__eyebrow" id="hh-title">Сегодня</h1>
         <a class="hh__value" href="#/metric/water"><span class="hh__num"></span><span class="hh__unit">мл</span></a>
         <p class="hh__caption"></p>
         <div class="hh__bar" role="progressbar" aria-label="Вода: выпито от цели" aria-valuemin="0" aria-valuemax="100"><span class="hh__fill"></span></div>

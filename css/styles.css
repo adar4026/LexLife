@@ -1422,6 +1422,7 @@ textarea.input { resize: vertical; font-family: inherit; }
   --hm-ink: #f2f8fa;
   --hm-muted: rgba(242, 248, 250, 0.65);
   --hm-accent: #61c9c2;
+  --hm-date: #8ccfe6;
   --hm-num-from: #f2f8fa;
   --hm-num-to: #9fe0da;
   --hm-track: rgba(242, 248, 250, 0.12);
@@ -1456,6 +1457,7 @@ textarea.input { resize: vertical; font-family: inherit; }
   --hm-ink: #15375b;
   --hm-muted: #4f6a80;
   --hm-accent: #167a8b;
+  --hm-date: #1b5f8e;
   --hm-num-from: #15375b;
   --hm-num-to: #167a8b;
   --hm-track: rgba(21, 55, 91, 0.09);
@@ -1592,37 +1594,32 @@ body:has(.home) { background: var(--hm-bg); }
   65% { transform: translate3d(13%, 6%, 0) rotate(2deg) scale(1.07); opacity: 0.5; }
 }
 
-/* дата — на одной линии с кнопкой ☰ (центр — safe-top + 30px) */
+/* дата — заголовок экрана, на одной линии с кнопкой ☰ (центр — safe-top + 30px) */
 .hh__head { padding-right: 56px; }
 .hh__date {
   margin: 0;
   min-height: 36px;
   display: flex;
   align-items: center;
-  font-size: 16px;
-  color: var(--hm-muted);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.005em;
+  line-height: 1.2;
+  color: var(--hm-date);
 }
 
-.hh__main { margin-top: 26px; }
-.hh__eyebrow {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  line-height: 1.2;
-  color: var(--hm-accent);
-}
+.hh__main { margin-top: 22px; }
 .hh__value {
   display: inline-flex;
   align-items: baseline;
-  gap: 8px;
-  margin: 6px 0 0 -2px;
+  gap: 6px;
+  margin: 0 0 0 -2px;
   color: var(--hm-ink);
   text-decoration: none;
   border-radius: 14px;
 }
 .hh__num {
-  font-size: clamp(68px, 22vw, 96px);
+  font-size: clamp(56px, 17.5vw, 74px);
   font-weight: 800;
   letter-spacing: -0.045em;
   line-height: 0.95;
@@ -1639,7 +1636,7 @@ body:has(.home) { background: var(--hm-bg); }
     color: transparent;
   }
 }
-.hh__unit { font-size: 22px; font-weight: 700; color: var(--hm-muted); }
+.hh__unit { font-size: 18px; font-weight: 700; color: var(--hm-muted); }
 .hh__caption { margin: 6px 0 0; font-size: 17px; color: var(--hm-muted); }
 
 .hh__bar {
@@ -1913,7 +1910,7 @@ body:has(.home) { background: var(--hm-bg); }
 /* невысокий экран (iPhone SE, 375×667): hero плотнее, чтобы «Ближайшее» начиналось на первом экране */
 @media (max-height: 700px) {
   .hh__main { margin-top: 16px; }
-  .hh__num { font-size: clamp(60px, 19vw, 80px); }
+  .hh__num { font-size: clamp(54px, 16.5vw, 64px); }
   .hh__caption { font-size: 16px; }
   .hh__bar { margin-top: 16px; }
   .hm-grid { margin-top: 16px; }
