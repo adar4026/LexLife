@@ -16,6 +16,7 @@ import { parsePreparedTest, importPreparedTest, PreparedImportError } from './se
 import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
 import { openDocViewer as showDocViewer } from './ui/docViewer.js';
 import { setActiveTab } from './ui/bottomNav.js';
+import { waterProgress, attentionItems, recentActivity, upcomingMed, nextDose } from './services/homeSummary.js';
 import { nextFire } from './services/notifySchedule.js';
 import { createNotifier, describeNotifyState, armPatch, waterRulePatch, NOTIF_ROUTES, isSafeRoute } from './services/notifier.js';
 import { createPushClient, SYNC_FAIL_TEXT, SERVER_FALLBACK_MS } from './services/pushClient.js';
@@ -64,7 +65,6 @@ const METRICS = {
   glucose: { key: 'glucose', name: 'Глюкоза', emoji: '🍬', unit: 'ммоль/л', kind: 'single', step: '0.1' },
 };
 const METRIC_ORDER = ['weight', 'pressure', 'pulse', 'water', 'temperature', 'spo2', 'glucose'];
-const HOME_METRICS = ['weight', 'pressure', 'pulse', 'water'];
 
 const fmtMl = (ml) => (ml == null ? '—' : Math.round(ml).toLocaleString('ru-RU'));
 const fmtMetric = (key, v) => {
@@ -85,15 +85,6 @@ const chartVal = (key, v) => {
 /* ---------- доменная логика анализов ---------- */
 /* Цветовая отметка основных полей по справочным значениям приложения (REFERENCE) */
 const evaluate = evaluateField;
-function nextDose(med) {
-  if (!med.every_days || !med.start) return null;
-  const ms = 86400000;
-  const start = new Date(med.start + 'T00:00:00');
-  const today = new Date(dateKey() + 'T00:00:00');
-  if (start > today) return med.start;
-  const cycles = Math.ceil((today - start) / ms / med.every_days);
-  return dateKey(new Date(start.getTime() + cycles * med.every_days * ms));
-}
 
 /* ---------- тема ---------- */
 const getTheme = () => localStorage.getItem('app_theme') || 'dark';
@@ -115,105 +106,245 @@ function metricCard(key, latest) {
 
 /* =========================================================
    Вкладка 1 — Главная (Dashboard)
+   Отвечает на три вопроса: что сегодня (вода, показатели) · что требует внимания
+   (отклонения последних анализов) · куда перейти (последняя активность).
+   Данные — только из Storage; расчёты — js/services/homeSummary.js.
    ========================================================= */
-async function HomeScreen() {
-  const [alerts, allMeds, latestTest, profile, ...latests] = await Promise.all([
-    Storage.getAlerts(),
-    Storage.getMeds(),
-    Storage.getLatestTest(),
-    Storage.getProfile(),
-    ...HOME_METRICS.map((k) => Storage.getMetricLatest(k)),
-  ]);
-  const meds = allMeds.filter((m) => m.active);
-  const screen = el('<div></div>');
-  const greeting = profile?.name ? `Привет, ${esc(profile.name)} 👋` : 'Привет 👋';
+const HOME_QUICK_METRICS = ['weight', 'pulse', 'pressure'];
+const HOME_WATER_ADD = 250; // мл — та же запись, что и быстрый ввод модуля воды (Storage.addWaterEntry)
 
-  screen.appendChild(
-    el(`
-    <header class="header">
-      <p class="header__eyebrow">${esc(fmtFull(new Date()))}</p>
-      <h1 class="header__title">${greeting}</h1>
-    </header>
-  `)
-  );
+/* Линейные иконки одного семейства с таб-баром (24×24, обводка currentColor) */
+const HOME_ICONS = {
+  water: '<path d="M12 3.6c3.3 4.1 5.6 7.3 5.6 10.2a5.6 5.6 0 0 1-11.2 0c0-2.9 2.3-6.1 5.6-10.2z"/>',
+  weight: '<rect x="4" y="4" width="16" height="16" rx="4.5"/><path d="M8.3 10.4a5.2 5.2 0 0 1 7.4 0"/><path d="m12 11.4 1.5-2"/>',
+  pulse: '<path d="M12 19.5s-7.5-4.4-7.5-10a4.2 4.2 0 0 1 7.5-2.6 4.2 4.2 0 0 1 7.5 2.6c0 5.6-7.5 10-7.5 10z"/><path d="M7.5 11.5h2.2l1.3-2.2 2 4.4 1.3-2.2h2.2"/>',
+  pressure: '<path d="M4.6 16.8a8 8 0 1 1 14.8 0"/><path d="m12 13.2 3.2-3.6"/><circle cx="12" cy="13.6" r="1.1"/>',
+  lab: '<path d="M9 3.5h6"/><path d="M10 3.5v6L5 18.3a1.8 1.8 0 0 0 1.6 2.7h10.8a1.8 1.8 0 0 0 1.6-2.7L14 9.5v-6"/><path d="M7.4 15h9.2"/>',
+  med: '<rect x="2.8" y="8.3" width="18.4" height="7.4" rx="3.7" transform="rotate(-45 12 12)"/><path d="m9.4 9.4 5.2 5.2"/>',
+  visit: '<path d="M6 3.5v5a4 4 0 0 0 8 0v-5"/><path d="M10 12.5v2a4.5 4.5 0 0 0 9 0V13"/><circle cx="19" cy="11" r="2"/>',
+  chevron: '<path d="m9.5 6 6 6-6 6"/>',
+  plus: '<path d="M12 5.5v13M5.5 12h13"/>',
+  check: '<path d="m5.5 12.5 4.2 4.2 8.8-9.2"/>',
+};
+HOME_ICONS.temperature = HOME_ICONS.pulse;
+HOME_ICONS.spo2 = HOME_ICONS.pulse;
+HOME_ICONS.glucose = HOME_ICONS.lab;
+const homeIcon = (name, cls = '') => `<svg class="hi ${cls}" viewBox="0 0 24 24" aria-hidden="true">${HOME_ICONS[name] || HOME_ICONS.lab}</svg>`;
+
+const fmtLongDate = (iso) => new Date(iso + 'T00:00:00').toLocaleDateString(RU, { day: 'numeric', month: 'long', year: 'numeric' }).replace(/\s*г\.$/, '');
+function fmtWhen(iso, today) {
+  if (iso === today) return 'сегодня';
+  const y = new Date(today + 'T00:00:00');
+  y.setDate(y.getDate() - 1);
+  if (iso === dateKey(y)) return 'вчера';
+  const d = new Date(iso + 'T00:00:00');
+  return d.toLocaleDateString(RU, d.getFullYear() === y.getFullYear() ? { day: 'numeric', month: 'short' } : { day: 'numeric', month: 'short', year: 'numeric' }).replace(/\s*г\.$/, '');
+}
+function homeSection(title, route, label) {
+  return el(`
+    <section class="hsec">
+      <div class="hsec__head">
+        <h2 class="hsec__title">${esc(title)}</h2>
+        ${route ? `<a class="hsec__more" href="#/${route}" aria-label="${esc(label)}">Все${homeIcon('chevron', 'hsec__chev')}</a>` : ''}
+      </div>
+    </section>
+  `);
+}
+
+async function HomeScreen() {
+  const today = dateKey();
+  const [water, goal, tests, metricsLog, visits, meds, takenToday] = await Promise.all([
+    Storage.getWater(today), Storage.getWaterGoal(), Storage.getTests(), Storage.getMetricsLog(), Storage.getVisits(),
+    Storage.getMeds(), Storage.getMedLog(today),
+  ]);
+  const screen = el('<div class="home"></div>');
+
+  /* дата — единственный заголовок; справа — общая кнопка ☰ (index.html) */
+  screen.appendChild(el(`<header class="home-head"><p class="home-head__date">${esc(fmtFull(new Date()))}</p></header>`));
   if (deploymentRole() === 'legacy') screen.appendChild(legacyNotice());
 
-  /* Сегодня — 4 краткие карточки показателей (тап → модуль) */
-  const sec = el('<section class="section" style="margin-top:14px"><div class="section__head"><h2 class="section__title">Сегодня</h2><button class="section__action" data-route="metrics">Все</button></div><div class="mcard-grid"></div></section>');
-  const grid = $('.mcard-grid', sec);
-  HOME_METRICS.forEach((k, i) => grid.appendChild(metricCard(k, latests[i])));
-  screen.appendChild(sec);
-
-  /* Предупреждения */
-  if (alerts.length) {
-    const s = el('<section class="section"><div class="section__head"><h2 class="section__title">Требует внимания</h2></div><div class="alerts"></div></section>');
-    const box = $('.alerts', s);
-    alerts.forEach((a) => {
-      box.appendChild(
-        el(`
-        <div class="alert alert--${esc(a.type)}">
-          <span class="alert__dot"></span>
-          <div class="alert__body">
-            <p class="alert__title">${esc(a.title)}</p>
-            <p class="alert__meta">${esc(a.note || (a.norm ? 'Норма: ' + a.norm : ''))}</p>
-          </div>
-          ${a.value ? `<span class="alert__value">${esc(a.value)}</span>` : ''}
-        </div>
-      `)
-      );
-    });
-    screen.appendChild(s);
-  }
-
-  /* Ближайшее */
-  const upcoming = [];
-  meds.forEach((m) => {
-    if (m.reminder_time) upcoming.push({ icon: m.icon, title: m.name, sub: 'Приём сегодня', trailing: m.reminder_time });
-    const nd = nextDose(m);
-    if (nd) upcoming.push({ icon: m.icon, title: m.name, sub: 'Следующая доза', trailing: fmtDate(nd) });
-  });
-  const repeatNote = alerts.find((a) => a.type === 'info' && a.note);
-  if (repeatNote) upcoming.push({ icon: '🩸', title: repeatNote.title, sub: repeatNote.note, trailing: '' });
-  if (upcoming.length) {
-    const s = el('<section class="section"><div class="section__head"><h2 class="section__title">Ближайшее</h2></div><div class="list-card"></div></section>');
-    const box = $('.list-card', s);
-    upcoming.forEach((u) => {
-      box.appendChild(
-        el(`
-        <div class="row">
-          <span class="row__icon">${esc(u.icon || '📌')}</span>
-          <div class="row__body"><p class="row__title">${esc(u.title)}</p><p class="row__sub">${esc(u.sub)}</p></div>
-          ${u.trailing ? `<span class="row__trailing">${esc(u.trailing)}</span>` : ''}
-        </div>
-      `)
-      );
-    });
-    screen.appendChild(s);
-  }
-
-  /* Последние анализы */
-  if (latestTest) {
-    const fields = ['ldl', 'trig', 'glucose', 'vitd'];
-    const s = el('<section class="section"><div class="section__head"><h2 class="section__title">Последние анализы</h2><button class="section__action" data-route="tests">Все</button></div><div class="metric-grid"></div></section>');
-    const g = $('.metric-grid', s);
-    fields.forEach((f) => {
-      const ref = REFERENCE[f];
-      const val = latestTest[f];
-      const st = evaluate(f, val);
-      g.appendChild(
-        el(`
-        <div class="metric-tile" role="button" data-route="test-history/${f}">
-          <div class="metric-tile__top"><span class="metric-tile__name">${esc(ref.label)}</span><span class="dot-status dot-status--${st}"></span></div>
-          <div class="metric-tile__value">${val ?? '—'}<span class="metric-tile__unit">${esc(ref.unit)}</span></div>
-        </div>
-      `)
-      );
-    });
-    screen.appendChild(s);
-  }
-
-  screen.addEventListener('click', onRouteClick);
+  screen.appendChild(renderWaterHero(water, goal));
+  screen.appendChild(renderQuickMetrics(metricsLog, today));
+  const upcoming = renderUpcoming(meds, takenToday);
+  if (upcoming) screen.appendChild(upcoming);
+  const attention = renderAttentionSection(tests);
+  if (attention) screen.appendChild(attention);
+  const recent = renderRecentActivity({ tests, metricsLog, visits, today });
+  if (recent) screen.appendChild(recent);
   return screen;
+}
+
+/* ---------- Вода сегодня (hero) ---------- */
+function renderWaterHero(water, goal) {
+  const card = el(`
+    <section class="hw" aria-label="Вода сегодня">
+      <a class="hw__head" href="#/metric/water" aria-label="Вода: открыть модуль воды">
+        <span class="hw__icon">${homeIcon('water')}</span>
+        <span class="hw__title">Вода сегодня</span>
+        ${homeIcon('chevron', 'hw__chev')}
+      </a>
+      <p class="hw__val"><span class="hw__cur"></span><span class="hw__goal"></span></p>
+      <div class="hw__bar" role="progressbar" aria-label="Выпито от цели" aria-valuemin="0" aria-valuemax="100"><span class="hw__fill"></span></div>
+      <div class="hw__foot">
+        <p class="hw__status" aria-live="polite"></p>
+        <button class="hw__add" type="button" aria-label="Добавить ${HOME_WATER_ADD} мл воды">${homeIcon('plus')}${HOME_WATER_ADD} мл</button>
+      </div>
+    </section>
+  `);
+  const paint = (cur) => {
+    const p = waterProgress(cur, goal);
+    $('.hw__cur', card).textContent = fmtMl(p.current);
+    $('.hw__goal', card).textContent = ` / ${fmtMl(p.goal)} мл`;
+    const pct = Math.round(p.progress * 100);
+    $('.hw__fill', card).style.width = `${pct}%`;
+    const bar = $('.hw__bar', card);
+    bar.setAttribute('aria-valuenow', String(pct));
+    bar.setAttribute('aria-valuetext', `${fmtMl(p.current)} из ${fmtMl(p.goal)} мл`);
+    const st = $('.hw__status', card);
+    st.classList.toggle('is-done', p.reached);
+    st.innerHTML = p.reached
+      ? `${homeIcon('check')}Цель выполнена${p.over ? ` <span class="hw__over">+${esc(fmtMl(p.over))} мл</span>` : ''}`
+      : `Осталось <b>${esc(fmtMl(p.remaining))} мл</b>`;
+  };
+  paint(water);
+
+  /* значение и прогресс тоже ведут в модуль воды (ссылка в заголовке — путь для VoiceOver) */
+  card.addEventListener('click', (e) => {
+    if (e.target.closest('.hw__add, .hw__head')) return;
+    location.hash = '#/metric/water';
+  });
+  const add = $('.hw__add', card);
+  add.addEventListener('click', async () => {
+    if (add.disabled) return;
+    add.disabled = true;
+    try {
+      paint(await Storage.addWaterEntry(HOME_WATER_ADD));
+      flash(`+${HOME_WATER_ADD} мл`);
+    } finally {
+      add.disabled = false;
+    }
+  });
+  return card;
+}
+
+/* ---------- Показатели: вес · пульс · давление ---------- */
+function renderQuickMetrics(metricsLog, today) {
+  const sec = homeSection('Показатели', 'metrics', 'Все показатели');
+  const grid = el('<div class="qm-grid"></div>');
+  const cells = HOME_QUICK_METRICS.map((key) => {
+    const M = METRICS[key];
+    const log = (metricsLog && metricsLog[key]) || {};
+    const date = Object.keys(log).filter((d) => log[d] != null && d <= today).sort().pop();
+    const value = date ? fmtMetric(key, log[date]) : null;
+    /* давление «120/80» читается без единицы — в карточке её нет, в aria-label есть */
+    const unit = key === 'pressure' ? '' : M.unit;
+    return { key, M, date, value, unit };
+  });
+  /* один размер цифр для всего ряда: по самой длинной записи (CSS: --qm-chars) */
+  const chars = Math.max(3, ...cells.filter((c) => c.value).map((c) => c.value.length + c.unit.length * 0.5));
+  grid.style.setProperty('--qm-chars', String(chars));
+  cells.forEach(({ key, M, date, value, unit }) => {
+    const label = value
+      ? `${M.name}: ${value} ${M.unit}, ${fmtWhen(date, today)}. Открыть`
+      : `${M.name}: нет записей. Добавить`;
+    grid.appendChild(el(`
+      <a class="qm${value ? '' : ' qm--empty'}" href="#/metric/${key}" aria-label="${esc(label)}">
+        ${homeIcon(key, 'qm__icon')}
+        <span class="qm__name">${esc(M.name)}</span>
+        ${value
+          ? `<span class="qm__val">${esc(value)}${unit ? `<span class="qm__unit">${esc(unit)}</span>` : ''}</span><span class="qm__when">${esc(fmtWhen(date, today))}</span>`
+          : `<span class="qm__val qm__val--none" aria-hidden="true">—</span><span class="qm__add">${homeIcon('plus')}Добавить</span>`}
+      </a>
+    `));
+  });
+  sec.appendChild(grid);
+  return sec;
+}
+
+/* ---------- Ближайшее: одно предстоящее лекарство (расписание и отметки — экран «Лекарства») ---------- */
+function renderUpcoming(meds, takenToday) {
+  const now = new Date();
+  const u = upcomingMed(meds, { now, takenToday });
+  if (!u) return null;
+  const today = dateKey(now);
+  const tomorrow = dateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1));
+  const day = u.date === today ? 'Сегодня' : u.date === tomorrow ? 'Завтра' : fmtWhen(u.date, today);
+  const when = [day, u.time].filter(Boolean).join(', ');
+  const sub = [when, u.dose].filter(Boolean).join(' · ');
+  const sec = homeSection('Ближайшее');
+  const row = el(`
+    <a class="hrow hrow--compact" href="#/meds">
+      <span class="hrow__icon">${homeIcon('med')}</span>
+      <span class="hrow__body"><span class="hrow__title"></span><span class="hrow__sub hrow__sub--one"></span></span>
+      ${homeIcon('chevron', 'hrow__chev')}
+    </a>
+  `);
+  $('.hrow__title', row).textContent = u.name;
+  $('.hrow__sub', row).textContent = sub;
+  row.setAttribute('aria-label', `Ближайшее: ${u.name}, ${sub}; открыть лекарства`);
+  const list = el('<div class="hlist"></div>');
+  list.appendChild(row);
+  sec.appendChild(list);
+  return sec;
+}
+
+/* ---------- Требует внимания: только то, что приложение уже отмечает как вне диапазона ---------- */
+function renderAttentionSection(tests) {
+  const { items } = attentionItems(tests, { limit: 3 });
+  if (!items.length) return null;
+  const sec = homeSection('Требует внимания', 'tests', 'Все анализы');
+  const list = el('<div class="hlist"></div>');
+  items.forEach((it) => {
+    const value = `${fmtNum(it.value)}${it.unit ? ` ${it.unit}` : ''}`;
+    const row = el(`
+      <a class="hrow" href="#/test-history/${encodeURIComponent(it.key)}">
+        <span class="hrow__icon hrow__icon--${it.level}">${homeIcon('lab')}</span>
+        <span class="hrow__body"><span class="hrow__title"></span><span class="hrow__sub">${esc(value)}</span></span>
+        <span class="hrow__status hrow__status--${it.level}">${esc(it.label)}</span>
+        ${homeIcon('chevron', 'hrow__chev')}
+      </a>
+    `);
+    $('.hrow__title', row).textContent = it.name;
+    row.setAttribute('aria-label', `${it.name}: ${value}, ${it.label.toLowerCase()}, анализ от ${fmtLongDate(it.date)}. История показателя`);
+    list.appendChild(row);
+  });
+  sec.appendChild(list);
+  sec.appendChild(el('<p class="hsec__note">По справочным значениям приложения и диапазонам бланка лаборатории — это не медицинская оценка.</p>'));
+  return sec;
+}
+
+/* ---------- Последняя активность: анализ → измерение → визит ---------- */
+function renderRecentActivity(data) {
+  const a = recentActivity(data);
+  if (!a) return null;
+  let icon, title, sub, href;
+  if (a.kind === 'test') {
+    /* группы бланка («Гематология · Биохимия») — заголовок; без них просто «Анализы» */
+    icon = 'lab'; title = a.summary || 'Анализы'; href = `#/test/${encodeURIComponent(a.testId)}`;
+    sub = fmtLongDate(a.date);
+  } else if (a.kind === 'metric') {
+    const M = METRICS[a.key];
+    icon = a.key; title = M.name; href = `#/metric/${a.key}`;
+    sub = `${fmtMetric(a.key, a.value)} ${M.unit} · ${fmtLongDate(a.date)}`;
+  } else {
+    icon = 'visit'; title = a.title; href = `#/visit/${encodeURIComponent(a.visitId)}`;
+    sub = fmtLongDate(a.date);
+  }
+  const sec = homeSection('Последняя активность');
+  const row = el(`
+    <a class="hrow" href="${href}">
+      <span class="hrow__icon">${homeIcon(icon)}</span>
+      <span class="hrow__body"><span class="hrow__title"></span><span class="hrow__sub hrow__sub--one"></span></span>
+      ${homeIcon('chevron', 'hrow__chev')}
+    </a>
+  `);
+  $('.hrow__title', row).textContent = title;
+  $('.hrow__sub', row).textContent = sub;
+  row.setAttribute('aria-label', `${title}: ${sub}. Открыть`);
+  const list = el('<div class="hlist"></div>');
+  list.appendChild(row);
+  sec.appendChild(list);
+  return sec;
 }
 
 /* =========================================================

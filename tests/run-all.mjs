@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const run = [
-  ['attachments.test.mjs'], ['tests-journal.test.mjs'], ['bottom-nav.test.mjs'], ['water-goal-days.test.mjs'], ['water-import.test.mjs'],
+  ['attachments.test.mjs'], ['tests-journal.test.mjs'], ['bottom-nav.test.mjs'], ['water-goal-days.test.mjs'], ['water-import.test.mjs'], ['home-summary.test.mjs'],
   ['notifications.test.mjs'], // сам перебирает 4 timezone
   ['push-worker.test.mjs', 'Asia/Tokyo'],
   ['push-client.test.mjs', 'Europe/Madrid'],
