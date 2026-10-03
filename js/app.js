@@ -184,7 +184,6 @@ function renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, metric
     <section class="hh${enter ? ' hh--enter' : ''}" aria-labelledby="hh-title">
       <div class="hh-ambient" aria-hidden="true"><span class="hh-wave hh-wave--a"></span><span class="hh-wave hh-wave--b"></span><span class="hh-wave hh-wave--c"></span></div>
       <header class="hh__head">
-        <p class="hh__brand">LexLife</p>
         <p class="hh__date">${esc(fmtFull(now))}</p>
       </header>
       <div class="hh__main">

@@ -1592,22 +1592,18 @@ body:has(.home) { background: var(--hm-bg); }
   65% { transform: translate3d(13%, 6%, 0) rotate(2deg) scale(1.07); opacity: 0.5; }
 }
 
-/* бренд и дата: строка бренда — на одной линии с кнопкой ☰ (центр — safe-top + 30px) */
+/* дата — на одной линии с кнопкой ☰ (центр — safe-top + 30px) */
 .hh__head { padding-right: 56px; }
-.hh__brand {
+.hh__date {
   margin: 0;
   min-height: 36px;
   display: flex;
   align-items: center;
-  font-family: var(--font-head);
-  font-size: 18px;
-  font-weight: 700;
-  letter-spacing: -0.01em;
-  color: var(--hm-ink);
+  font-size: 16px;
+  color: var(--hm-muted);
 }
-.hh__date { margin: 0; font-size: 15px; color: var(--hm-muted); }
 
-.hh__main { margin-top: 30px; }
+.hh__main { margin-top: 26px; }
 .hh__eyebrow {
   margin: 0;
   font-size: 15px;
@@ -1916,7 +1912,7 @@ body:has(.home) { background: var(--hm-bg); }
 
 /* невысокий экран (iPhone SE, 375×667): hero плотнее, чтобы «Ближайшее» начиналось на первом экране */
 @media (max-height: 700px) {
-  .hh__main { margin-top: 18px; }
+  .hh__main { margin-top: 16px; }
   .hh__num { font-size: clamp(60px, 19vw, 80px); }
   .hh__caption { font-size: 16px; }
   .hh__bar { margin-top: 16px; }
