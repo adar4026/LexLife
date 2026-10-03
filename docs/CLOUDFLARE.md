@@ -1,7 +1,9 @@
 # LexLife на Cloudflare: Workers + Static Assets + D1 + Cron + Web Push
 
-Статус: **подготовлено и проверено локально** (ветка `cloudflare-push`).
-В Cloudflare ничего не создано. GitHub Pages (`https://adar4026.github.io/LexLife/`) работает как раньше.
+Статус: **параллельный production развёрнут** (ветка `cloudflare-push`, 2026-10-03) —
+`https://lexlife.alexus4026.workers.dev/`. Worker `lexlife`, D1 `lexlife`, cron `* * * * *`, production VAPID
+(приватный ключ и subject — только Cloudflare secrets). Данные пользователя не переносились.
+GitHub Pages (`https://adar4026.github.io/LexLife/`) работает как раньше, `main` не менялся.
 
 ## Архитектура
 
@@ -144,7 +146,7 @@ Git-интеграция Cloudflare (Workers Builds): push в `main` → сбо�
 Миграции D1 применяются вручную и осознанно (`npm run db:migrate:remote`), не при каждом push.
 GitHub Pages продолжает деплоиться из того же `main` — оба адреса живут параллельно.
 
-## Что потребуется для production (НЕ выполнено — ждёт подтверждения)
+## Production: шаги 1–5 выполнены 2026-10-03, остальное ждёт подтверждения
 
 1. `wrangler login` (аккаунт Cloudflare, Free plan достаточно).
 2. `wrangler d1 create lexlife` → записать `database_id` в `wrangler.jsonc`.

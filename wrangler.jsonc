@@ -24,7 +24,7 @@
     {
       "binding": "DB",
       "database_name": "lexlife",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "c8eaba54-3002-484a-924d-e0ef5a896012",
       "migrations_dir": "migrations"
     }
   ],
@@ -40,7 +40,7 @@
   /* Публичные значения. VAPID_PUBLIC_KEY production-пары подставляется при её создании
      (локально его переопределяет .dev.vars). */
   "vars": {
-    "VAPID_PUBLIC_KEY": "",
+    "VAPID_PUBLIC_KEY": "BLy1I-G7yb3M-h5FQNIJDwiFzgmp1tBIC_HGC3xk8KfOHiG4K03bQxSWlvoMqp0yo9y0gF69kAMyatmCPilJ28I",
     "PUSH_TEST_INTERVAL_SEC": "20"
   },
 
