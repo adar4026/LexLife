@@ -1,6 +1,9 @@
 /* =========================================================
    homeSummary.js — данные главного экрана: чистые функции без DOM и хранилища.
    • waterProgress — прогресс воды за сегодня (без отрицательного «осталось»);
+   • waterDayStatus — главный показатель дня: вода относительно плана гидратации;
+   • medsToday — лекарства на сегодня: сколько в плане дня и сколько отмечено;
+   • upcomingVisit — ближайший запланированный / следующий визит (как в Календаре);
    • attentionItems — «Требует внимания»: последние значения показателей анализов,
      которые приложение уже отмечает как вне диапазона (evaluateField — справочные
      значения приложения для основных полей; outOfLabRange — диапазон бланка для
@@ -29,6 +32,18 @@ export function waterProgress(current, goal) {
     reached: g > 0 && cur >= g,
     over: g > 0 && cur > g ? cur - g : 0,
   };
+}
+
+/* Состояние дня по воде относительно плана гидратации — та же оценка, что на экране «Вода»
+   (выпито − план к текущему моменту < 0 → «отстаёте»). plannedMl считает app.js (plannedByNow).
+   → { state: 'none' (цели нет) | 'done' | 'onTrack' | 'behind', behind (мл, ≥ 0), over (мл сверх цели) } */
+export function waterDayStatus(current, goal, plannedMl) {
+  const p = waterProgress(current, goal);
+  if (!p.goal) return { state: 'none', behind: 0, over: 0 };
+  if (p.reached) return { state: 'done', behind: 0, over: p.over };
+  const planned = isNum(plannedMl) ? Math.min(Math.max(plannedMl, 0), p.goal) : 0;
+  const behind = Math.max(Math.round(planned - p.current), 0);
+  return { state: behind > 0 ? 'behind' : 'onTrack', behind, over: 0 };
 }
 
 /* ---------- «Требует внимания» ---------- */
@@ -134,6 +149,44 @@ export function upcomingMed(meds, { now = new Date(), takenToday = [] } = {}) {
   if (!best) return null;
   const { key, ...item } = best;
   return item;
+}
+
+/* Лекарства на сегодня — те же отметки, что на экране «Лекарства» («принял сегодня» по имени).
+   В план дня входит активное лекарство, если курс не закончился (end) и не начался позже (start);
+   курс «раз в N дней» — только в день дозы. Лекарство без расписания отмечается ежедневно — входит.
+   → { due, taken } (taken ≤ due) */
+export function medsToday(meds, { today = dateKey(), takenToday = [] } = {}) {
+  const taken = new Set(Array.isArray(takenToday) ? takenToday : []);
+  let due = 0;
+  let done = 0;
+  (Array.isArray(meds) ? meds : []).forEach((m) => {
+    if (!m || !m.active || typeof m.name !== 'string' || !m.name.trim()) return;
+    if (m.end && today > m.end) return;
+    if (m.start && today < m.start) return;
+    if (m.every_days && m.start && nextDose(m, today) !== today) return;
+    due += 1;
+    if (taken.has(m.name)) done += 1;
+  });
+  return { due, taken: done };
+}
+
+/* Ближайший визит — как в Календаре: запланированный визит (status 'planned') на дату не раньше
+   сегодняшней или «следующий визит» (nextDate) любого визита. Времени у визитов нет.
+   → { visitId, date, title, next: boolean } | null */
+export function upcomingVisit(visits, today = dateKey()) {
+  let best = null;
+  const consider = (v, date, next) => {
+    if (typeof date !== 'string' || date < today) return;
+    if (!best || date < best.date) {
+      best = { visitId: v.id, date, title: [v.specialty, v.doctor].filter(Boolean).join(' · ') || 'Визит к врачу', next };
+    }
+  };
+  (Array.isArray(visits) ? visits : []).forEach((v) => {
+    if (!v) return;
+    if (v.status === 'planned') consider(v, v.date, false);
+    if (v.nextDate) consider(v, v.nextDate, true);
+  });
+  return best;
 }
 
 /* ---------- «Последняя активность» ---------- */

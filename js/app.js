@@ -16,7 +16,7 @@ import { parsePreparedTest, importPreparedTest, PreparedImportError } from './se
 import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
 import { openDocViewer as showDocViewer } from './ui/docViewer.js';
 import { setActiveTab } from './ui/bottomNav.js';
-import { waterProgress, attentionItems, recentActivity, upcomingMed, nextDose } from './services/homeSummary.js';
+import { waterProgress, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed, nextDose } from './services/homeSummary.js';
 import { nextFire } from './services/notifySchedule.js';
 import { createNotifier, describeNotifyState, armPatch, waterRulePatch, NOTIF_ROUTES, isSafeRoute } from './services/notifier.js';
 import { createPushClient, SYNC_FAIL_TEXT, SERVER_FALLBACK_MS } from './services/pushClient.js';
@@ -106,12 +106,14 @@ function metricCard(key, latest) {
 
 /* =========================================================
    Вкладка 1 — Главная (Dashboard)
-   Отвечает на три вопроса: что сегодня (вода, показатели) · что требует внимания
-   (отклонения последних анализов) · куда перейти (последняя активность).
+   Hero прямо на фоне страницы: главный показатель дня (вода и план гидратации) · показатели
+   дня 2×2 · действия. Ниже — ближайшее (лекарство, визит) · требует внимания (отклонения
+   последних анализов) · последняя активность.
    Данные — только из Storage; расчёты — js/services/homeSummary.js.
    ========================================================= */
-const HOME_QUICK_METRICS = ['weight', 'pulse', 'pressure'];
+const HOME_QUICK_METRICS = ['pressure', 'pulse', 'weight']; // ячейки после «Лекарств»
 const HOME_WATER_ADD = 250; // мл — та же запись, что и быстрый ввод модуля воды (Storage.addWaterEntry)
+let homeEntered = false;
 
 /* Линейные иконки одного семейства с таб-баром (24×24, обводка currentColor) */
 const HOME_ICONS = {
@@ -140,32 +142,31 @@ function fmtWhen(iso, today) {
   const d = new Date(iso + 'T00:00:00');
   return d.toLocaleDateString(RU, d.getFullYear() === y.getFullYear() ? { day: 'numeric', month: 'short' } : { day: 'numeric', month: 'short', year: 'numeric' }).replace(/\s*г\.$/, '');
 }
-function homeSection(title, route, label) {
+function homeSection(title, route, label, more = 'Все') {
   return el(`
     <section class="hsec">
       <div class="hsec__head">
         <h2 class="hsec__title">${esc(title)}</h2>
-        ${route ? `<a class="hsec__more" href="#/${route}" aria-label="${esc(label)}">Все${homeIcon('chevron', 'hsec__chev')}</a>` : ''}
+        ${route ? `<a class="hsec__more" href="#/${route}" aria-label="${esc(label)}">${esc(more)}${homeIcon('chevron', 'hsec__chev')}</a>` : ''}
       </div>
     </section>
   `);
 }
 
 async function HomeScreen() {
-  const today = dateKey();
-  const [water, goal, tests, metricsLog, visits, meds, takenToday] = await Promise.all([
-    Storage.getWater(today), Storage.getWaterGoal(), Storage.getTests(), Storage.getMetricsLog(), Storage.getVisits(),
-    Storage.getMeds(), Storage.getMedLog(today),
+  const now = new Date();
+  const today = dateKey(now);
+  const [water, goal, hyd, tests, metricsLog, visits, meds, takenToday] = await Promise.all([
+    Storage.getWater(today), Storage.getWaterGoal(), Storage.getHydration(), Storage.getTests(), Storage.getMetricsLog(),
+    Storage.getVisits(), Storage.getMeds(), Storage.getMedLog(today),
   ]);
   const screen = el('<div class="home"></div>');
+  /* мягкое появление — только при первом открытии Главной за запуск (не на каждом переключении вкладки) */
+  const enter = !homeEntered;
+  homeEntered = true;
 
-  /* дата — единственный заголовок; справа — общая кнопка ☰ (index.html) */
-  screen.appendChild(el(`<header class="home-head"><p class="home-head__date">${esc(fmtFull(new Date()))}</p></header>`));
-  if (deploymentRole() === 'legacy') screen.appendChild(legacyNotice());
-
-  screen.appendChild(renderWaterHero(water, goal));
-  screen.appendChild(renderQuickMetrics(metricsLog, today));
-  const upcoming = renderUpcoming(meds, takenToday);
+  screen.appendChild(renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, metricsLog, enter }));
+  const upcoming = renderUpcoming({ meds, takenToday, visits, now });
   if (upcoming) screen.appendChild(upcoming);
   const attention = renderAttentionSection(tests);
   if (attention) screen.appendChild(attention);
@@ -174,46 +175,78 @@ async function HomeScreen() {
   return screen;
 }
 
-/* ---------- Вода сегодня (hero) ---------- */
-function renderWaterHero(water, goal) {
-  const card = el(`
-    <section class="hw" aria-label="Вода сегодня">
-      <a class="hw__head" href="#/metric/water" aria-label="Вода: открыть модуль воды">
-        <span class="hw__icon">${homeIcon('water')}</span>
-        <span class="hw__title">Вода сегодня</span>
-        ${homeIcon('chevron', 'hw__chev')}
-      </a>
-      <p class="hw__val"><span class="hw__cur"></span><span class="hw__goal"></span></p>
-      <div class="hw__bar" role="progressbar" aria-label="Выпито от цели" aria-valuemin="0" aria-valuemax="100"><span class="hw__fill"></span></div>
-      <div class="hw__foot">
-        <p class="hw__status" aria-live="polite"></p>
-        <button class="hw__add" type="button" aria-label="Добавить ${HOME_WATER_ADD} мл воды">${homeIcon('plus')}${HOME_WATER_ADD} мл</button>
+/* ---------- Hero: композиция прямо на фоне страницы (без карточки) ----------
+   Главный показатель дня — вода: выпито / цель и отметка плана гидратации (та же оценка,
+   что на экране «Вода»). Ниже — показатели дня 2×2 и два действия. Фон — световые волны
+   .hh-ambient (только CSS, в границах hero, растворяются к «Ближайшему»). */
+function renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, metricsLog, enter }) {
+  const hero = el(`
+    <section class="hh${enter ? ' hh--enter' : ''}" aria-labelledby="hh-title">
+      <div class="hh-ambient" aria-hidden="true"><span class="hh-wave hh-wave--a"></span><span class="hh-wave hh-wave--b"></span><span class="hh-wave hh-wave--c"></span></div>
+      <header class="hh__head">
+        <p class="hh__brand">LexLife</p>
+        <p class="hh__date">${esc(fmtFull(now))}</p>
+      </header>
+      <div class="hh__main">
+        <h1 class="hh__eyebrow" id="hh-title">Сегодня</h1>
+        <a class="hh__value" href="#/metric/water"><span class="hh__num"></span><span class="hh__unit">мл</span></a>
+        <p class="hh__caption"></p>
+        <div class="hh__bar" role="progressbar" aria-label="Вода: выпито от цели" aria-valuemin="0" aria-valuemax="100"><span class="hh__fill"></span></div>
+        <p class="hh__meta"><span class="hh__pct"></span><span class="hh__status" aria-live="polite"></span></p>
+      </div>
+      <div class="hm-grid"></div>
+      <div class="hh__cta">
+        <a class="hh-btn hh-btn--soft" href="#/metric/water" aria-label="Подробнее о воде: план дня и журнал">Подробнее</a>
+        <button class="hh-btn hh-btn--accent" type="button" aria-label="Добавить ${HOME_WATER_ADD} мл воды">${homeIcon('plus')}${HOME_WATER_ADD} мл</button>
       </div>
     </section>
   `);
+  if (deploymentRole() === 'legacy') $('.hh__head', hero).after(legacyNotice());
+
   const paint = (cur) => {
     const p = waterProgress(cur, goal);
-    $('.hw__cur', card).textContent = fmtMl(p.current);
-    $('.hw__goal', card).textContent = ` / ${fmtMl(p.goal)} мл`;
-    const pct = Math.round(p.progress * 100);
-    $('.hw__fill', card).style.width = `${pct}%`;
-    const bar = $('.hw__bar', card);
-    bar.setAttribute('aria-valuenow', String(pct));
-    bar.setAttribute('aria-valuetext', `${fmtMl(p.current)} из ${fmtMl(p.goal)} мл`);
-    const st = $('.hw__status', card);
-    st.classList.toggle('is-done', p.reached);
-    st.innerHTML = p.reached
-      ? `${homeIcon('check')}Цель выполнена${p.over ? ` <span class="hw__over">+${esc(fmtMl(p.over))} мл</span>` : ''}`
-      : `Осталось <b>${esc(fmtMl(p.remaining))} мл</b>`;
+    const planned = hyd && hyd.wakeStart && hyd.wakeEnd ? plannedByNow(p.goal, hyd, nowMinutes()) : 0;
+    const s = waterDayStatus(p.current, p.goal, planned);
+    const pct = p.goal ? Math.round((p.current / p.goal) * 100) : 0;
+    $('.hh__num', hero).textContent = fmtMl(p.current);
+    $('.hh__caption', hero).textContent = p.goal ? `воды из ${fmtMl(p.goal)} мл` : 'воды сегодня';
+    $('.hh__fill', hero).style.width = `${Math.min(pct, 100)}%`;
+    const bar = $('.hh__bar', hero);
+    bar.setAttribute('aria-valuenow', String(Math.min(pct, 100)));
+    bar.setAttribute('aria-valuetext', p.goal ? `${fmtMl(p.current)} из ${fmtMl(p.goal)} мл, ${pct}%` : `${fmtMl(p.current)} мл`);
+    $('.hh__pct', hero).textContent = p.goal ? `${pct}% от цели` : '';
+    const st = $('.hh__status', hero);
+    st.className = `hh__status hh__status--${s.state}`;
+    st.innerHTML = s.state === 'done'
+      ? `${homeIcon('check')}Цель выполнена${s.over ? ` · +${esc(fmtMl(s.over))} мл` : ''}`
+      : s.state === 'behind'
+        ? `<span class="hh__dot"></span>Отстаёте от плана на ${esc(fmtMl(s.behind))} мл`
+        : s.state === 'onTrack'
+          ? '<span class="hh__dot"></span>Всё идёт по плану'
+          : 'Цель не задана';
+    $('.hh__value', hero).setAttribute('aria-label', `Вода сегодня: ${fmtMl(p.current)}${p.goal ? ` из ${fmtMl(p.goal)}` : ''} мл. Открыть модуль воды`);
   };
   paint(water);
 
-  /* значение и прогресс тоже ведут в модуль воды (ссылка в заголовке — путь для VoiceOver) */
-  card.addEventListener('click', (e) => {
-    if (e.target.closest('.hw__add, .hw__head')) return;
-    location.hash = '#/metric/water';
+  const grid = $('.hm-grid', hero);
+  homeMetricCells({ meds, takenToday, metricsLog, today }).forEach((c, i) => {
+    const cell = el(`
+      <a class="hm hm--${c.tone}" href="${c.href}" style="--i:${i}">
+        <span class="hm__label">${homeIcon(c.icon, 'hm__icon')}<span class="hm__name"></span></span>
+        <span class="hm__val${c.value ? '' : ' hm__val--none'}"></span>
+        <span class="hm__when"></span>
+      </a>
+    `);
+    $('.hm__name', cell).textContent = c.name;
+    const val = $('.hm__val', cell);
+    val.textContent = c.value || '—';
+    if (c.value && c.unit) val.appendChild(el(`<span class="hm__unit">${esc(c.unit)}</span>`));
+    $('.hm__when', cell).textContent = c.when;
+    cell.setAttribute('aria-label', c.label);
+    grid.appendChild(cell);
   });
-  const add = $('.hw__add', card);
+
+  const add = $('.hh-btn--accent', hero);
   add.addEventListener('click', async () => {
     if (add.disabled) return;
     add.disabled = true;
@@ -224,66 +257,67 @@ function renderWaterHero(water, goal) {
       add.disabled = false;
     }
   });
-  return card;
+  return hero;
 }
 
-/* ---------- Показатели: вес · пульс · давление ---------- */
-function renderQuickMetrics(metricsLog, today) {
-  const sec = homeSection('Показатели', 'metrics', 'Все показатели');
-  const grid = el('<div class="qm-grid"></div>');
-  const cells = HOME_QUICK_METRICS.map((key) => {
+/* Показатели дня 2×2: лекарства (отметки «принял сегодня») · давление · пульс · вес (последние записи) */
+function homeMetricCells({ meds, takenToday, metricsLog, today }) {
+  const m = medsToday(meds, { today, takenToday });
+  const cells = [{
+    tone: 'med', icon: 'med', name: 'Лекарства', href: '#/meds', unit: '',
+    value: m.due ? `${m.taken} / ${m.due}` : null,
+    when: !m.due ? 'на сегодня нет' : m.taken >= m.due ? 'всё принято' : 'принято сегодня',
+    label: m.due ? `Лекарства сегодня: принято ${m.taken} из ${m.due}. Открыть лекарства` : 'Лекарства: на сегодня приёмов нет. Открыть лекарства',
+  }];
+  HOME_QUICK_METRICS.forEach((key) => {
     const M = METRICS[key];
     const log = (metricsLog && metricsLog[key]) || {};
     const date = Object.keys(log).filter((d) => log[d] != null && d <= today).sort().pop();
     const value = date ? fmtMetric(key, log[date]) : null;
-    /* давление «120/80» читается без единицы — в карточке её нет, в aria-label есть */
-    const unit = key === 'pressure' ? '' : M.unit;
-    return { key, M, date, value, unit };
+    cells.push({
+      tone: key, icon: key, name: M.name, href: `#/metric/${key}`,
+      /* давление «120/80» читается без единицы — в aria-label она есть */
+      value, unit: key === 'pressure' ? '' : M.unit,
+      when: date ? fmtWhen(date, today) : 'нет записей',
+      label: value ? `${M.name}: ${value} ${M.unit}, ${fmtWhen(date, today)}. Открыть` : `${M.name}: нет записей. Добавить`,
+    });
   });
-  /* один размер цифр для всего ряда: по самой длинной записи (CSS: --qm-chars) */
-  const chars = Math.max(3, ...cells.filter((c) => c.value).map((c) => c.value.length + c.unit.length * 0.5));
-  grid.style.setProperty('--qm-chars', String(chars));
-  cells.forEach(({ key, M, date, value, unit }) => {
-    const label = value
-      ? `${M.name}: ${value} ${M.unit}, ${fmtWhen(date, today)}. Открыть`
-      : `${M.name}: нет записей. Добавить`;
-    grid.appendChild(el(`
-      <a class="qm${value ? '' : ' qm--empty'}" href="#/metric/${key}" aria-label="${esc(label)}">
-        ${homeIcon(key, 'qm__icon')}
-        <span class="qm__name">${esc(M.name)}</span>
-        ${value
-          ? `<span class="qm__val">${esc(value)}${unit ? `<span class="qm__unit">${esc(unit)}</span>` : ''}</span><span class="qm__when">${esc(fmtWhen(date, today))}</span>`
-          : `<span class="qm__val qm__val--none" aria-hidden="true">—</span><span class="qm__add">${homeIcon('plus')}Добавить</span>`}
-      </a>
-    `));
-  });
-  sec.appendChild(grid);
-  return sec;
+  return cells;
 }
 
-/* ---------- Ближайшее: одно предстоящее лекарство (расписание и отметки — экран «Лекарства») ---------- */
-function renderUpcoming(meds, takenToday) {
-  const now = new Date();
-  const u = upcomingMed(meds, { now, takenToday });
-  if (!u) return null;
+/* ---------- Ближайшее: следующее лекарство и следующий визит (время · тип · действие) ---------- */
+function renderUpcoming({ meds, takenToday, visits, now }) {
   const today = dateKey(now);
   const tomorrow = dateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1));
-  const day = u.date === today ? 'Сегодня' : u.date === tomorrow ? 'Завтра' : fmtWhen(u.date, today);
-  const when = [day, u.time].filter(Boolean).join(', ');
-  const sub = [when, u.dose].filter(Boolean).join(' · ');
-  const sec = homeSection('Ближайшее');
-  const row = el(`
-    <a class="hrow hrow--compact" href="#/meds">
-      <span class="hrow__icon">${homeIcon('med')}</span>
-      <span class="hrow__body"><span class="hrow__title"></span><span class="hrow__sub hrow__sub--one"></span></span>
-      ${homeIcon('chevron', 'hrow__chev')}
-    </a>
-  `);
-  $('.hrow__title', row).textContent = u.name;
-  $('.hrow__sub', row).textContent = sub;
-  row.setAttribute('aria-label', `Ближайшее: ${u.name}, ${sub}; открыть лекарства`);
-  const list = el('<div class="hlist"></div>');
-  list.appendChild(row);
+  const dayWord = (d) => (d === today ? 'Сегодня' : d === tomorrow ? 'Завтра' : fmtWhen(d, today));
+  const items = [];
+  const u = upcomingMed(meds, { now, takenToday });
+  if (u) items.push({ sort: `${u.date}T${u.time || '00:00'}`, tone: 'med', icon: 'med', href: '#/meds', title: u.name,
+    top: u.time || dayWord(u.date), bottom: u.time ? dayWord(u.date) : '', sub: ['Лекарство', u.dose].filter(Boolean).join(' · ') });
+  const v = upcomingVisit(visits, today);
+  if (v) items.push({ sort: `${v.date}T99`, tone: 'visit', icon: 'visit', href: `#/visit/${encodeURIComponent(v.visitId)}`, title: v.title,
+    top: dayWord(v.date), bottom: '', sub: v.next ? 'Следующий визит' : 'Визит к врачу' });
+  if (!items.length) return null;
+  items.sort((a, b) => a.sort.localeCompare(b.sort));
+
+  const sec = homeSection('Ближайшее', 'calendar', 'Открыть календарь', 'Календарь');
+  const list = el('<div class="hev-list"></div>');
+  items.forEach((it) => {
+    const row = el(`
+      <a class="hev" href="${it.href}">
+        <span class="hev__when"><b></b><small></small></span>
+        <span class="hev__icon hev__icon--${it.tone}">${homeIcon(it.icon)}</span>
+        <span class="hev__body"><span class="hev__title"></span><span class="hev__sub"></span></span>
+        ${homeIcon('chevron', 'hrow__chev')}
+      </a>
+    `);
+    $('.hev__when b', row).textContent = it.top;
+    $('.hev__when small', row).textContent = it.bottom;
+    $('.hev__title', row).textContent = it.title;
+    $('.hev__sub', row).textContent = it.sub;
+    row.setAttribute('aria-label', `${it.sub}: ${it.title}, ${[it.bottom, it.top].filter(Boolean).join(' ')}. Открыть`);
+    list.appendChild(row);
+  });
   sec.appendChild(list);
   return sec;
 }

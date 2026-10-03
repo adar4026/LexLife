@@ -6,13 +6,14 @@
      показателя, порядок и лимит;
    • «Ближайшее»: одно предстоящее лекарство по его расписанию и отметке «принял сегодня»;
    • «Последняя активность»: самый поздний из анализа, измерения и прошедшего визита.
+   • hero: вода относительно плана дня; лекарства на сегодня; ближайший визит.
    Без браузера. Только синтетические данные.
 
    Запуск:  node tests/home-summary.test.mjs
    ========================================================= */
 
 import assert from 'node:assert/strict';
-import { waterProgress, attentionItems, recentActivity, upcomingMed, nextDose } from '../js/services/homeSummary.js';
+import { waterProgress, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed, nextDose } from '../js/services/homeSummary.js';
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -233,6 +234,58 @@ test('активность: равная дата (времени у запис�
 test('активность: нет данных — null (секция скрывается)', () => {
   assert.equal(recentActivity({ today: TODAY }), null);
   assert.equal(recentActivity({ tests: [], metricsLog: {}, visits: [{ id: 'p', date: '2026-03-01', status: 'planned' }], today: TODAY }), null);
+});
+
+/* ================= hero: план дня, лекарства на сегодня, ближайший визит ================= */
+
+test('hero: вода по плану, отставание, цель выполнена, цели нет', () => {
+  assert.deepEqual(waterDayStatus(1200, 2600, 1100), { state: 'onTrack', behind: 0, over: 0 });
+  assert.deepEqual(waterDayStatus(1200, 2600, 1200), { state: 'onTrack', behind: 0, over: 0 });
+  assert.deepEqual(waterDayStatus(900, 2600, 1250), { state: 'behind', behind: 350, over: 0 });
+  assert.deepEqual(waterDayStatus(2900, 2600, 2600), { state: 'done', behind: 0, over: 300 });
+  assert.deepEqual(waterDayStatus(500, 0, 0), { state: 'none', behind: 0, over: 0 });
+});
+
+test('hero: план до подъёма (0) и мусор — «по плану», отставание не больше цели', () => {
+  assert.equal(waterDayStatus(0, 2600, 0).state, 'onTrack');
+  assert.equal(waterDayStatus(0, 2600, undefined).state, 'onTrack');
+  assert.equal(waterDayStatus(NaN, 2600, -50).state, 'onTrack');
+  assert.equal(waterDayStatus(100, 2600, 99999).behind, 2500);
+});
+
+test('лекарства на сегодня: активные, отмеченные — по имени; неактивные и закончившиеся не считаются', () => {
+  const list = [
+    med({ name: 'A', reminder_time: '08:00' }),
+    med({ name: 'B' }), // без расписания — отмечается ежедневно
+    med({ name: 'C', active: false }),
+    med({ name: 'D', reminder_time: '21:00', end: '2026-02-13' }),
+    med({ name: 'E', start: '2026-02-20' }),
+  ];
+  assert.deepEqual(medsToday(list, { today: '2026-02-14', takenToday: ['A', 'C'] }), { due: 2, taken: 1 });
+  assert.deepEqual(medsToday(list, { today: '2026-02-14', takenToday: ['A', 'B'] }), { due: 2, taken: 2 });
+  assert.deepEqual(medsToday([], { today: '2026-02-14' }), { due: 0, taken: 0 });
+  assert.deepEqual(medsToday(null), { due: 0, taken: 0 });
+});
+
+test('лекарства на сегодня: курс «раз в N дней» — только в день дозы', () => {
+  const c = med({ name: 'Курс', every_days: 7, start: '2026-02-07' });
+  assert.deepEqual(medsToday([c], { today: '2026-02-14' }), { due: 1, taken: 0 });
+  assert.deepEqual(medsToday([c], { today: '2026-02-15' }), { due: 0, taken: 0 });
+  assert.deepEqual(medsToday([c], { today: '2026-02-14', takenToday: ['Курс'] }), { due: 1, taken: 1 });
+});
+
+test('ближайший визит: запланированный или «следующий визит», не в прошлом, самый ранний', () => {
+  const visits = [
+    { id: 'v1', date: '2026-01-10', status: 'done', specialty: 'Кардиолог', doctor: 'Петров', nextDate: '2026-03-01' },
+    { id: 'v2', date: '2026-02-20', status: 'planned', specialty: 'Терапевт' },
+    { id: 'v3', date: '2026-02-01', status: 'planned', specialty: 'Окулист' }, // в прошлом
+  ];
+  assert.deepEqual(upcomingVisit(visits, '2026-02-14'), { visitId: 'v2', date: '2026-02-20', title: 'Терапевт', next: false });
+  assert.deepEqual(upcomingVisit(visits, '2026-02-21'), { visitId: 'v1', date: '2026-03-01', title: 'Кардиолог · Петров', next: true });
+  assert.equal(upcomingVisit(visits, '2026-03-02'), null);
+  assert.equal(upcomingVisit([{ id: 'v', date: '2026-02-14', status: 'done' }], '2026-02-14'), null);
+  assert.equal(upcomingVisit([{ id: 'v', date: '2026-02-14', status: 'planned' }], '2026-02-14').title, 'Визит к врачу');
+  assert.equal(upcomingVisit(null, '2026-02-14'), null);
 });
 
 /* ---------- запуск ---------- */
