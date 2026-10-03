@@ -4,9 +4,11 @@
    сетевым фолбэком. Шрифты Google кэшируются на лету,
    чтобы тёмная типографика работала офлайн.
    Меняйте CACHE_VERSION при обновлении ассетов.
+   Сборка для Cloudflare (scripts/build-assets.mjs) дописывает к нему
+   короткий commit: каждый deploy main = новый sw.js = обновление кэша.
    ========================================================= */
 
-const CACHE_VERSION = 'lexlife-v35';
+const CACHE_VERSION = 'lexlife-v36';
 const FONT_CACHE = 'lexlife-fonts-v1';
 /* Журнал показанных срабатываний (push/локально) — общий со страницей (js/services/occurrenceStore.js) */
 const OCC_CACHE = 'lexlife-occ-v1';
@@ -35,6 +37,7 @@ const APP_SHELL = [
   './js/vendor/pdfjs/pdf.min.js',
   './js/vendor/pdfjs/pdf.worker.min.js',
   './manifest.json',
+  './build-info.json',
   './icons/lexlife-icon-192.png',
 ];
 

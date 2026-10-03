@@ -13,6 +13,7 @@ const run = [
   ['push-worker.test.mjs', 'Asia/Tokyo'],
   ['push-client.test.mjs', 'Europe/Madrid'],
   ['push-client.test.mjs', 'America/New_York'],
+  ['build-assets.test.mjs'], // последним: пересобирает dist/
 ];
 let bad = 0;
 for (const [file, tz] of run) {

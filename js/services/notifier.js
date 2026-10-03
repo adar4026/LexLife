@@ -75,7 +75,7 @@ export const waterRulePatch = (hyd) => ({
 
 /* Реальное состояние системы уведомлений → тексты для экрана.
    env: { supported, permission, standalone, ios, swActive, pushSupported, subscribed,
-          background?: { backend: 'ok'|'error'|'absent'|'offline', enabled, subscription: 'active'|'none'|'lost',
+          background?: { backend: 'ok'|'error'|'absent'|'offline'|'legacy', primaryHost?, enabled, subscription: 'active'|'none'|'lost',
                          syncError, pending, lastSyncAt, lastPushAt } }
    level: 'ok' | 'warn' | 'bad'. Никогда не обещает доставку, которой нет. */
 const fmtStamp = (iso) => {
@@ -94,7 +94,10 @@ export function describeNotifyState(env) {
   const active = backgroundActive(bg);
   const items = [];
   let status;
-  if (!env.supported) {
+  const legacy = !!(bg && bg.backend === 'legacy');
+  if (legacy) {
+    status = { level: 'warn', title: 'Резервная версия LexLife', detail: `Фоновые уведомления работают только в основной версии${bg.primaryHost ? ` (${bg.primaryHost})` : ''}. Здесь напоминания проверяются, только пока это приложение открыто, и могут повторить уведомления основной версии.` };
+  } else if (!env.supported) {
     status = env.ios && !env.standalone
       ? { level: 'bad', title: 'В Safari уведомления недоступны', detail: 'На iPhone уведомления работают только в установленном приложении: Поделиться → «На экран „Домой“», затем открывайте LexLife с иконки.' }
       : { level: 'bad', title: 'PWA не поддерживает системные уведомления в данном режиме', detail: env.ios ? 'Нужна iOS 16.4 или новее и запуск LexLife с экрана «Домой».' : 'Этот браузер не поддерживает Notification API.' };
@@ -120,7 +123,7 @@ export function describeNotifyState(env) {
   items.push({ label: 'Системное разрешение', value: perm });
   items.push({ label: 'Service Worker', value: env.swActive ? 'активен' : 'не активен' });
   items.push({ label: 'Push-подписка', value: !env.pushSupported ? 'не поддерживается' : env.subscribed ? 'активна' : 'отсутствует' });
-  const backend = !bg ? 'не проверен' : bg.backend === 'ok' ? 'доступен' : bg.backend === 'absent' ? 'нет на этом адресе' : bg.backend === 'offline' ? 'нет сети' : 'ошибка';
+  const backend = !bg ? 'не проверен' : bg.backend === 'ok' ? 'доступен' : bg.backend === 'absent' ? 'нет на этом адресе' : bg.backend === 'legacy' ? 'не используется (резервная версия)' : bg.backend === 'offline' ? 'нет сети' : 'ошибка';
   items.push({ label: 'Сервер уведомлений', value: backend });
   items.push({ label: 'Фоновая доставка', value: active ? 'активна' : 'неактивна' });
   if (bg && bg.enabled) {
@@ -129,7 +132,9 @@ export function describeNotifyState(env) {
   }
   const limit = active
     ? 'Пока LexLife открыт, приложение подстраховывает: если серверный push не пришёл в течение 2 минут, напоминание покажется локально (не дважды).'
-    : bg && bg.backend === 'absent'
+    : legacy
+      ? 'Это резервная копия на старом адресе: сервер уведомлений здесь не используется, данные не синхронизируются с основной версией.'
+      : bg && bg.backend === 'absent'
       ? 'По этому адресу фоновые уведомления не работают: напоминания проверяются самим приложением и приходят, только пока LexLife открыт на экране.'
       : 'Без фоновой доставки напоминания проверяются самим приложением: когда LexLife свёрнут, экран заблокирован или приложение закрыто, iPhone останавливает его код — напоминание не придёт (если открыть приложение в течение 10 минут после назначенного времени, оно покажется с опозданием).';
   return { status, items, limit, active };

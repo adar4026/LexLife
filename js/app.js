@@ -19,7 +19,7 @@ import { nextFire } from './services/notifySchedule.js';
 import { createNotifier, describeNotifyState, armPatch, waterRulePatch, NOTIF_ROUTES, isSafeRoute } from './services/notifier.js';
 import { createPushClient, SYNC_FAIL_TEXT, SERVER_FALLBACK_MS } from './services/pushClient.js';
 import { createOccurrenceStore } from './services/occurrenceStore.js';
-import { NEW_HOME_URL, migrationMode } from './services/deployment.js';
+import { NEW_HOME_URL, PRIMARY_URL, migrationMode, deploymentRole, serverPushAllowed } from './services/deployment.js';
 
 /* Документы анализов: файлы в IndexedDB (только на этом устройстве), метаданные — в health_tests */
 const Attachments = new AttachmentService(Storage, new IdbAttachmentStore());
@@ -135,6 +135,7 @@ async function HomeScreen() {
     </header>
   `)
   );
+  if (deploymentRole() === 'legacy') screen.appendChild(legacyNotice());
 
   /* Сегодня — 4 краткие карточки показателей (тап → модуль) */
   const sec = el('<section class="section" style="margin-top:14px"><div class="section__head"><h2 class="section__title">Сегодня</h2><button class="section__action" data-route="metrics">Все</button></div><div class="mcard-grid"></div></section>');
@@ -2129,11 +2130,36 @@ async function SettingsScreen() {
       <h2 class="group-label">О приложении</h2>
       <div class="list-card">
         <div class="row"><div class="row__body"><p class="row__title">Версия приложения</p></div><span class="row__trailing">${esc(APP_VERSION)}</span></div>
+        ${aboutBuildRows(await readBuildInfo())}
       </div>
     </section>
   `));
   screen.appendChild(appFooter());
   return screen;
+}
+
+/* Сборка: build-info.json (Cloudflare — commit и время сборки; в репозитории/GitHub Pages — без них) */
+async function readBuildInfo() {
+  try { const r = await fetch('build-info.json'); return r.ok ? await r.json() : null; } catch { return null; }
+}
+const ROLE_LABEL = { primary: 'основной', legacy: 'резервный (GitHub Pages)', dev: 'локальная разработка', other: 'другой адрес' };
+function aboutBuildRows(info) {
+  const row = (t, v) => `<div class="row"><div class="row__body"><p class="row__title">${t}</p></div><span class="row__trailing">${esc(v)}</span></div>`;
+  const sha = info && typeof info.sha === 'string' && /^[0-9a-f]{7,40}$/.test(info.sha) ? info.sha.slice(0, 7) : null;
+  const at = info && info.builtAt && !Number.isNaN(Date.parse(info.builtAt))
+    ? new Date(info.builtAt).toLocaleString('ru-RU', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
+  return row('Сборка', sha ? `build ${sha}${info.dirty ? '+' : ''}${at ? ` · ${at}` : ''}` : 'без номера сборки') + row('Адрес', ROLE_LABEL[deploymentRole()]);
+}
+
+/* Резервная копия на GitHub Pages: предупреждение без редиректа (данные этой копии остаются здесь) */
+function legacyNotice() {
+  const host = new URL(PRIMARY_URL).host;
+  return el(`
+    <section class="notif-status notif-status--warn" role="note" style="margin-top:12px">
+      <div class="notif-status__head"><span class="notif-status__dot"></span><span class="notif-status__title">Резервная версия LexLife</span></div>
+      <p class="notif-status__detail">Основная версия: <b>${esc(host)}</b>. Данные этой копии с ней не синхронизируются, фоновые уведомления здесь отключены.</p>
+      <div class="notif-status__actions"><a class="doc-btn" href="${esc(PRIMARY_URL)}" target="_blank" rel="noopener">Открыть основную версию</a></div>
+    </section>`);
 }
 
 /* Footer с версией (Настройки, Drawer): номер — из APP_VERSION, дата релиза — из APP_UPDATED */
@@ -2425,6 +2451,7 @@ const pushClient = createPushClient({
   timeZone: () => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
   pushManager: async () => { const reg = await readyRegistration(); return reg && 'pushManager' in reg ? reg.pushManager : null; },
   permission: notifyPermission,
+  serverAllowed: serverPushAllowed(), // GitHub Pages (резерв): без /api, подписок и правил на сервере
 });
 const occurrences = 'caches' in window ? createOccurrenceStore({ base: document.baseURI }) : null;
 
@@ -2460,7 +2487,10 @@ async function readNotifyEnv({ server = true } = {}) {
   try { subscribed = !!(reg && reg.pushManager && await reg.pushManager.getSubscription()); } catch { subscribed = false; }
   const st = pushClient.state();
   const background = { backend: 'error', enabled: !!st.enabled, subscription: st.subscription || 'none', syncError: !!st.lastError, pending: await pushClient.pendingSync(), lastSyncAt: st.syncedAt || null, lastPushAt: null };
-  if (server) {
+  if (!pushClient.serverAllowed) {
+    background.backend = 'legacy';
+    background.primaryHost = new URL(PRIMARY_URL).host;
+  } else if (server) {
     const cfg = await pushClient.config();
     background.backend = cfg.available ? 'ok' : cfg.offline ? 'offline' : 'absent';
     if (cfg.available && st.enabled) {
@@ -2525,7 +2555,7 @@ async function NotificationsScreen() {
     const hhmm = () => new Date().toTimeString().slice(0, 5);
     const ENABLE_ERR = {
       permission: 'Нет разрешения на уведомления.', offline: 'Нет сети — попробуйте позже.',
-      backend_unavailable: 'Сервер уведомлений недоступен по этому адресу.', push_unsupported: 'Push не поддерживается: откройте LexLife с экрана «Домой».',
+      backend_unavailable: 'Сервер уведомлений недоступен по этому адресу.', legacy: 'Это резервная версия: фоновые уведомления — только в основной.', push_unsupported: 'Push не поддерживается: откройте LexLife с экрана «Домой».',
       register_failed: 'Сервер не зарегистрировал устройство.', subscribe_failed: 'iPhone не выдал push-подписку.',
       server: 'Сервер не принял подписку.', sync_failed: SYNC_FAIL_TEXT,
     };
@@ -3468,8 +3498,9 @@ async function buildDrawer() {
   const scroller = el('<div class="drawer-scroll"></div>');
   drawer.appendChild(scroller);
   const mode = migrationMode();
-  const sections = mode
-    ? [[{ route: 'move', icon: '🚚', title: mode === 'export' ? 'Перенести LexLife на новый адрес' : 'Перенос из старой версии' }], ...DRAWER_SECTIONS]
+  /* Пункт переноса — только в резервной копии; на основном адресе перенос уже выполнен (#/move остаётся доступен) */
+  const sections = mode === 'export'
+    ? [[{ route: 'move', icon: '🚚', title: 'Перенести LexLife на новый адрес' }], ...DRAWER_SECTIONS]
     : DRAWER_SECTIONS;
   sections.forEach((items) => {
     const sec = el('<div class="drawer-sec"></div>');

@@ -2,6 +2,7 @@
    worker/api.js — HTTP API фоновых уведомлений (тот же origin,
    что и приложение: CORS не нужен и не разрешается).
 
+   GET  /api/status                 — здоровье: D1, VAPID настроен, сборка (без авторизации)
    GET  /api/config                 — публичный VAPID-ключ (без авторизации)
    POST /api/device/register        — новое устройство → токен (один раз)
    POST /api/push/subscribe         — PushSubscription текущего устройства
@@ -207,9 +208,27 @@ async function testPush(request, env, device, { now, fetchImpl }) {
   return fail(502, 'push_failed', { kind: r.kind, status: r.status });
 }
 
+/* Здоровье сервиса для release-checklist и мониторинга. Без авторизации:
+   только «работает / не работает» и номер сборки — ни устройств, ни ключей, ни счётчиков. */
+async function health(request, env, { now }) {
+  let db = 'error';
+  try { const r = await env.DB.prepare('SELECT 1 AS ok').first(); if (r && r.ok === 1) db = 'ok'; } catch { db = 'error'; }
+  let build = null;
+  try {
+    if (env.ASSETS) {
+      const r = await env.ASSETS.fetch(new Request(new URL('/build-info.json', request.url)));
+      if (r.ok) { const b = await r.json(); build = { version: b.version ?? null, sha: b.sha ?? null, builtAt: b.builtAt ?? null, cache: b.cache ?? null }; }
+    }
+  } catch { build = null; }
+  const push = env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY && env.VAPID_SUBJECT ? 'configured' : 'not_configured';
+  const ok = db === 'ok' && push === 'configured';
+  return json(ok ? 200 : 503, { status: ok ? 'ok' : 'degraded', api: 1, db, push, build, time: new Date(now).toISOString() });
+}
+
 /* ---------- маршрутизация ---------- */
 
 const ROUTES = {
+  'GET /api/status': { auth: false, fn: (req, env, dev, opts) => health(req, env, opts) },
   'GET /api/config': { auth: false, fn: (req, env) => json(200, { vapidPublicKey: env.VAPID_PUBLIC_KEY || null, api: 1 }) },
   'POST /api/device/register': { auth: false, fn: (req, env, dev, opts) => register(req, env, opts) },
   'POST /api/push/subscribe': { auth: true, fn: subscribe },

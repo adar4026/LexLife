@@ -23,7 +23,8 @@ import { generateVapidKeys } from '../worker/webpush.js';
 import { createD1 } from './helpers/d1.mjs';
 import { createPushServer, decrypt } from './helpers/pushService.mjs';
 import { createFakeCaches, createFakePushManager, loadServiceWorker } from './helpers/fakeBrowser.mjs';
-import { migrationMode, isLegacyPages, NEW_HOME_URL } from '../js/services/deployment.js';
+import { migrationMode, isLegacyPages, NEW_HOME_URL, PRIMARY_URL, deploymentRole, serverPushAllowed } from '../js/services/deployment.js';
+import { describeNotifyState } from '../js/services/notifier.js';
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -47,7 +48,7 @@ function createServer() {
 }
 
 /* Устройство: localStorage + StorageService + PushManager + сеть (online/offline) */
-async function createDevice(server, { pages = false } = {}) {
+async function createDevice(server, { pages = false, serverAllowed = true } = {}) {
   const kv = memKv();
   const storage = new StorageService(new MemoryDriver());
   storage.noDemoData = true;
@@ -65,7 +66,7 @@ async function createDevice(server, { pages = false } = {}) {
   const client = createPushClient({
     kv, fetchImpl, apiBase: new URL(pages ? 'https://adar4026.github.io/LexLife/api/' : 'https://lexlife.test/api/'),
     getRules: () => storage.getNotifications(), timeZone: () => TZ,
-    pushManager: async () => pm, permission: () => perm.value, now: () => server.clock,
+    pushManager: async () => pm, permission: () => perm.value, now: () => server.clock, serverAllowed,
   });
   return { kv, storage, pm, calls, current, net, client, perm };
 }
@@ -349,16 +350,61 @@ test('тестовый push с клиента: проходит через Worke
   assert.equal(st.data.subscription, 'active'); assert.ok(st.data.lastPushAt);
 });
 
-test('перенос: экран скрыт, пока новый адрес не задан; export на GitHub Pages, import на новом origin', () => {
-  assert.equal(NEW_HOME_URL, null, 'адрес production задаётся только после проверки');
+test('перенос: export на GitHub Pages, import на основном origin, иначе скрыт', () => {
+  assert.equal(NEW_HOME_URL, PRIMARY_URL);
   const pages = new URL('https://adar4026.github.io/LexLife/#/home');
   const cf = new URL('https://lexlife.example.workers.dev/#/home');
   assert.equal(isLegacyPages(pages), true); assert.equal(isLegacyPages(cf), false);
-  assert.equal(migrationMode(pages), null);
+  assert.equal(migrationMode(pages), 'export');
+  assert.equal(migrationMode(pages, null), null);
   assert.equal(migrationMode(pages, cf.origin + '/'), 'export');
   assert.equal(migrationMode(cf, cf.origin + '/'), 'import');
   assert.equal(migrationMode(new URL('http://localhost:4173/'), cf.origin + '/'), null);
   assert.equal(migrationMode(cf, 'not a url'), null);
+});
+
+test('роль адреса: основной / резервный / dev / другой; серверный push только на основном и dev', () => {
+  const at = (u) => new URL(u);
+  assert.equal(deploymentRole(at('https://lexlife.alexus4026.workers.dev/#/home')), 'primary');
+  assert.equal(deploymentRole(at('https://adar4026.github.io/LexLife/')), 'legacy');
+  assert.equal(deploymentRole(at('http://127.0.0.1:8787/')), 'dev');
+  assert.equal(deploymentRole(at('http://localhost:4173/')), 'dev');
+  assert.equal(deploymentRole(at('https://abc123-lexlife.alexus4026.workers.dev/')), 'other', 'preview-версия Worker — не основной адрес');
+  assert.equal(deploymentRole(null), 'other');
+  assert.equal(serverPushAllowed(at('https://lexlife.alexus4026.workers.dev/')), true);
+  assert.equal(serverPushAllowed(at('http://127.0.0.1:8787/')), true);
+  assert.equal(serverPushAllowed(at('https://adar4026.github.io/LexLife/')), false);
+  assert.equal(serverPushAllowed(at('https://evil.example/')), false);
+});
+
+test('резервная копия (GitHub Pages): ни одного запроса к /api, устройство не создаётся, правила не уходят', async () => {
+  const server = createServer(); const dev = await createDevice(server, { pages: true, serverAllowed: false });
+  assert.equal(dev.client.serverAllowed, false);
+  const cfg = await dev.client.config();
+  assert.equal(cfg.available, false); assert.equal(cfg.legacy, true); assert.equal(cfg.offline, false);
+  assert.deepEqual(await dev.client.enable(), { ok: false, error: 'legacy' });
+  assert.equal(await dev.client.ensureDevice(), false);
+  for (let i = 0; i < 5; i++) assert.equal((await dev.client.sync({ force: true })).skipped, true); // нет retry-цикла
+  assert.deepEqual(await dev.client.checkSubscription(), { state: 'off' });
+  assert.equal(await dev.client.pendingSync(), false);
+  assert.equal(await dev.client.isServerPrimary(), false);
+  assert.equal((await dev.client.status()).ok, false);
+  assert.equal((await dev.client.testPush()).ok, false);
+  await dev.client.disable();
+  assert.deepEqual(server.requests, [], 'нет сетевых запросов');
+  assert.equal(dev.calls.subscribe.length, 0, 'push-подписка не создавалась');
+  assert.equal(dev.kv.get(PUSH_KV.deviceId), null); assert.equal(dev.kv.get(PUSH_KV.token), null);
+  assert.equal(server.db.q('SELECT COUNT(*) n FROM devices')[0].n, 0);
+});
+
+test('экран уведомлений на резервной копии: «Резервная версия», сервер не используется, ссылка на основной адрес', () => {
+  const env = { supported: true, permission: 'granted', ios: true, standalone: true, swActive: true, pushSupported: true, subscribed: false,
+    background: { backend: 'legacy', primaryHost: 'lexlife.alexus4026.workers.dev', enabled: false, subscription: 'none' } };
+  const d = describeNotifyState(env);
+  assert.equal(d.status.title, 'Резервная версия LexLife'); assert.equal(d.status.level, 'warn');
+  assert.match(d.status.detail, /lexlife\.alexus4026\.workers\.dev/);
+  assert.equal(d.items.find((i) => i.label === 'Сервер уведомлений').value, 'не используется (резервная версия)');
+  assert.equal(d.active, false); assert.match(d.limit, /резервная копия/);
 });
 
 let passed = 0; let failed = 0;

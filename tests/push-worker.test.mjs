@@ -488,6 +488,24 @@ test('Worker fetch: /index.html без редиректа, security headers, /ap
   assert.ok(!(await get('/api/config')).headers.get('Access-Control-Allow-Origin'), 'CORS не открыт');
 });
 
+test('GET /api/status: D1 и VAPID → ok + сборка; без VAPID → 503; без деталей устройств и ключей', async () => {
+  const s = await setup();
+  const info = { app: 'lexlife', version: '1.0.0', sha: 'a'.repeat(40), builtAt: '2031-03-10T07:00:00.000Z', cache: 'lexlife-v36-aaaaaaa' };
+  s.env.ASSETS = { fetch: async (req) => (new URL(req.url).pathname === '/build-info.json' ? Response.json(info) : new Response('nf', { status: 404 })) };
+  await s.subscribed();
+  const r = await s.call('GET', '/api/status');
+  assert.equal(r.status, 200);
+  assert.deepEqual({ ...r.data, time: undefined }, { status: 'ok', api: 1, db: 'ok', push: 'configured', build: { version: '1.0.0', sha: 'a'.repeat(40), builtAt: info.builtAt, cache: info.cache }, time: undefined });
+  assert.equal(r.headers.get('Cache-Control'), 'no-store');
+  const raw = JSON.stringify(r.data);
+  assert.ok(!/web\.push|endpoint|p256dh|token|BEGIN|mailto/i.test(raw), 'ничего лишнего');
+  const noVapid = await handleApi(new Request('https://lexlife.test/api/status'), { ...s.env, VAPID_PRIVATE_KEY: '' }, { now: Date.now() });
+  assert.equal(noVapid.status, 503); assert.equal((await noVapid.json()).push, 'not_configured');
+  const brokenDb = await handleApi(new Request('https://lexlife.test/api/status'), { ...s.env, DB: { prepare() { throw new Error('d1 down'); } } }, { now: Date.now() });
+  assert.equal(brokenDb.status, 503); assert.equal((await brokenDb.json()).db, 'error');
+  assert.equal((await s.call('POST', '/api/status', { body: {} })).status, 405);
+});
+
 let passed = 0; let failed = 0;
 for (const t of tests) {
   try { await t.fn(); passed++; console.log(`  ok — ${t.name}`); } catch (err) { failed++; console.log(`  FAIL — ${t.name}\n    ${err && err.stack}`); }

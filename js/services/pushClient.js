@@ -66,9 +66,11 @@ async function hashText(text) {
    timeZone      () → 'Europe/Madrid'
    pushManager   async () → PushManager | null
    permission    () → 'granted' | 'denied' | 'default' | 'unsupported'
+   serverAllowed false — резервная копия (GitHub Pages): ни одного запроса к /api,
+                 устройство не регистрируется, подписка и правила на сервер не уходят
    now, randomUUID — для тестов */
 export function createPushClient({
-  kv, fetchImpl, apiBase, getRules, timeZone, pushManager, permission,
+  kv, fetchImpl, apiBase, getRules, timeZone, pushManager, permission, serverAllowed = true,
   now = () => Date.now(), randomUUID = () => crypto.randomUUID(),
 }) {
   const readState = () => {
@@ -81,6 +83,7 @@ export function createPushClient({
   };
 
   async function api(method, path, body, { auth = true } = {}) {
+    if (!serverAllowed) return { ok: false, status: 0, data: { error: 'not_primary' }, legacy: true };
     const headers = { Accept: 'application/json' };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     if (auth) {
@@ -102,6 +105,7 @@ export function createPushClient({
   let configPromise = null;
   /* { available, vapidPublicKey }. На GitHub Pages /api нет → available: false */
   function config() {
+    if (!serverAllowed) return Promise.resolve({ available: false, vapidPublicKey: null, offline: false, legacy: true });
     if (!configPromise) {
       configPromise = api('GET', 'config', undefined, { auth: false }).then((r) => {
         const ok = r.ok && r.data && typeof r.data.vapidPublicKey === 'string' && r.data.vapidPublicKey.length > 80;
@@ -115,6 +119,7 @@ export function createPushClient({
   /* device_id генерируется на устройстве один раз; сервер выдаёт токен.
      Если id занят (409) — новый случайный id (старый токен утерян). */
   async function ensureDevice() {
+    if (!serverAllowed) return false;
     if (creds()) return true;
     let id = kv.get(PUSH_KV.deviceId) || randomUUID();
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -142,6 +147,7 @@ export function createPushClient({
 
   /* Включить фоновые уведомления. Разрешение на уведомления запрашивает вызывающий код. */
   async function enable() {
+    if (!serverAllowed) return { ok: false, error: 'legacy' };
     if (permission() !== 'granted') return { ok: false, error: 'permission' };
     const cfg = await config();
     if (!cfg.available) return { ok: false, error: cfg.offline ? 'offline' : 'backend_unavailable' };
@@ -178,6 +184,7 @@ export function createPushClient({
   }
 
   async function syncOnce(force) {
+    if (!serverAllowed) return { ok: true, skipped: true };
     const st = readState();
     if (st.pendingUnsubscribe) { // отключение, не дошедшее до сервера offline
       const r = await api('POST', 'push/unsubscribe', {});
@@ -220,6 +227,7 @@ export function createPushClient({
 
   /* При запуске: подписка на месте и та же, что знает сервер? */
   async function checkSubscription() {
+    if (!serverAllowed) return { state: 'off' };
     const st = readState();
     if (!st.enabled) return { state: 'off' };
     let sub = null;
@@ -240,17 +248,19 @@ export function createPushClient({
   }
 
   const pendingSync = async () => {
+    if (!serverAllowed) return false;
     const st = readState();
     return !!st.enabled && JSON.stringify(syncSnapshot(await getRules(), timeZone())) !== st.syncedHash;
   };
   /* Push — основной канал: включён, подписка активна, правила на сервере актуальны */
   async function isServerPrimary() {
+    if (!serverAllowed) return false;
     const st = readState();
     return !!st.enabled && st.subscription === 'active' && !(await pendingSync());
   }
 
   return {
-    config, ensureDevice, enable, disable, sync, checkSubscription, pendingSync, isServerPrimary,
+    serverAllowed, config, ensureDevice, enable, disable, sync, checkSubscription, pendingSync, isServerPrimary,
     state: readState,
     status: () => api('GET', 'push/status'),
     testPush: () => api('POST', 'notifications/test', {}),

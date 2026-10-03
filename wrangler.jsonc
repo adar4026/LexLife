@@ -7,6 +7,8 @@
   "main": "worker/index.js",
   "compatibility_date": "2026-09-30",
   "workers_dev": true,
+  /* Preview-адреса версий отключены: они работали бы с той же production D1 */
+  "preview_urls": false,
 
   /* PWA из dist/ (npm run build: allowlist файлов приложения).
      run_worker_first — Worker видит каждый запрос: /api/*, /index.html без редиректа,
