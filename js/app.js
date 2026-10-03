@@ -16,7 +16,7 @@ import { parsePreparedTest, importPreparedTest, PreparedImportError } from './se
 import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
 import { openDocViewer as showDocViewer } from './ui/docViewer.js';
 import { setActiveTab, initBottomNav } from './ui/bottomNav.js';
-import { waterProgress, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed, nextDose } from './services/homeSummary.js';
+import { HOME_WATER_QUICK_ADD, waterProgress, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed, nextDose } from './services/homeSummary.js';
 import { nextFire } from './services/notifySchedule.js';
 import { createNotifier, describeNotifyState, armPatch, waterRulePatch, NOTIF_ROUTES, isSafeRoute } from './services/notifier.js';
 import { createPushClient, SYNC_FAIL_TEXT, SERVER_FALLBACK_MS } from './services/pushClient.js';
@@ -112,7 +112,7 @@ function metricCard(key, latest) {
    Данные — только из Storage; расчёты — js/services/homeSummary.js.
    ========================================================= */
 const HOME_QUICK_METRICS = ['pressure', 'pulse', 'weight']; // ячейки после «Лекарств»
-const HOME_WATER_ADD = 250; // мл — та же запись, что и быстрый ввод модуля воды (Storage.addWaterEntry)
+const HOME_WATER_ADD = HOME_WATER_QUICK_ADD; // мл — кнопка hero «+ 300 мл», запись через Storage.addWaterEntry
 let homeEntered = false;
 
 /* Линейные иконки одного семейства с таб-баром (24×24, обводка currentColor) */
@@ -194,11 +194,11 @@ function renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, metric
         <div class="hh__bar" role="progressbar" aria-label="Вода: выпито от цели" aria-valuemin="0" aria-valuemax="100"><span class="hh__fill"></span></div>
         <p class="hh__meta"><span class="hh__pct"></span><span class="hh__status" aria-live="polite"></span></p>
       </div>
-      <div class="hm-grid"></div>
       <div class="hh__cta">
         <a class="hh-btn hh-btn--soft" href="#/metric/water" aria-label="Подробнее о воде: план дня и журнал">Подробнее</a>
         <button class="hh-btn hh-btn--accent" type="button" aria-label="Добавить ${HOME_WATER_ADD} мл воды">${homeIcon('plus')}${HOME_WATER_ADD} мл</button>
       </div>
+      <div class="hm-grid"></div>
     </section>
   `);
   if (deploymentRole() === 'legacy') $('.hh__head', hero).after(legacyNotice());

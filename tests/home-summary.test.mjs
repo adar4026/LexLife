@@ -13,7 +13,7 @@
    ========================================================= */
 
 import assert from 'node:assert/strict';
-import { waterProgress, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed, nextDose } from '../js/services/homeSummary.js';
+import { HOME_WATER_QUICK_ADD, waterProgress, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed, nextDose } from '../js/services/homeSummary.js';
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -286,6 +286,10 @@ test('ближайший визит: запланированный или «с�
   assert.equal(upcomingVisit([{ id: 'v', date: '2026-02-14', status: 'done' }], '2026-02-14'), null);
   assert.equal(upcomingVisit([{ id: 'v', date: '2026-02-14', status: 'planned' }], '2026-02-14').title, 'Визит к врачу');
   assert.equal(upcomingVisit(null, '2026-02-14'), null);
+});
+
+test('hero: быстрое действие «+ N мл» добавляет 300 мл', () => {
+  assert.equal(HOME_WATER_QUICK_ADD, 300);
 });
 
 /* ---------- запуск ---------- */

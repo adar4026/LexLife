@@ -34,6 +34,9 @@ export function waterProgress(current, goal) {
   };
 }
 
+/* Быстрое действие hero «+ N мл»: одна запись воды этим объёмом (Storage.addWaterEntry) */
+export const HOME_WATER_QUICK_ADD = 300;
+
 /* Состояние дня по воде относительно плана гидратации — та же оценка, что на экране «Вода»
    (выпито − план к текущему моменту < 0 → «отстаёте»). plannedMl считает app.js (plannedByNow).
    → { state: 'none' (цели нет) | 'done' | 'onTrack' | 'behind', behind (мл, ≥ 0), over (мл сверх цели) } */

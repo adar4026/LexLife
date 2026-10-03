@@ -1478,11 +1478,11 @@ textarea.input { resize: vertical; font-family: inherit; }
   --hm-track: rgba(21, 55, 91, 0.09);
   --hm-fill: linear-gradient(90deg, #167a8b, #7fd7d0);
   --hm-line: rgba(21, 55, 91, 0.09);
-  --hm-soft: rgba(255, 255, 255, 0.62);
-  --hm-soft-border: rgba(21, 55, 91, 0.07);
+  --hm-soft: rgba(255, 255, 255, 0.72);
+  --hm-soft-border: rgba(21, 55, 91, 0.08);
   --hm-cta-bg: linear-gradient(135deg, #15707f, #1a8c9b);
   --hm-cta-text: #fff;
-  --hm-cta-shadow: 0 6px 16px -10px rgba(22, 122, 139, 0.7);
+  --hm-cta-shadow: 0 2px 6px -4px rgba(22, 122, 139, 0.45);
   --hm-surface: rgba(255, 255, 255, 0.74);
   --hm-warn: #b7791f;
   --hm-amb-top: #ddf4f7;
@@ -1705,7 +1705,7 @@ body:has(.home) { background: var(--hm-bg); }
 .hm-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  margin: 26px -4px 0;
+  margin: 18px -4px 0;
 }
 .hm {
   position: relative;
@@ -1755,22 +1755,22 @@ body:has(.home) { background: var(--hm-bg); }
 .hm__unit { margin-left: 4px; font-size: 14px; font-weight: 600; letter-spacing: 0; color: var(--hm-muted); }
 .hm__when { margin-top: 2px; font-size: 13px; color: var(--hm-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-/* ---------- действия ---------- */
-.hh__cta { display: flex; gap: 10px; margin-top: 22px; }
+/* ---------- действия: сразу под статусом, лёгкие pill-кнопки (46px), «+ 300 мл» чуть шире ---------- */
+.hh__cta { display: flex; gap: 10px; max-width: 336px; margin-top: 18px; }
 .hh-btn {
   flex: 1 1 0;
   min-width: 0;
-  min-height: 50px;
+  min-height: 46px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 4px;
-  padding: 0 18px;
+  padding: 0 14px;
   border: 1px solid transparent;
   border-radius: 999px;
   font-family: inherit;
   font-size: 16px;
-  font-weight: 700;
+  font-weight: 600;
   text-decoration: none;
   white-space: nowrap;
   cursor: pointer;
@@ -1783,7 +1783,7 @@ body:has(.home) { background: var(--hm-bg); }
   -webkit-backdrop-filter: blur(12px);
   backdrop-filter: blur(12px);
 }
-.hh-btn--accent { background: var(--hm-cta-bg); color: var(--hm-cta-text); box-shadow: var(--hm-cta-shadow); }
+.hh-btn--accent { flex-grow: 1.15; font-weight: 700; background: var(--hm-cta-bg); color: var(--hm-cta-text); box-shadow: var(--hm-cta-shadow); }
 .hh-btn .hi { width: 18px; height: 18px; stroke-width: 2.5; }
 .hh-btn:active { transform: scale(0.97); opacity: 0.88; }
 .hh-btn:disabled { opacity: 0.7; }
@@ -1922,7 +1922,7 @@ body:has(.home) { background: var(--hm-bg); }
   .hm:last-child::after { display: none; }
   .hm:nth-child(n) { padding-left: 14px; }
   .hm:first-child { padding-left: 12px; }
-  .hh__cta { max-width: 420px; }
+  .hh__cta { max-width: 360px; }
 }
 @media (min-width: 641px) {
   .hh-ambient {
@@ -1939,10 +1939,9 @@ body:has(.home) { background: var(--hm-bg); }
   .water-main-value { font-size: clamp(48px, calc(10vw + 16.5px), 58px); }
   .hh__caption { font-size: 16px; }
   .hh__bar { margin-top: 16px; }
-  .hm-grid { margin-top: 16px; }
+  .hm-grid { margin-top: 14px; }
   .hm { min-height: 70px; padding-top: 9px; padding-bottom: 8px; }
   .hh__cta { margin-top: 14px; }
-  .hh-btn { min-height: 48px; }
   .hsec { margin-top: 24px; }
 }
 
@@ -1952,8 +1951,8 @@ body:has(.home) { background: var(--hm-bg); }
 .hh--enter .hh__caption { animation-delay: 0.1s; }
 .hh--enter .hh__bar, .hh--enter .hh__meta { animation-delay: 0.14s; }
 .hh--enter .hh__fill { animation: hh-fill 0.9s cubic-bezier(0.25, 0.8, 0.25, 1) 0.3s backwards; }
-.hh--enter .hm { animation: hh-fade 0.4s ease-out backwards; animation-delay: calc(0.3s + var(--i, 0) * 0.04s); }
-.hh--enter .hh__cta { animation: hh-fade 0.4s ease-out 0.48s backwards; }
+.hh--enter .hh__cta { animation: hh-fade 0.4s ease-out 0.24s backwards; }
+.hh--enter .hm { animation: hh-fade 0.4s ease-out backwards; animation-delay: calc(0.32s + var(--i, 0) * 0.04s); }
 @keyframes hh-rise { from { opacity: 0; transform: translateY(10px); } }
 @keyframes hh-fade { from { opacity: 0; transform: translateY(4px); } }
 @keyframes hh-fill { from { width: 0; } }
