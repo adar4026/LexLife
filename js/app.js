@@ -15,7 +15,7 @@ import { createFullBackup, prepareFullRestore, applyFullRestore, isZipFile, coun
 import { parsePreparedTest, importPreparedTest, PreparedImportError } from './services/preparedImport.js';
 import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
 import { openDocViewer as showDocViewer } from './ui/docViewer.js';
-import { setActiveTab } from './ui/bottomNav.js';
+import { setActiveTab, initBottomNav } from './ui/bottomNav.js';
 import { waterProgress, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed, nextDose } from './services/homeSummary.js';
 import { nextFire } from './services/notifySchedule.js';
 import { createNotifier, describeNotifyState, armPatch, waterRulePatch, NOTIF_ROUTES, isSafeRoute } from './services/notifier.js';
@@ -3827,6 +3827,7 @@ applyTheme(getTheme());
 async function boot() {
   await Storage.init();
   initChrome();
+  initBottomNav($('#tab-bar'));
   await buildDrawer();
   window.addEventListener('hashchange', render);
   window.addEventListener('scroll', () => { clearTimeout(scrollSaveTimer); scrollSaveTimer = setTimeout(saveScrollState, 250); }, { passive: true });

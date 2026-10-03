@@ -35,3 +35,11 @@ export function setActiveTab(nav, tab) {
   nav.style.setProperty('--nav-index', String(idx));
   return idx;
 }
+
+/* iOS Safari применяет :active к ссылке только если на ней (или предке) есть
+   touchstart-слушатель — без него касание не даёт визуального отклика.
+   Пустой passive-слушатель не мешает прокрутке и не трогает навигацию. */
+export function initBottomNav(nav) {
+  if (!nav) return;
+  nav.addEventListener('touchstart', () => {}, { passive: true });
+}

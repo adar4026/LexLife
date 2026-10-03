@@ -16,18 +16,17 @@
   --red: #f85149;
   --text: #e6edf3;
   --text2: #8b949e;
-  /* Нижняя капсула (как в LexMoney): стекло, тонкий контур, мягкая тень; подложка — акцент */
-  --nav-bg: rgba(22, 27, 34, 0.62);
-  --nav-bg-solid: rgba(22, 27, 34, 0.97);
-  --nav-border: rgba(255, 255, 255, 0.12);
-  --nav-highlight: rgba(255, 255, 255, 0.06);
-  --nav-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
-  --nav-blur: 16px;
-  --nav-saturate: 150%;
-  --nav-muted: var(--text2);
-  --nav-pill-bg: rgba(88, 166, 255, 0.2);
-  --nav-pill-border: rgba(255, 255, 255, 0.1);
-  --nav-pill-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 3px 12px rgba(88, 166, 255, 0.12);
+  /* Нижняя капсула — системное стекло iOS: полупрозрачный тёмно-серый материал,
+     волосяной светлый контур, почти незаметная тень; активный пункт — лёгкий tint акцента */
+  --nav-bg: rgba(28, 28, 30, 0.7);
+  --nav-bg-solid: rgba(28, 28, 30, 0.96);
+  --nav-border: rgba(255, 255, 255, 0.1);
+  --nav-highlight: rgba(255, 255, 255, 0.05);
+  --nav-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  --nav-blur: 20px;
+  --nav-saturate: 180%;
+  --nav-muted: rgba(235, 235, 245, 0.6);
+  --nav-pill-bg: rgba(88, 166, 255, 0.14);
   /* Серии графиков (провалидированы на CVD/контраст для тёмной поверхности) */
   --viz-1: #3987e5;
   --viz-2: #d95926;
@@ -39,15 +38,19 @@
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   /* Нижняя навигация — единый источник геометрии:
      --tab-h      высота капсулы;
-     --tab-bottom капсула садится на границу safe area (iPhone с Home Indicator),
-                  без safe area — минимум 6px от края (проверено LexMoney на устройстве);
+     --tab-bottom капсула чуть заходит в safe area, как системный tab bar: на iPhone
+                  с Home Indicator (inset 34px) — 24px от края, ~11px над индикатором;
+                  без safe area — минимум 6px от края (проверено LexMoney на устройстве).
+                  Источник — только env(): --safe-bottom переопределяется лишь в e2e;
      --tab-space  нижний отступ контента: последний элемент прокручивается выше капсулы. */
   --tab-h: 64px;
-  --tab-bottom: max(6px, var(--safe-bottom));
+  --tab-bottom: max(6px, calc(var(--safe-bottom) - 10px));
   --tab-space: calc(var(--tab-bottom) + var(--tab-h) + 20px);
 
   --font-head: 'Unbounded', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
   --font-body: 'Mulish', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  /* системный шрифт устройства (SF Pro на Apple), без загрузки файлов — подписи таб-бара */
+  --font-system: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
 }
 
 * {
@@ -620,12 +623,14 @@ button.tv-doc:active { background: var(--surface-2); }
 .timeline__date { font-size: 12px; color: var(--text2); }
 .timeline__event { font-size: 14px; margin-top: 2px; }
 
-/* ---------- Нижняя навигация — плавающая капсула (по образцу LexMoney) ----------
-   Не касается краёв (14px, на ≤340px — 12px), садится на границу safe area,
+/* ---------- Нижняя навигация — плавающая капсула (по образцу LexMoney, в духе iOS) ----------
+   Не касается краёв (14px, на ≤340px — 12px), садится чуть выше Home Indicator,
    высота постоянна на всех экранах. Колонки равные (grid), поэтому общий
    индикатор активного пункта ездит через transform по --nav-index без
    измерения DOM. Центрирование — left/right + margin:auto, не translateX(-50%):
-   дробный transform вместе с backdrop-filter размывает текст в Safari. */
+   дробный transform вместе с backdrop-filter размывает текст в Safari.
+   Внешний вид — системное стекло: blur + saturate, волосяной контур, рассеянная
+   тень; системный шрифт; активный пункт — tint, а не отдельная кнопка. */
 .tab-bar {
   position: fixed;
   left: 14px;
@@ -643,14 +648,20 @@ button.tv-doc:active { background: var(--surface-2); }
   box-shadow: var(--nav-shadow), inset 0 1px 0 var(--nav-highlight);
   -webkit-backdrop-filter: blur(var(--nav-blur)) saturate(var(--nav-saturate));
   backdrop-filter: blur(var(--nav-blur)) saturate(var(--nav-saturate));
+  font-family: var(--font-system);
   overflow: hidden;
   z-index: 100;
+}
+/* Retina: контур в физический пиксель (hairline), как у системных панелей */
+@media (min-resolution: 2dppx) {
+  .tab-bar { border-width: 0.5px; }
 }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .tab-bar { background: var(--nav-bg-solid); }
 }
 
-/* Общий индикатор: ширина — одна колонка, положение — --nav-index (bottomNav.js) */
+/* Общий индикатор: ширина — одна колонка, положение — --nav-index (bottomNav.js).
+   Мягкая подложка с лёгким tint акцента: без обводки и свечения. */
 .tab-bar__indicator {
   position: absolute;
   top: 7px;
@@ -659,8 +670,6 @@ button.tv-doc:active { background: var(--surface-2); }
   width: calc((100% - 14px) / var(--nav-count, 4));
   border-radius: 999px;
   background: var(--nav-pill-bg);
-  border: 1px solid var(--nav-pill-border);
-  box-shadow: var(--nav-pill-shadow);
   pointer-events: none;
   opacity: 0;
   transform: translate3d(calc(var(--nav-index, 0) * 100%), 0, 0);
@@ -684,7 +693,7 @@ button.tv-doc:active { background: var(--surface-2); }
   -webkit-touch-callout: none; /* долгое нажатие на ссылку в iOS не открывает превью */
   -webkit-user-select: none;
   user-select: none;
-  transition: color 0.2s ease, transform 0.15s ease;
+  transition: color 0.2s ease-out, opacity 0.2s ease-out;
 }
 .tab__icon {
   flex-shrink: 0;
@@ -692,24 +701,26 @@ button.tv-doc:active { background: var(--surface-2); }
   height: 22px;
   fill: none;
   stroke: currentColor;
-  stroke-width: 2;
+  stroke-width: 1.8;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
 .tab__label {
   max-width: 100%;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.1;
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 1.15;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* активный пункт: акцент + подложка + более жирные подпись и штрих (не только цвет) */
+/* активный пункт: акцент + подложка + чуть плотнее подпись и штрих (не только цвет) */
 .tab.is-active { color: var(--blue); }
-.tab.is-active .tab__label { font-weight: 800; }
-.tab.is-active .tab__icon { stroke-width: 2.4; }
-.tab:active { transform: scale(0.94); }
+.tab.is-active .tab__label { font-weight: 600; }
+.tab.is-active .tab__icon { stroke-width: 2.1; }
+/* касание: мгновенное притухание, плавный возврат (как подсветка UIKit).
+   В iOS Safari :active срабатывает благодаря touchstart-слушателю (initBottomNav). */
+.tab:active { opacity: 0.55; transition-duration: 0s; }
 .tab:focus-visible { outline: 2px solid var(--blue); outline-offset: -3px; }
 
 @media (max-width: 340px) {
@@ -718,7 +729,6 @@ button.tv-doc:active { background: var(--surface-2); }
 }
 @media (prefers-reduced-motion: reduce) {
   .tab-bar__indicator { transition: opacity 0.18s ease; }
-  .tab { transition: color 0.2s ease; }
 }
 
 /* ---------- Витальные показатели (вкладка «Показатели») ---------- */
@@ -1093,13 +1103,12 @@ body.is-scroll-locked {
   --text2: #6b6b72;
   --nav-bg: rgba(255, 255, 255, 0.72);
   --nav-bg-solid: rgba(255, 255, 255, 0.97);
-  --nav-border: rgba(60, 60, 67, 0.16);
-  --nav-highlight: rgba(255, 255, 255, 0.7);
-  --nav-shadow: 0 10px 30px rgba(28, 32, 60, 0.12);
-  --nav-muted: #5d5d66;
-  --nav-pill-bg: rgba(10, 114, 232, 0.13);
-  --nav-pill-border: rgba(255, 255, 255, 0.6);
-  --nav-pill-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), 0 3px 12px rgba(10, 114, 232, 0.1);
+  --nav-border: rgba(0, 0, 0, 0.07);
+  --nav-highlight: rgba(255, 255, 255, 0.6);
+  --nav-shadow: 0 6px 22px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
+  /* secondaryLabel iOS (60,60,67 / .6) чуть плотнее — контраст подписи 10–11px ≥ 4.5:1 */
+  --nav-muted: rgba(60, 60, 67, 0.74);
+  --nav-pill-bg: rgba(10, 114, 232, 0.09);
   --blue: #0a72e8;
   --green: #29a745;
   --orange: #e07b1a;
