@@ -6,7 +6,7 @@
    Меняйте CACHE_VERSION при обновлении ассетов.
    ========================================================= */
 
-const CACHE_VERSION = 'lexlife-v33';
+const CACHE_VERSION = 'lexlife-v34';
 const FONT_CACHE = 'lexlife-fonts-v1';
 
 const APP_SHELL = [
@@ -22,6 +22,8 @@ const APP_SHELL = [
   './js/services/preparedImport.js',
   './js/services/zip.js',
   './js/services/testsJournal.js',
+  './js/services/notifySchedule.js',
+  './js/services/notifier.js',
   './js/ui/charts.js',
   './js/ui/docViewer.js',
   './js/vendor/pdfjs/pdf.min.js',
@@ -55,13 +57,36 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-/* Клик по уведомлению — сфокусировать приложение (задел под центр уведомлений) */
+/* Web Push (задел): сервера-отправителя пока нет и подписка не создаётся, поэтому
+   сейчас это событие не приходит. Каждый push обязан показать уведомление (iOS). */
+self.addEventListener('push', (event) => {
+  let p = {};
+  try { p = event.data ? event.data.json() : {}; } catch (e) { p = { body: event.data ? event.data.text() : '' }; }
+  const route = typeof p.route === 'string' && /^#\/[\w\-/]*$/.test(p.route) ? p.route : '#/notifications';
+  event.waitUntil(
+    self.registration.showNotification(String(p.title || 'LexLife'), {
+      body: String(p.body || 'Напоминание'),
+      tag: String(p.tag || 'lexlife-push'),
+      icon: 'icons/lexlife-icon-192.png',
+      data: { route },
+    })
+  );
+});
+
+/* Клик по уведомлению — открыть приложение на нужном экране */
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
+  const d = event.notification.data || {};
+  const route = typeof d.route === 'string' && /^#\/[\w\-/]*$/.test(d.route) ? d.route : '';
   event.waitUntil(
-    self.clients.matchAll({ type: 'window' }).then((cs) => {
-      for (const c of cs) if ('focus' in c) return c.focus();
-      if (self.clients.openWindow) return self.clients.openWindow('./');
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((cs) => {
+      for (const c of cs) {
+        if ('focus' in c) {
+          if (route) c.postMessage({ type: 'lexlife:open', route });
+          return c.focus();
+        }
+      }
+      if (self.clients.openWindow) return self.clients.openWindow('./' + route);
       return undefined;
     })
   );

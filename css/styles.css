@@ -1089,6 +1089,22 @@ textarea.input { resize: vertical; font-family: inherit; }
 /* Центр уведомлений */
 .notif-perm { display: flex; align-items: center; gap: 10px; background: rgba(88,166,255,0.12); border: 1px solid var(--border); border-radius: var(--radius); padding: 11px 12px; margin: 8px 0 14px; font-size: 13px; color: var(--blue); }
 .notif-perm__btn { background: var(--blue); color: #fff; border: 0; border-radius: 10px; font-size: 13px; font-weight: 700; padding: 8px 14px; flex-shrink: 0; }
+.notif-status { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 12px 14px; margin: 8px 0 14px; }
+.notif-status__head { display: flex; align-items: center; gap: 8px; }
+.notif-status__dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; background: var(--orange); }
+.notif-status--ok .notif-status__dot { background: var(--green); }
+.notif-status--bad .notif-status__dot { background: var(--red); }
+.notif-status__title { font-size: 15px; font-weight: 700; }
+.notif-status__detail { margin: 4px 0 0; font-size: 13px; color: var(--text2); line-height: 1.4; }
+.notif-status__ask { margin-top: 10px; }
+.notif-status__facts { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 10px 0 0; font-size: 13px; }
+.notif-status__facts dt { color: var(--text2); }
+.notif-status__facts dd { margin: 0; text-align: right; }
+.notif-status__limit { margin: 10px 0 0; padding: 9px 10px; border-radius: 10px; background: rgba(240, 136, 62, 0.12); color: var(--text); font-size: 12px; line-height: 1.45; }
+.notif-status__actions { display: flex; gap: 8px; margin-top: 10px; }
+.notif-status__actions .doc-btn:last-child { flex: 0 0 auto; }
+.notif-status__result { margin: 8px 0 0; font-size: 12px; color: var(--text2); line-height: 1.4; }
+.notif-status__result:empty { display: none; }
 .notif-list { display: flex; flex-direction: column; gap: 10px; }
 .notif-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 12px 14px; }
 .notif-card.is-off { opacity: 0.6; }

@@ -15,6 +15,8 @@ import { createFullBackup, prepareFullRestore, applyFullRestore, isZipFile, coun
 import { parsePreparedTest, importPreparedTest, PreparedImportError } from './services/preparedImport.js';
 import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
 import { openDocViewer as showDocViewer } from './ui/docViewer.js';
+import { nextFire } from './services/notifySchedule.js';
+import { createNotifier, describeNotifyState, armPatch, waterRulePatch, NOTIF_ROUTES, isSafeRoute } from './services/notifier.js';
 
 /* Документы анализов: файлы в IndexedDB (только на этом устройстве), метаданные — в health_tests */
 const Attachments = new AttachmentService(Storage, new IdbAttachmentStore());
@@ -479,12 +481,18 @@ function plannedByNow(goal, cfg, nowMin) {
   if (nowMin >= end) return goal;
   return Math.round((goal * (nowMin - start)) / (end - start));
 }
-/* запрос разрешения на уведомления — seam под Этап 3 (push/local) */
+/* запрос разрешения на уведомления — только из обработчика нажатия (iOS требует жест пользователя) */
 async function ensureNotifyPermission() {
   if (!('Notification' in window)) return false;
   if (Notification.permission === 'granted') return true;
   if (Notification.permission === 'denied') return false;
   try { return (await Notification.requestPermission()) === 'granted'; } catch { return false; }
+}
+/* после включения напоминания — честно сказать, если доставки не будет */
+function flashNotifyResult(granted, onText) {
+  if (granted) flash(onText);
+  else if (!('Notification' in window)) flash('Сохранено, но уведомления здесь недоступны');
+  else flash('Сохранено, но уведомления не разрешены');
 }
 
 async function WaterScreen() {
@@ -563,8 +571,9 @@ async function WaterScreen() {
     screen.appendChild(goalPeriodStats(log, goal));
     screen.appendChild(averagesBlock(log));
 
-    /* 9. Настройки напоминаний */
-    screen.appendChild(reminderSettings(hyd));
+    /* 9. Настройки напоминаний (тумблер = правило «Вода» центра уведомлений) */
+    const waterRule = (await Storage.getNotifications()).find((n) => n.type === 'water') || null;
+    screen.appendChild(reminderSettings(hyd, waterRule));
   }
 
   /* План гидратации (фиксированные слоты) — только ориентир. Статус порции считается по
@@ -628,8 +637,11 @@ async function WaterScreen() {
     return sec;
   }
 
-  /* Настройки напоминаний (подъём/сон/интервал/тумблер) — каркас под Этап 3 */
-  function reminderSettings(hyd) {
+  /* Настройки напоминаний (подъём/сон/интервал/тумблер). Тумблер управляет правилом
+     «Вода» центра уведомлений (единственный механизм доставки); hydration_cfg.notify
+     сохраняется для совместимости бэкапов. */
+  function reminderSettings(hyd, waterRule) {
+    const on = !!(waterRule && waterRule.enabled);
     const sec = el(`
       <section class="section">
         <div class="section__head"><h2 class="section__title">Напоминания</h2></div>
@@ -641,21 +653,30 @@ async function WaterScreen() {
               ${[60, 90, 120, 180].map((m) => `<option value="${m}" ${hyd.slotMinutes === m ? 'selected' : ''}>${m === 60 ? '1 ч' : m === 90 ? '1,5 ч' : m === 120 ? '2 ч' : '3 ч'}</option>`).join('')}
             </select>
           </div>
-          <div class="rs-row"><div><div class="field__label" style="margin:0">Напоминания</div><div style="font-size:11px; color:var(--text2)">локальные уведомления PWA</div></div>
-            <button class="rs-toggle ${hyd.notify ? 'is-on' : ''}" id="rs-notify" type="button" role="switch" aria-checked="${hyd.notify}"><span class="rs-toggle__knob"></span></button>
+          <div class="rs-row"><div><div class="field__label" style="margin:0">Напоминания</div><div style="font-size:11px; color:var(--text2)">${on ? esc(repeatSummary(waterRule)) + ' · ' : ''}только пока LexLife открыт · <a href="#/notifications" style="color:var(--blue)">статус</a></div></div>
+            <button class="rs-toggle ${on ? 'is-on' : ''}" id="rs-notify" type="button" role="switch" aria-checked="${on}" ${waterRule ? '' : 'disabled'}><span class="rs-toggle__knob"></span></button>
           </div>
         </div>
       </section>
     `);
-    const save = async (patch) => { await Storage.setHydration(patch); await paint(); };
+    const save = async (patch) => {
+      const next = await Storage.setHydration(patch);
+      /* включённые интервальные напоминания следуют за окном и интервалом плана */
+      if (waterRule && waterRule.enabled && waterRule.repeat === 'interval') await Storage.updateNotification(waterRule.id, armPatch(waterRulePatch(next)));
+      await paint();
+    };
     $('#rs-wake', sec).addEventListener('change', (e) => save({ wakeStart: e.target.value }));
     $('#rs-sleep', sec).addEventListener('change', (e) => save({ wakeEnd: e.target.value }));
     $('#rs-int', sec).addEventListener('change', (e) => save({ slotMinutes: Number(e.target.value) }));
     $('#rs-notify', sec).addEventListener('click', async () => {
-      const next = !hyd.notify;
-      if (next) await ensureNotifyPermission();
-      await save({ notify: next });
-      flash(next ? 'Напоминания включены' : 'Напоминания выключены');
+      if (!waterRule) return;
+      const next = !on;
+      const granted = next ? await ensureNotifyPermission() : false;
+      await Storage.updateNotification(waterRule.id, next ? armPatch({ enabled: true, ...waterRulePatch(hyd) }) : { enabled: false });
+      await Storage.setHydration({ notify: next });
+      notifier.check();
+      await paint();
+      if (next) flashNotifyResult(granted, 'Напоминания включены'); else flash('Напоминания выключены');
     });
     return sec;
   }
@@ -2341,37 +2362,6 @@ const NOTIF_TYPES = {
 const NOTIF_ORDER = ['meds', 'water', 'pressure', 'weight', 'tests', 'visits'];
 const WD = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
 
-const parseHM = (s) => { const [h, m] = (s || '09:00').split(':').map(Number); return { h, m }; };
-const atTime = (date, hm) => { const d = new Date(date); d.setHours(hm.h, hm.m, 0, 0); return d; };
-const okDay = (rule, d) => { const dow = d.getDay(); if (rule.repeat === 'weekdays') return dow >= 1 && dow <= 5; if (rule.repeat === 'weekly') return (rule.days || []).includes(dow); return true; };
-
-function nextFire(rule, now = new Date()) {
-  const hm = parseHM(rule.time);
-  if (rule.repeat === 'once') { if (!rule.date) return null; const d = atTime(new Date(rule.date + 'T00:00:00'), hm); return d > now ? d : null; }
-  if (rule.repeat === 'interval') {
-    const s = parseHM(rule.startTime || '07:00'), e = parseHM(rule.endTime || '23:00'), step = rule.intervalMinutes || 120;
-    const sM = s.h * 60 + s.m, eM = e.h * 60 + e.m, nM = now.getHours() * 60 + now.getMinutes();
-    const d0 = new Date(now); d0.setHours(0, 0, 0, 0);
-    if (nM < sM) { const d = new Date(d0); d.setMinutes(sM); return d; }
-    if (nM <= eM) { const k = Math.floor((nM - sM) / step) + 1, slot = sM + k * step; if (slot <= eM) { const d = new Date(d0); d.setMinutes(slot); return d; } }
-    const d = new Date(d0); d.setDate(d.getDate() + 1); d.setMinutes(sM); return d;
-  }
-  for (let i = 0; i < 8; i++) { const d = new Date(now); d.setDate(d.getDate() + i); const f = atTime(d, hm); if (okDay(rule, d) && f > now) return f; }
-  return null;
-}
-function prevFire(rule, now = new Date()) {
-  const hm = parseHM(rule.time);
-  if (rule.repeat === 'once') { if (!rule.date) return null; const d = atTime(new Date(rule.date + 'T00:00:00'), hm); return d <= now ? d : null; }
-  if (rule.repeat === 'interval') {
-    const s = parseHM(rule.startTime || '07:00'), e = parseHM(rule.endTime || '23:00'), step = rule.intervalMinutes || 120;
-    const sM = s.h * 60 + s.m, eM = e.h * 60 + e.m, nM = now.getHours() * 60 + now.getMinutes();
-    const d0 = new Date(now); d0.setHours(0, 0, 0, 0);
-    if (nM >= sM) { const slot = sM + Math.floor((Math.min(nM, eM) - sM) / step) * step; if (slot <= nM) { const d = new Date(d0); d.setMinutes(slot); return d; } }
-    const d = new Date(d0); d.setDate(d.getDate() - 1); d.setMinutes(sM + Math.floor((eM - sM) / step) * step); return d;
-  }
-  for (let i = 0; i < 8; i++) { const d = new Date(now); d.setDate(d.getDate() - i); const f = atTime(d, hm); if (okDay(rule, d) && f <= now) return f; }
-  return null;
-}
 function fmtNext(d) {
   if (!d) return null;
   const now = new Date(), diff = d - now;
@@ -2392,30 +2382,48 @@ function repeatSummary(r) {
   return `${r.time} · ежедневно`;
 }
 
-/* доставка «пока приложение открыто» (PWA-ограничение; модель готова под push) */
-const Notifier = {
-  timer: null,
-  start() { if (!('Notification' in window)) return; this.check(); clearInterval(this.timer); this.timer = setInterval(() => this.check(), 60000); },
-  async check() {
-    if (!('Notification' in window) || Notification.permission !== 'granted') return;
-    const list = await Storage.getNotifications(); const now = new Date();
-    for (const r of list) {
-      if (!r.enabled) continue;
-      const prev = prevFire(r, now); if (!prev) continue;
-      const last = r.lastFiredAt ? new Date(r.lastFiredAt) : null;
-      if ((!last || prev > last) && (now - prev) < 10 * 60000) { this.show(r); await Storage.updateNotification(r.id, { lastFiredAt: prev.toISOString() }); }
-    }
-  },
-  show(r) {
-    const t = NOTIF_TYPES[r.type] || {};
-    const title = `${t.emoji || '🔔'} ${t.name || 'Напоминание'}`;
-    const opts = { body: r.text || '', tag: r.id, icon: 'icons/lexlife-icon-192.png' };
-    try {
-      if (navigator.serviceWorker && navigator.serviceWorker.ready) navigator.serviceWorker.ready.then((reg) => reg.showNotification(title, opts)).catch(() => { try { new Notification(title, opts); } catch (e) {} });
-      else new Notification(title, opts);
-    } catch (e) { /* ignore */ }
-  },
-};
+/* Локальная доставка: проверка расписания кодом страницы — только пока LexLife
+   открыт (см. js/services/notifier.js). Показ — через Service Worker. */
+const notifyPermission = () => ('Notification' in window ? Notification.permission : 'unsupported');
+async function showSystemNotification(title, opts) {
+  const reg = 'serviceWorker' in navigator ? await navigator.serviceWorker.getRegistration() : null;
+  if (reg && reg.active) return reg.showNotification(title, opts);
+  if (!('Notification' in window)) throw new Error('Notification API недоступен');
+  new Notification(title, opts); // без Service Worker (не iOS)
+  return undefined;
+}
+function showRuleNotification(r) {
+  const t = NOTIF_TYPES[r.type] || {};
+  return showSystemNotification(`${t.emoji || '🔔'} ${t.name || 'Напоминание'}`, {
+    body: r.text || '', tag: r.id, icon: 'icons/lexlife-icon-192.png', data: { route: NOTIF_ROUTES[r.type] || '#/notifications' },
+  });
+}
+const notifier = createNotifier({
+  storage: Storage, show: showRuleNotification, permission: notifyPermission,
+  onError: (err) => console.warn('[notify] не показано:', err && (err.message || err.name)),
+});
+let notifyTimer = null;
+function startNotifier() {
+  if (!('Notification' in window)) return;
+  clearInterval(notifyTimer);
+  notifyTimer = setInterval(() => notifier.check(), 30000);
+  notifier.check();
+}
+
+/* Реальное состояние: поддержка, разрешение, режим PWA, Service Worker, push-подписка */
+async function readNotifyEnv() {
+  const ua = navigator.userAgent || '';
+  const ios = /iPad|iPhone|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+  const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  let reg = null;
+  try { reg = 'serviceWorker' in navigator ? await navigator.serviceWorker.getRegistration() : null; } catch { reg = null; }
+  let subscribed = false;
+  try { subscribed = !!(reg && reg.pushManager && await reg.pushManager.getSubscription()); } catch { subscribed = false; }
+  return {
+    supported: 'Notification' in window, permission: notifyPermission(), ios, standalone,
+    swActive: !!(reg && reg.active), pushSupported: !!(reg && 'pushManager' in reg), subscribed,
+  };
+}
 
 async function NotificationsScreen() {
   const screen = el('<div></div>');
@@ -2426,17 +2434,50 @@ async function NotificationsScreen() {
     screen.innerHTML = '';
     screen.appendChild(backHeader('Уведомления', { label: 'Назад', onBack: goBack }));
 
-    const perm = ('Notification' in window) ? Notification.permission : 'unsupported';
-    if (perm !== 'granted') {
-      const banner = el(`<div class="notif-perm"><i style="font-size:18px">🔔</i><span style="flex:1">${perm === 'unsupported' ? 'Уведомления не поддерживаются браузером' : 'Разрешите уведомления, чтобы получать напоминания'}</span>${perm === 'default' ? '<button class="notif-perm__btn" type="button">Разрешить</button>' : ''}</div>`);
-      const b = $('.notif-perm__btn', banner);
-      if (b) b.addEventListener('click', async () => { await ensureNotifyPermission(); Notifier.start(); await paint(); });
-      screen.appendChild(banner);
-    }
+    screen.appendChild(await statusPanel());
 
     const wrap = el('<div class="notif-list"></div>');
     NOTIF_ORDER.forEach((type) => { const r = list.find((n) => n.type === type); if (r) wrap.appendChild(card(r)); });
     screen.appendChild(wrap);
+  }
+
+  /* Честный статус системы + тестовое уведомление */
+  async function statusPanel() {
+    const env = await readNotifyEnv();
+    const { status, items, limit } = describeNotifyState(env);
+    const canTest = env.supported && env.permission === 'granted';
+    const p = el(`
+      <section class="notif-status notif-status--${status.level}">
+        <div class="notif-status__head"><span class="notif-status__dot"></span><span class="notif-status__title">${esc(status.title)}</span></div>
+        <p class="notif-status__detail">${esc(status.detail)}</p>
+        ${status.ask ? '<button class="notif-perm__btn notif-status__ask" type="button">Разрешить</button>' : ''}
+        <dl class="notif-status__facts">${items.map((i) => `<dt>${esc(i.label)}</dt><dd>${esc(i.value)}</dd>`).join('')}</dl>
+        <p class="notif-status__limit">${esc(limit)}</p>
+        ${canTest ? `<div class="notif-status__actions">
+          <button class="doc-btn" type="button" data-test="0">Отправить тестовое уведомление</button>
+          <button class="doc-btn" type="button" data-test="10">Через 10 с</button>
+        </div>
+        <p class="notif-status__result" aria-live="polite"></p>` : ''}
+      </section>
+    `);
+    const ask = $('.notif-status__ask', p);
+    if (ask) ask.addEventListener('click', async () => { await ensureNotifyPermission(); startNotifier(); await paint(); });
+    const result = $('.notif-status__result', p);
+    $$('[data-test]', p).forEach((b) => b.addEventListener('click', () => {
+      const delay = Number(b.dataset.test);
+      const send = async () => {
+        try {
+          await showSystemNotification('🔔 LexLife · тест', { body: 'Тестовое уведомление LexLife доставлено.', tag: 'lexlife-test', icon: 'icons/lexlife-icon-192.png', data: { route: '#/notifications' } });
+          if (result.isConnected) result.textContent = `Передано системе в ${new Date().toTimeString().slice(0, 5)}. Нет баннера — проверьте Настройки → Уведомления → LexLife.`;
+        } catch (err) {
+          if (result.isConnected) result.textContent = `Ошибка: ${err && (err.message || err.name) || 'неизвестно'}`;
+        }
+      };
+      if (!delay) { send(); return; }
+      result.textContent = `Через ${delay} с… Не сворачивайте LexLife: в фоне iPhone остановит таймер.`;
+      setTimeout(send, delay * 1000);
+    }));
+    return p;
   }
 
   function card(r) {
@@ -2459,10 +2500,11 @@ async function NotificationsScreen() {
     $('.rs-toggle', c).addEventListener('click', async (e) => {
       e.stopPropagation();
       const on = !r.enabled;
-      if (on) await ensureNotifyPermission();
-      await Storage.updateNotification(r.id, { enabled: on });
-      Notifier.start();
+      const granted = on ? await ensureNotifyPermission() : false;
+      await Storage.updateNotification(r.id, on ? armPatch({ enabled: true }) : { enabled: false });
+      startNotifier();
       await paint();
+      if (on) flashNotifyResult(granted, 'Включено');
     });
     $('.notif-card__body', c).addEventListener('click', () => { editing = editing === r.id ? null : r.id; paint(); });
     if (editing === r.id) c.appendChild(editor(r));
@@ -2503,11 +2545,11 @@ async function NotificationsScreen() {
     const save = el('<button class="btn-primary" type="button" style="margin-top:6px">Сохранить</button>');
     save.addEventListener('click', async () => {
       const rep = $('#e-rep', wrap).value;
-      const patch = { text: $('#e-text', wrap).value.trim(), repeat: rep, lastFiredAt: null };
+      const patch = { text: $('#e-text', wrap).value.trim(), repeat: rep };
       if (rep === 'interval') { patch.intervalMinutes = Number($('#e-int', wrap).value); patch.startTime = $('#e-start', wrap).value; patch.endTime = $('#e-end', wrap).value; }
       else if (rep === 'once') { patch.date = $('#e-date', wrap).value; patch.time = $('#e-time', wrap).value; }
       else { patch.time = $('#e-time', wrap).value; if (rep === 'weekly') patch.days = $$('.wd-chip.is-on', wrap).map((c) => Number(c.dataset.d)); }
-      await Storage.updateNotification(r.id, patch); editing = null; Notifier.start(); await paint(); flash('Сохранено ✓');
+      await Storage.updateNotification(r.id, armPatch(patch)); editing = null; startNotifier(); await paint(); flash('Сохранено ✓');
     });
     wrap.appendChild(save);
     return wrap;
@@ -3445,6 +3487,11 @@ function initChrome() {
 function registerSW() {
   if (!('serviceWorker' in navigator)) return;
   window.addEventListener('load', () => { navigator.serviceWorker.register('sw.js').catch((err) => console.warn('[sw]', err)); });
+  /* клик по уведомлению: SW просит открыть экран (только внутренние маршруты) */
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    const d = e.data || {};
+    if (d.type === 'lexlife:open' && isSafeRoute(d.route) && location.hash !== d.route) location.hash = d.route;
+  });
 }
 
 /* ---------- запуск ---------- */
@@ -3456,10 +3503,11 @@ async function boot() {
   window.addEventListener('hashchange', render);
   window.addEventListener('scroll', () => { clearTimeout(scrollSaveTimer); scrollSaveTimer = setTimeout(saveScrollState, 250); }, { passive: true });
   document.addEventListener('click', saveScrollState, true); // до перехода по ссылке/кнопке
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) { render(); Notifier.check(); } });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { render(); notifier.check(); } });
+  window.addEventListener('pageshow', (e) => { if (e.persisted) notifier.check(); });
   await render();
   registerSW();
-  Notifier.start();
+  startNotifier();
   /* «висячие» документы (анализ удалён/заменён при восстановлении) — фоном, безопасно */
   if (IdbAttachmentStore.available()) Attachments.cleanupOrphans().catch((err) => console.warn('[attachments] очистка пропущена', err && err.name));
 }
