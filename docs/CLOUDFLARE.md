@@ -168,3 +168,27 @@ npm run db:migrate:local
 npm run dev                # http://127.0.0.1:8787, cron: GET /__scheduled
 npm test                   # все тесты (node:sqlite вместо D1, заглушка push-сервиса)
 ```
+
+## Стабильная точка отката (2026-10-03)
+
+Зафиксирована после переноса данных пользователем и проверки целостности.
+
+| | |
+|---|---|
+| Git | тег `cf-stable-2026-10-03` → коммит `dfb8b33` (ветка `cloudflare-push`) |
+| Worker | `lexlife`, версия `ea6631f7-ffc5-4041-948a-413da3b6b8fd` (код + секреты VAPID) |
+| Static assets | 29 файлов, побайтно совпадают со сборкой `npm run build` из `dfb8b33`; SW `lexlife-v35` |
+| D1 | `lexlife` `c8eaba54-3002-484a-924d-e0ef5a896012`, bookmark `00000004-00000012-000050f9-cdfa24c76977369578f61a5db0c9cf91` (2026-10-03T16:46Z) |
+| Cron | `* * * * *` |
+
+Откат:
+
+```
+npx wrangler rollback ea6631f7-ffc5-4041-948a-413da3b6b8fd     # код/конфиг Worker
+git checkout cf-stable-2026-10-03 && npm run deploy            # или пересобрать из тега
+npx wrangler d1 time-travel restore lexlife --bookmark=<bookmark>   # только если повреждена D1
+```
+
+D1 Time Travel на Free plan хранит 7 дней. В D1 только инфраструктура push: при её потере устройство
+перерегистрируется и заново синхронизирует правила; данные здоровья живут на устройстве и в бэкапах пользователя.
+Откат Worker не трогает localStorage/IndexedDB на iPhone.
