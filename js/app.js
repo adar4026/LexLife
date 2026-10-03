@@ -131,6 +131,8 @@ const HOME_ICONS = {
 HOME_ICONS.temperature = HOME_ICONS.pulse;
 HOME_ICONS.spo2 = HOME_ICONS.pulse;
 HOME_ICONS.glucose = HOME_ICONS.lab;
+/* капля главного показателя: заливка — мягкий вертикальный градиент фирменных цветов (токены темы) */
+const WATER_DROP_SVG = '<svg class="hh__drop" viewBox="0 0 24 30" aria-hidden="true"><defs><linearGradient id="hh-drop-g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--hm-drop-top)"/><stop offset="1" style="stop-color:var(--hm-drop-bottom)"/></linearGradient></defs><path fill="url(#hh-drop-g)" d="M12 1.5c-.5 0-.9.3-1.2.7C6.6 8 3 12.9 3 18.6 3 24 7 28.5 12 28.5s9-4.5 9-9.9c0-5.7-3.6-10.6-7.8-16.4-.3-.4-.7-.7-1.2-.7z"/></svg>';
 const homeIcon = (name, cls = '') => `<svg class="hi ${cls}" viewBox="0 0 24 24" aria-hidden="true">${HOME_ICONS[name] || HOME_ICONS.lab}</svg>`;
 
 const fmtLongDate = (iso) => new Date(iso + 'T00:00:00').toLocaleDateString(RU, { day: 'numeric', month: 'long', year: 'numeric' }).replace(/\s*г\.$/, '');
@@ -187,7 +189,7 @@ function renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, metric
         <h1 class="hh__date" id="hh-title">${esc(fmtFull(now))}</h1>
       </header>
       <div class="hh__main">
-        <a class="hh__value" href="#/metric/water"><span class="hh__num"></span><span class="hh__unit">мл</span></a>
+        <a class="hh__value water-main-value" href="#/metric/water">${WATER_DROP_SVG}<span class="hh__num"></span><span class="hh__unit">мл</span></a>
         <p class="hh__caption"></p>
         <div class="hh__bar" role="progressbar" aria-label="Вода: выпито от цели" aria-valuemin="0" aria-valuemax="100"><span class="hh__fill"></span></div>
         <p class="hh__meta"><span class="hh__pct"></span><span class="hh__status" aria-live="polite"></span></p>

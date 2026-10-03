@@ -1432,6 +1432,9 @@ textarea.input { resize: vertical; font-family: inherit; }
   --hm-muted: rgba(242, 248, 250, 0.65);
   --hm-accent: #61c9c2;
   --hm-date: #8ccfe6;
+  --hm-unit: rgba(242, 248, 250, 0.74);
+  --hm-drop-top: #3fb3b4;
+  --hm-drop-bottom: #8fe0da;
   --hm-num-from: #f2f8fa;
   --hm-num-to: #9fe0da;
   --hm-track: rgba(242, 248, 250, 0.12);
@@ -1467,6 +1470,9 @@ textarea.input { resize: vertical; font-family: inherit; }
   --hm-muted: #4f6a80;
   --hm-accent: #167a8b;
   --hm-date: #1b5f8e;
+  --hm-unit: rgba(21, 55, 91, 0.72);
+  --hm-drop-top: #167a8b;
+  --hm-drop-bottom: #56c7c4;
   --hm-num-from: #15375b;
   --hm-num-to: #167a8b;
   --hm-track: rgba(21, 55, 91, 0.09);
@@ -1618,17 +1624,28 @@ body:has(.home) { background: var(--hm-bg); }
 }
 
 .hh__main { margin-top: 22px; }
-.hh__value {
+/* главная строка: [капля] число мл — одна строка; размер числа задаёт строка, капля — в em от него
+   (390px → 58px, 430px → 62px; невысокий экран 375×667 → 54px, см. max-height ниже) */
+.water-main-value {
   display: inline-flex;
   align-items: baseline;
-  gap: 6px;
-  margin: 0 0 0 -2px;
+  max-width: 100%;
+  margin: 0 0 0 -1px;
+  font-size: clamp(50px, calc(10vw + 19px), 62px);
+  white-space: nowrap;
   color: var(--hm-ink);
   text-decoration: none;
   border-radius: 14px;
 }
+.hh__drop {
+  align-self: center;
+  flex-shrink: 0;
+  width: 0.54em;
+  height: 0.675em;
+  margin-right: 13px;
+}
 .hh__num {
-  font-size: clamp(56px, 17.5vw, 74px);
+  font-size: 1em;
   font-weight: 800;
   letter-spacing: -0.045em;
   line-height: 0.95;
@@ -1645,7 +1662,7 @@ body:has(.home) { background: var(--hm-bg); }
     color: transparent;
   }
 }
-.hh__unit { font-size: 18px; font-weight: 700; color: var(--hm-muted); }
+.hh__unit { margin-left: 9px; font-size: 17px; font-weight: 700; color: var(--hm-unit); }
 .hh__caption { margin: 6px 0 0; font-size: 17px; color: var(--hm-muted); }
 
 .hh__bar {
@@ -1919,7 +1936,7 @@ body:has(.home) { background: var(--hm-bg); }
 /* невысокий экран (iPhone SE, 375×667): hero плотнее, чтобы «Ближайшее» начиналось на первом экране */
 @media (max-height: 700px) {
   .hh__main { margin-top: 16px; }
-  .hh__num { font-size: clamp(54px, 16.5vw, 64px); }
+  .water-main-value { font-size: clamp(48px, calc(10vw + 16.5px), 58px); }
   .hh__caption { font-size: 16px; }
   .hh__bar { margin-top: 16px; }
   .hm-grid { margin-top: 16px; }
