@@ -12,6 +12,11 @@
      сохранения (переход CET/CEST учтён), хранится, чтобы не зависеть от часового пояса
      устройства при последующем просмотре. Одна дата пробуждения — одна запись (основной сон).
      naps — дневной сон отдельными эпизодами (сейчас форма пишет один эпизод с minutes).
+     Происхождение (необязательно, для будущих внешних источников — Apple Health и др.):
+     source 'manual' | 'apple_health' (нет поля → 'manual'), externalId — id записи во внешнем
+     источнике (дедупликация повторного импорта), sourceDevice { name, manufacturer, model },
+     importedAt ISO, sleepStages { awakeMinutes, coreMinutes, deepMinutes, remMinutes }.
+     Аналитика и интерфейс эти поля пока не используют.
    • sleep_settings = { goalMinutes, bedtime, wakeTime, reminders: { bedtime, log } }
      reminders — модель будущих уведомлений (в центр уведомлений пока не подключена).
    Пропущенный день — «нет данных» (null), а не 0 часов: средние считаются только по записям.
@@ -68,6 +73,19 @@ export const SLEEP_REMINDERS = {
   log: { type: 'sleep_log', title: 'Записать сон', text: 'Запишите, как вы спали', route: '#/sleep/new', defaultTime: '08:00' },
 };
 export const SLEEP_REMINDER_TYPES = Object.values(SLEEP_REMINDERS).map((r) => r.type);
+
+/* Источники записи. Отсутствие source (записи до этого поля) = 'manual'. Неизвестный, но
+   безопасный ключ источника из копии более новой версии не ломает восстановление. */
+export const SLEEP_SOURCES = ['manual', 'apple_health'];
+export const SLEEP_STAGE_KEYS = ['awakeMinutes', 'coreMinutes', 'deepMinutes', 'remMinutes'];
+export const sleepSource = (e) => (e && typeof e.source === 'string' && e.source ? e.source : 'manual');
+/* Ключ дедупликации внешнего импорта: источник + id записи в нём; у ручных записей — null */
+export const sleepExternalKey = (e) => (e && typeof e.externalId === 'string' && e.externalId ? `${sleepSource(e)}:${e.externalId}` : null);
+export function findSleepByExternalId(entries, source, externalId) {
+  if (typeof externalId !== 'string' || !externalId) return null;
+  const key = `${source || 'manual'}:${externalId}`;
+  return (Array.isArray(entries) ? entries : []).find((e) => sleepExternalKey(e) === key) || null;
+}
 
 /* ---------- примитивы ---------- */
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -218,6 +236,20 @@ export function normalizeSleepInput(input = {}, { today = localDay() } = {}) {
 const NAP_OK = (n) => isObj(n) && isInt(n.minutes) && n.minutes >= 0 && n.minutes <= 1440
   && (n.start == null || isSleepStamp(n.start)) && (n.end == null || isSleepStamp(n.end));
 
+const SOURCE_RE = /^[a-z][a-z0-9_]{0,31}$/;
+const isShortStr = (v, max) => typeof v === 'string' && v.length <= max && !/[\u0000-\u001f\u007f]/.test(v);
+const isStrOrNull = (v, max) => v == null || isShortStr(v, max);
+/* лишние поля вложенных объектов (будущие версии) — только простые значения */
+const isPlainValue = (v) => v == null || typeof v === 'boolean' || isNum(v) || isShortStr(v, 200);
+const SOURCE_DEVICE_OK = (d) => d == null || (isObj(d) && Object.keys(d).length <= 20 && Object.values(d).every(isPlainValue)
+  && isStrOrNull(d.name, 100) && isStrOrNull(d.manufacturer, 100) && isStrOrNull(d.model, 100));
+const STAGES_OK = (s) => s == null || (isObj(s) && Object.keys(s).length <= 20
+  && Object.values(s).every((v) => v == null || (isNum(v) && v >= 0 && v <= 1440)));
+/* Происхождение записи: всё необязательно; externalId не требуется ни для manual, ни для apple_health */
+const provenanceOk = (e) => (e.source == null || (typeof e.source === 'string' && SOURCE_RE.test(e.source)))
+  && isStrOrNull(e.externalId, 200) && (e.externalId == null || e.externalId.length > 0)
+  && SOURCE_DEVICE_OK(e.sourceDevice) && isStrOrNull(e.importedAt, 40) && STAGES_OK(e.sleepStages);
+
 /* Одна запись: строго то, что UI подставляет в разметку и что нужно аналитике;
    неизвестные теги допустимы (будущие версии), но только как безопасные ключи. */
 export function isValidSleepEntry(e) {
@@ -231,7 +263,8 @@ export function isValidSleepEntry(e) {
     && (e.naps == null || (Array.isArray(e.naps) && e.naps.length <= 24 && e.naps.every(NAP_OK)))
     && (e.tags == null || (Array.isArray(e.tags) && e.tags.length <= 50 && e.tags.every((t) => typeof t === 'string' && TAG_RE.test(t))))
     && (e.note == null || (typeof e.note === 'string' && e.note.length <= SLEEP_NOTE_MAX * 2))
-    && (e.createdAt == null || typeof e.createdAt === 'string') && (e.updatedAt == null || typeof e.updatedAt === 'string');
+    && (e.createdAt == null || typeof e.createdAt === 'string') && (e.updatedAt == null || typeof e.updatedAt === 'string')
+    && provenanceOk(e);
 }
 export const isValidSleepLog = (v) => Array.isArray(v) && v.every(isValidSleepEntry);
 

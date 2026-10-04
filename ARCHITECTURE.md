@@ -267,12 +267,24 @@ fallback → home
   "naps": [ { "minutes": 30, "start": null, "end": null } ],   // дневной сон эпизодами; форма пишет один
   "tags": ["stress", "late_meal"],      // coffee alcohol late_meal stress exercise medication illness screen travel nap
   "note": "",
-  "createdAt": "ISO", "updatedAt": "ISO"
+  "createdAt": "ISO", "updatedAt": "ISO",
+  // происхождение — необязательно (задел под внешние источники, см. ниже)
+  "source": "manual",                   // "manual" | "apple_health"; нет поля → "manual"
+  "externalId": null,                   // id записи во внешнем источнике — дедупликация повторного импорта
+  "sourceDevice": null,                 // { "name": "Apple Watch", "manufacturer": "Apple", "model": null } — любой источник
+  "importedAt": null,                   // ISO момента импорта
+  "sleepStages": {                      // только у внешних записей; у ручных поля нет совсем
+    "awakeMinutes": null, "coreMinutes": null, "deepMinutes": null, "remMinutes": null
+  }
 } ]
 // sleep_settings
 { "goalMinutes": 480, "bedtime": "23:30", "wakeTime": "07:30",
   "reminders": { "bedtime": { "enabled": false, "time": "23:00" }, "log": { "enabled": false, "time": "08:00" } } }
 ```
+**Внешние источники (задел, импорта пока нет).** `source`, `externalId`, `sourceDevice`, `importedAt`, `sleepStages` предназначены для будущего импорта сна из внешних источников (Apple Health и другие). Все поля необязательны, миграции нет: запись без `source` (созданная до появления поля) считается `manual` (`sleepSource()`). Новая ручная запись получает `source: "manual"`, `externalId/sourceDevice/importedAt: null`, без `sleepStages`; правка в форме происхождение не меняет. `externalId` не обязателен ни для `manual`, ни для `apple_health`; если он есть, ключ дедупликации — `source:externalId` (`sleepExternalKey`, `findSleepByExternalId`), и `addSleepEntry` отклоняет повтор кодом `DUPLICATE_EXTERNAL`. Проверка копии: `source` — `manual`, `apple_health` или безопасный ключ будущего источника (`^[a-z][a-z0-9_]{0,31}$`); `sourceDevice` — объект со строками `name/manufacturer/model` и простыми лишними полями; `sleepStages` — минуты 0–1440 или null, лишние будущие стадии допустимы. Стадии в интерфейсе и аналитике не используются.
+
+**Apple Health нельзя читать напрямую из текущего PWA:** у веб-приложения в Safari/на экране «Домой» нет доступа к HealthKit. Будущая интеграция потребует iOS/native-компонента (приложение или оболочка с HealthKit permissions), который передаст записи в формате выше.
+
 Схему не поднимали намеренно (как `med_intakes`): новый номер схемы заставил бы старые версии отклонять новые копии; отсутствующие ключи `init()` и восстановление создают по умолчанию (`[]` и настройки выше), старые версии ключи сна в копии игнорируют (whitelist). Ограничения записи: конец позже начала, не больше 20 ч (защита от ошибки даты, не медицинская норма), дата пробуждения не в будущем. Подписи факторов и качества — только в UI (`SLEEP_TAGS`, `SLEEP_QUALITY`), хранятся ключи и числа. CRUD — только `Storage`: `getSleepEntries/getSleepEntry/addSleepEntry/updateSleepEntry/removeSleepEntry`, `getSleepSettings/updateSleepSettings`; повтор даты → `SleepStoreError('DUPLICATE_DATE')`.
 
 ### 5.11 Прочее
@@ -413,6 +425,7 @@ fallback → home
 - `sleepGoalRate` (среди дней с записью), `currentSleepStreak` (дни подряд с ночным сном ≥ цели по сегодня; сегодня не записано — по вчера; пропуск прерывает), `bestSleepStreak`.
 - Периоды календарные: `periodBounds/shiftPeriod` (неделя Пн–Вс, месяц, год); `aggregateByWeek/aggregateByMonth` (дни), `aggregateByYear` (средние по месяцам); `comparePeriods` (нет данных в одном из периодов → нет сравнения).
 - `factorInsights` — «Что связано с вашим сном»: разница средней длительности (≥ 15 мин) или качества (≥ 0,3) в днях с фактором и без; только при ≥ 5 днях с фактором и ≥ 5 без; формулировки без причинности (`insightText`).
+- Поля происхождения и `sleepStages` на аналитику не влияют (тест «аналитика не зависит от источника и стадий»).
 - Основной показатель — ночной сон; дневной сон и «общий сон за сутки» (`totalDayMinutes`) показываются отдельно и подписаны.
 - **Напоминания** (`SLEEP_REMINDERS`: `sleep_bedtime` «Пора готовиться ко сну», `sleep_log` «Записать сон»): модель в `sleep_settings.reminders` и `sleepReminderRules()` в формате правил центра уведомлений. В ключ `notifications` пока не добавляются: сервер фоновых уведомлений (`worker/rules.js`, `RULE_TYPES`) отклоняет неизвестные типы, и синхронизация всех правил сломалась бы. Подключение — отдельный этап вместе с сервером.
 - Графики — `ui/charts.js` (необязательные параметры `xLabels`, `yFormat`, `yStep`, `domain`, `barColor`, `fit`); столбцы «меньше цели» — тот же оттенок слабее (`--sleep-below`), состояние также написано в карточке значения.

@@ -10,7 +10,7 @@
    Ключи и модель данных — по ТЗ «LexLife».
    ========================================================= */
 
-import { isValidSleepLog, isValidSleepSettings, isValidSleepEntry, normalizeSleepSettings, defaultSleepSettings, SLEEP_NOTE_MAX } from './sleep.js';
+import { isValidSleepLog, isValidSleepSettings, isValidSleepEntry, normalizeSleepSettings, defaultSleepSettings, findSleepByExternalId, SLEEP_NOTE_MAX } from './sleep.js';
 
 const APP_ID = 'lexlife';
 /* Старые бэкапы (экспортированные до ребрендинга) помечены прежним app id —
@@ -94,6 +94,19 @@ export class SleepStoreError extends Error {
     this.code = code;
     this.existing = existing;
   }
+}
+/* Происхождение новой записи: вручную — source 'manual' и пустые поля источника; будущий импорт
+   передаёт свои значения (sleepStages — только если есть, у ручных записей поля нет) */
+function sleepProvenance(v) {
+  const o = v || {};
+  const p = {
+    source: typeof o.source === 'string' && o.source ? o.source : 'manual',
+    externalId: o.externalId ?? null,
+    sourceDevice: o.sourceDevice ? { ...o.sourceDevice } : null,
+    importedAt: o.importedAt ?? null,
+  };
+  if (o.sleepStages) p.sleepStages = { ...o.sleepStages };
+  return p;
 }
 /* Только поля модели сна (лишнее из формы не попадает в хранилище) */
 function sleepFields(v) {
@@ -1258,8 +1271,11 @@ export class StorageService {
     return this._serialSleep(async () => {
       const list = await this._read(KEYS.sleepLog, []);
       const at = nowISO();
-      const entry = { ...sleepFields(value), id: uid(), createdAt: at, updatedAt: at };
+      const entry = { ...sleepFields(value), ...sleepProvenance(value), id: uid(), createdAt: at, updatedAt: at };
       if (!isValidSleepEntry(entry)) throw new SleepStoreError('INVALID', 'Запись сна заполнена некорректно.');
+      /* повторный импорт той же внешней записи не создаёт дубль */
+      const ext = findSleepByExternalId(list, entry.source, entry.externalId);
+      if (ext) throw new SleepStoreError('DUPLICATE_EXTERNAL', 'Эта запись сна уже импортирована.', ext);
       const dup = list.find((e) => e.date === entry.date);
       if (dup) throw new SleepStoreError('DUPLICATE_DATE', 'За эту дату сон уже записан.', dup);
       list.push(entry);
@@ -1267,6 +1283,8 @@ export class StorageService {
       return entry;
     });
   }
+  /* правка из формы меняет только поля сна; происхождение (source, externalId, sourceDevice,
+     importedAt, sleepStages) остаётся как было — у старой записи без source его и не появляется */
   async updateSleepEntry(id, value) {
     return this._serialSleep(async () => {
       const list = await this._read(KEYS.sleepLog, []);

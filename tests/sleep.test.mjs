@@ -18,6 +18,7 @@ import {
   aggregateByYear, comparePeriods, factorInsights, periodBounds, shiftPeriod, entriesInRange, napMinutes,
   totalDayMinutes, defaultSleepSettings, normalizeSleepSettings, isValidSleepSettings, clampSleepGoal, sleepReminderRules,
   SLEEP_REMINDER_TYPES, SLEEP_TAG_KEYS, minutesToClock, addDays, insightText as rawInsight,
+  SLEEP_SOURCES, sleepSource, sleepExternalKey, findSleepByExternalId, isValidSleepLog,
 } from '../js/services/sleep.js';
 import { nextFire } from '../js/services/notifySchedule.js';
 
@@ -418,6 +419,105 @@ test('очистка данных удаляет сон вместе с оста
   assert.equal(await s.driver.get('sleep_log'), null);
   await s.init();
   assert.deepEqual(await s.getSleepEntries(), []);
+});
+
+/* ================= источник записи и стадии сна (задел под внешние источники) ================= */
+const HK = {
+  source: 'apple_health', externalId: 'HK-0000-SYNTH-0001', importedAt: '2026-10-04T08:00:00.000Z',
+  sourceDevice: { name: 'Apple Watch', manufacturer: 'Apple', model: null },
+  sleepStages: { awakeMinutes: 12, coreMinutes: 250, deepMinutes: 80, remMinutes: 118 },
+};
+
+test('legacy: запись без source — это manual, проходит проверку, аналитика прежняя', () => {
+  const legacy = { ...form().value, id: 'old1', createdAt: null, updatedAt: null };
+  assert.equal('source' in legacy, false);
+  assert.equal(isValidSleepEntry(legacy), true);
+  assert.equal(sleepSource(legacy), 'manual');
+  assert.equal(sleepExternalKey(legacy), null);
+  assert.deepEqual(SLEEP_SOURCES, ['manual', 'apple_health']);
+});
+
+test('manual: новая запись из формы получает source manual и пустые поля источника, без sleepStages', async () => {
+  const s = await fresh();
+  const e = await s.addSleepEntry(form().value);
+  assert.deepEqual([e.source, e.externalId, e.sourceDevice, e.importedAt], ['manual', null, null, null]);
+  assert.equal('sleepStages' in e, false, 'стадий у ручной записи нет совсем — без фиктивных значений');
+  /* правка не меняет происхождение; у старой записи без source оно и не появляется */
+  const upd = await s.updateSleepEntry(e.id, form({ wakeTime: '07:40' }).value);
+  assert.equal(upd.source, 'manual');
+  await s.driver.set('sleep_log', JSON.stringify([{ ...form().value, id: 'old1' }]));
+  const old = await s.updateSleepEntry('old1', form({ quality: 5 }).value);
+  assert.equal('source' in old, false);
+  assert.equal(sleepSource(old), 'manual');
+});
+
+test('apple_health: валидатор принимает запись источника (externalId не обязателен), стадии и устройство', () => {
+  const base = { ...form().value, id: 'h1' };
+  assert.equal(isValidSleepEntry({ ...base, ...HK }), true);
+  assert.equal(isValidSleepEntry({ ...base, ...HK, externalId: null }), true, 'externalId пока не обязателен');
+  assert.equal(isValidSleepEntry({ ...base, source: 'manual', externalId: null, sourceDevice: null, importedAt: null }), true);
+  assert.equal(isValidSleepEntry({ ...base, sourceDevice: { name: 'Кольцо', manufacturer: 'Другой', model: 'X2' } }), true, 'не только Apple Watch');
+  assert.equal(isValidSleepEntry({ ...base, sleepStages: { deepMinutes: 90 } }), true, 'стадии частично');
+  for (const bad of [
+    { source: 'Apple Health!' }, { source: 5 }, { externalId: '' }, { externalId: 'x'.repeat(201) }, { externalId: 42 },
+    { sourceDevice: 'Apple Watch' }, { sourceDevice: { name: { x: 1 } } }, { importedAt: 5 },
+    { sleepStages: { deepMinutes: -5 } }, { sleepStages: { remMinutes: 2000 } }, { sleepStages: [] }, { sleepStages: { coreMinutes: '90' } },
+  ]) assert.equal(isValidSleepEntry({ ...base, ...bad }), false, JSON.stringify(bad));
+});
+
+test('будущие значения: неизвестный безопасный источник и лишние поля стадий/устройства не ломают проверку', () => {
+  const base = { ...form().value, id: 'f1' };
+  assert.equal(isValidSleepEntry({ ...base, source: 'other_tracker', sourceDevice: { name: 'Band', firmware: '1.2', paired: true } }), true);
+  assert.equal(isValidSleepEntry({ ...base, sleepStages: { ...HK.sleepStages, inBedMinutes: 500, unspecifiedMinutes: null } }), true);
+  assert.equal(sleepSource({ ...base, source: 'other_tracker' }), 'other_tracker');
+});
+
+test('дедупликация будущего импорта: та же внешняя запись повторно не добавляется', async () => {
+  const s = await fresh();
+  const a = await s.addSleepEntry({ ...form().value, ...HK });
+  assert.equal(a.source, 'apple_health');
+  assert.deepEqual(a.sleepStages, HK.sleepStages);
+  assert.equal(findSleepByExternalId(await s.getSleepEntries(), 'apple_health', HK.externalId).id, a.id);
+  assert.equal(findSleepByExternalId(await s.getSleepEntries(), 'manual', HK.externalId), null, 'ключ учитывает источник');
+  await assert.rejects(s.addSleepEntry({ ...form({ wakeDate: '2026-10-03' }).value, ...HK }),
+    (e) => e instanceof SleepStoreError && e.code === 'DUPLICATE_EXTERNAL' && e.existing.id === a.id);
+  assert.equal((await s.getSleepEntries()).length, 1);
+});
+
+test('backup/restore: source, externalId, sourceDevice, importedAt и sleepStages сохраняются и возвращаются', async () => {
+  const a = await fresh();
+  await a.addSleepEntry({ ...form().value, ...HK });
+  await a.addSleepEntry(form({ wakeDate: '2026-10-03' }).value);
+  const { json, verified } = await a.createBackup();
+  assert.equal(verified, true);
+  const b = await fresh();
+  await b.restoreBackup(await b.prepareRestore(parseBackup(json)));
+  const [hk, man] = await b.getSleepEntries();
+  assert.deepEqual([hk.source, hk.externalId, hk.sourceDevice, hk.importedAt, hk.sleepStages], [HK.source, HK.externalId, HK.sourceDevice, HK.importedAt, HK.sleepStages]);
+  assert.deepEqual([man.source, man.externalId, man.sourceDevice, man.importedAt, 'sleepStages' in man], ['manual', null, null, null, false]);
+});
+
+test('старая копия: записи сна без новых полей восстанавливаются как manual; будущие поля не мешают', async () => {
+  const oldEntry = { ...form().value, id: 'old1', createdAt: '2026-10-04T08:00:00.000Z', updatedAt: '2026-10-04T08:00:00.000Z' };
+  const backup = { app: 'lexlife', backupFormatVersion: 2, schemaVersion: 8, data: { sleep_log: [oldEntry], sleep_settings: defaultSleepSettings() } };
+  const s = await fresh();
+  await s.restoreBackup(await s.prepareRestore(parseBackup(JSON.stringify(backup))));
+  const [e] = await s.getSleepEntries();
+  assert.equal('source' in e, false, 'обязательной миграции нет');
+  assert.equal(sleepSource(e), 'manual');
+  const future = { ...backup, data: { ...backup.data, sleep_log: [{ ...oldEntry, source: 'other_tracker', sleepStages: { remMinutes: 90, lightMinutes: 200 }, futureField: { x: 1 } }] } };
+  await s.restoreBackup(await s.prepareRestore(parseBackup(JSON.stringify(future))));
+  assert.equal((await s.getSleepEntries())[0].source, 'other_tracker');
+  assert.equal(isValidSleepLog([{ ...oldEntry, sleepStages: { deepMinutes: -1 } }]), false, 'некорректные значения по-прежнему отклоняются');
+});
+
+test('аналитика не зависит от источника и стадий: те же результаты с полями и без', () => {
+  const plain = [entry('2026-10-01', 420, { quality: 3, tags: ['stress'] }), entry('2026-10-02', 480, { bed: '23:30', quality: 5 }), entry('2026-10-03', 510, { bed: '00:10', quality: 4 })];
+  const rich = plain.map((e, i) => ({ ...e, ...HK, externalId: `HK-${i}`, sleepStages: { awakeMinutes: 60, coreMinutes: 10, deepMinutes: 0, remMinutes: 5 } }));
+  const calc = (l) => [averageSleep(l), averageBedtime(l), averageWakeTime(l), averageQuality(l), sleepConsistency(l), sleepGoalRate(l, 480),
+    currentSleepStreak(l, 480, '2026-10-03'), bestSleepStreak(l, 480), aggregateByWeek(l, '2026-10-01').map((x) => x.minutes),
+    aggregateByYear(l, '2026-10-01').map((x) => x.minutes), totalDayMinutes(l[0]), factorInsights(l, { minDays: 1 })];
+  assert.deepEqual(calc(rich), calc(plain));
 });
 
 /* ---------- запуск ---------- */
