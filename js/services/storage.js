@@ -10,6 +10,8 @@
    Ключи и модель данных — по ТЗ «LexLife».
    ========================================================= */
 
+import { isValidSleepLog, isValidSleepSettings, isValidSleepEntry, normalizeSleepSettings, defaultSleepSettings, findSleepByExternalId, SLEEP_NOTE_MAX } from './sleep.js';
+
 const APP_ID = 'lexlife';
 /* Старые бэкапы (экспортированные до ребрендинга) помечены прежним app id —
    принимаем их на импорт, чтобы не терять совместимость с уже сделанными бэкапами. */
@@ -38,12 +40,14 @@ export const KEYS = {
   activityGoals: 'activity_goals',
   medLog: 'med_log',            // старый журнал: { "ГГГГ-ММ-ДД": ["Имя", ...] } — только чтение
   medIntakes: 'med_intakes',    // приёмы: { "ГГГГ-ММ-ДД": [{ medId, scheduledTime, takenAt }] }
+  sleepLog: 'sleep_log',        // сон: [{ id, date (день пробуждения), sleepStart, sleepEnd, durationMinutes, … }] (services/sleep.js)
+  sleepSettings: 'sleep_settings', // цель сна, желаемое время, модель будущих напоминаний
 };
 
 /* Ключи с пользовательскими данными (для бэкапа/очистки) — без служебного meta */
 const DATA_KEYS = [
   KEYS.alerts, KEYS.tests, KEYS.meds, KEYS.visits, KEYS.metrics, KEYS.metricsLog, KEYS.profile, KEYS.hydration, KEYS.notifications,
-  KEYS.activityDays, KEYS.activityGoals, KEYS.medLog, KEYS.medIntakes,
+  KEYS.activityDays, KEYS.activityGoals, KEYS.medLog, KEYS.medIntakes, KEYS.sleepLog, KEYS.sleepSettings,
 ];
 
 /* UI-настройка темы: хранится строкой (не JSON), живёт вне DATA_KEYS, но входит в бэкап (settings.theme) */
@@ -70,7 +74,7 @@ const KEY_LABELS = {
   [KEYS.metrics]: 'Цели показателей', [KEYS.metricsLog]: 'История показателей', [KEYS.profile]: 'Профиль',
   [KEYS.hydration]: 'План воды', [KEYS.notifications]: 'Уведомления', [KEYS.activityDays]: 'Активность',
   [KEYS.activityGoals]: 'Цели активности', [KEYS.medLog]: 'Журнал приёма лекарств',
-  [KEYS.medIntakes]: 'Приёмы лекарств',
+  [KEYS.medIntakes]: 'Приёмы лекарств', [KEYS.sleepLog]: 'Сон', [KEYS.sleepSettings]: 'Настройки сна',
 };
 
 /* Ошибка бэкапа с кодом — UI показывает message как есть */
@@ -80,6 +84,39 @@ export class BackupError extends Error {
     this.name = 'BackupError';
     this.code = code;
   }
+}
+
+/* Ошибка сохранения сна: DUPLICATE_DATE (existing — запись этой даты) | INVALID | NO_SPACE */
+export class SleepStoreError extends Error {
+  constructor(code, message, existing = null) {
+    super(message);
+    this.name = 'SleepStoreError';
+    this.code = code;
+    this.existing = existing;
+  }
+}
+/* Происхождение новой записи: вручную — source 'manual' и пустые поля источника; будущий импорт
+   передаёт свои значения (sleepStages — только если есть, у ручных записей поля нет) */
+function sleepProvenance(v) {
+  const o = v || {};
+  const p = {
+    source: typeof o.source === 'string' && o.source ? o.source : 'manual',
+    externalId: o.externalId ?? null,
+    sourceDevice: o.sourceDevice ? { ...o.sourceDevice } : null,
+    importedAt: o.importedAt ?? null,
+  };
+  if (o.sleepStages) p.sleepStages = { ...o.sleepStages };
+  return p;
+}
+/* Только поля модели сна (лишнее из формы не попадает в хранилище) */
+function sleepFields(v) {
+  const o = v || {};
+  return {
+    date: o.date, sleepStart: o.sleepStart, sleepEnd: o.sleepEnd, durationMinutes: o.durationMinutes,
+    quality: o.quality ?? null, awakenings: o.awakenings ?? 0,
+    naps: Array.isArray(o.naps) ? o.naps.map((n) => ({ minutes: n.minutes, start: n.start ?? null, end: n.end ?? null })) : [],
+    tags: Array.isArray(o.tags) ? o.tags.slice() : [], note: typeof o.note === 'string' ? o.note.slice(0, SLEEP_NOTE_MAX) : '',
+  };
 }
 
 /* Референсные значения для цветовой индикации (из ТЗ) */
@@ -419,6 +456,8 @@ const KEY_VALIDATORS = {
   [KEYS.activityGoals]: mapOf((x) => isNumOrNull(x)),
   [KEYS.medLog]: mapOf((list, d) => isDateStr(d) && d !== '' && Array.isArray(list) && list.every((x) => typeof x === 'string')),
   [KEYS.medIntakes]: mapOf((list, d) => isDateStr(d) && d !== '' && Array.isArray(list) && list.every(MED_INTAKE_OK)),
+  [KEYS.sleepLog]: isValidSleepLog,
+  [KEYS.sleepSettings]: isValidSleepSettings,
 };
 
 /* Проверка набора данных финальной схемы; бросает BackupError с названием раздела */
@@ -447,6 +486,7 @@ function summarize(data) {
     visits: (data[KEYS.visits] || []).length,
     notifications: (data[KEYS.notifications] || []).length,
     activityDays: Object.keys(data[KEYS.activityDays] || {}).length,
+    sleep: Array.isArray(data[KEYS.sleepLog]) ? data[KEYS.sleepLog].length : 0,
   };
 }
 
@@ -713,8 +753,10 @@ export class StorageService {
     const meta = await this._read(KEYS.meta, null);
     if (!meta || !meta.seededAt) await this._seed();
     else await this._migrate();
-    /* аддитивный раздел без смены схемы: у существующих установок появляется пустым */
+    /* аддитивные разделы без смены схемы: у существующих установок появляются пустыми / по умолчанию */
     if ((await this._read(KEYS.medIntakes, null)) == null) await this._write(KEYS.medIntakes, {});
+    if ((await this._read(KEYS.sleepLog, null)) == null) await this._write(KEYS.sleepLog, []);
+    if ((await this._read(KEYS.sleepSettings, null)) == null) await this._write(KEYS.sleepSettings, defaultSleepSettings());
     return this;
   }
 
@@ -771,6 +813,8 @@ export class StorageService {
     if ((await this._read(KEYS.activityDays, null)) == null) await this._write(KEYS.activityDays, {});
     if ((await this._read(KEYS.medLog, null)) == null) await this._write(KEYS.medLog, {});
     if ((await this._read(KEYS.medIntakes, null)) == null) await this._write(KEYS.medIntakes, {});
+    if ((await this._read(KEYS.sleepLog, null)) == null) await this._write(KEYS.sleepLog, []);
+    if ((await this._read(KEYS.sleepSettings, null)) == null) await this._write(KEYS.sleepSettings, defaultSleepSettings());
   }
 
   /* ---- Предупреждения ---- */
@@ -1202,6 +1246,81 @@ export class StorageService {
     });
   }
 
+  /* ---- Сон ----
+     sleep_log — записи сна (одна на дату пробуждения), sleep_settings — цель и желаемое время.
+     Модель, валидация и аналитика — services/sleep.js; UI обращается только к этим методам.
+     Запись проверяется перед сохранением (isValidSleepEntry); изменения сериализуются. */
+  _serialSleep(fn) {
+    const run = (this._sleepQueue || Promise.resolve()).then(fn, fn);
+    this._sleepQueue = run.catch(() => {});
+    return run;
+  }
+  async _writeSleepKey(key, value) {
+    if (!(await this._write(key, value))) throw new SleepStoreError('NO_SPACE', 'Не удалось сохранить: недостаточно места на устройстве.');
+  }
+  /* новые сверху (по дате пробуждения) */
+  async getSleepEntries() {
+    const list = await this._read(KEYS.sleepLog, []);
+    return (Array.isArray(list) ? list : []).slice().sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  }
+  async getSleepEntry(id) {
+    return (await this.getSleepEntries()).find((e) => e.id === id) || null;
+  }
+  /* value — результат normalizeSleepInput(…).value. Дата пробуждения уже занята → SleepStoreError DUPLICATE_DATE */
+  async addSleepEntry(value) {
+    return this._serialSleep(async () => {
+      const list = await this._read(KEYS.sleepLog, []);
+      const at = nowISO();
+      const entry = { ...sleepFields(value), ...sleepProvenance(value), id: uid(), createdAt: at, updatedAt: at };
+      if (!isValidSleepEntry(entry)) throw new SleepStoreError('INVALID', 'Запись сна заполнена некорректно.');
+      /* повторный импорт той же внешней записи не создаёт дубль */
+      const ext = findSleepByExternalId(list, entry.source, entry.externalId);
+      if (ext) throw new SleepStoreError('DUPLICATE_EXTERNAL', 'Эта запись сна уже импортирована.', ext);
+      const dup = list.find((e) => e.date === entry.date);
+      if (dup) throw new SleepStoreError('DUPLICATE_DATE', 'За эту дату сон уже записан.', dup);
+      list.push(entry);
+      await this._writeSleepKey(KEYS.sleepLog, list);
+      return entry;
+    });
+  }
+  /* правка из формы меняет только поля сна; происхождение (source, externalId, sourceDevice,
+     importedAt, sleepStages) остаётся как было — у старой записи без source его и не появляется */
+  async updateSleepEntry(id, value) {
+    return this._serialSleep(async () => {
+      const list = await this._read(KEYS.sleepLog, []);
+      const i = list.findIndex((e) => e.id === id);
+      if (i < 0) return null;
+      const next = { ...list[i], ...sleepFields(value), id, createdAt: list[i].createdAt || nowISO(), updatedAt: nowISO() };
+      if (!isValidSleepEntry(next)) throw new SleepStoreError('INVALID', 'Запись сна заполнена некорректно.');
+      const dup = list.find((e) => e.id !== id && e.date === next.date);
+      if (dup) throw new SleepStoreError('DUPLICATE_DATE', 'За эту дату сон уже записан.', dup);
+      list[i] = next;
+      await this._writeSleepKey(KEYS.sleepLog, list);
+      return next;
+    });
+  }
+  /* → удалённая запись | null */
+  async removeSleepEntry(id) {
+    return this._serialSleep(async () => {
+      const list = await this._read(KEYS.sleepLog, []);
+      const rec = list.find((e) => e.id === id);
+      if (!rec) return null;
+      await this._writeSleepKey(KEYS.sleepLog, list.filter((e) => e.id !== id));
+      return rec;
+    });
+  }
+  async getSleepSettings() {
+    return normalizeSleepSettings(await this._read(KEYS.sleepSettings, null));
+  }
+  async updateSleepSettings(patch) {
+    return this._serialSleep(async () => {
+      const cur = normalizeSleepSettings(await this._read(KEYS.sleepSettings, null));
+      const next = normalizeSleepSettings({ ...cur, ...patch, reminders: { ...cur.reminders, ...((patch && patch.reminders) || {}) } });
+      await this._writeSleepKey(KEYS.sleepSettings, next);
+      return next;
+    });
+  }
+
   /* ---- Врачи и визиты ---- */
   async getVisits() {
     const list = await this._read(KEYS.visits, []);
@@ -1435,6 +1554,7 @@ export class StorageService {
     await Promise.all([
       this.getTests(), this.getVisits(), this.getMeds(), this.getMetricsLog(), this.getMetricsConfig(),
       this.getNotifications(), this.getProfile(), this.getHydration(), this.getAllActivity(), this.getGoals(),
+      this.getSleepEntries(), this.getSleepSettings(),
     ]);
     return summarize(data);
   }

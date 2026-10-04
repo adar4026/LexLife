@@ -2108,3 +2108,165 @@ body:has(.home) { background: var(--hm-bg); }
 /* меню действий в диалоге — столбцом; «Удалить» — красный текст (подтверждение — отдельным шагом) */
 .dialog__actions--stack { flex-direction: column; }
 .dialog__btn--destructive { color: var(--danger-text); }
+
+/* =========================================================
+   Сон (#/sleep, форма записи, настройки). Только токены темы LexLife;
+   --sleep-below — столбец «меньше цели»: тот же оттенок графика, слабее (не новый цвет);
+   --hm-sleep — значок сна на Главной (как прочие типы данных).
+   ========================================================= */
+:root {
+  --sleep-below: color-mix(in srgb, var(--viz-1) 42%, var(--surface));
+  --hm-sleep: #a9abf2;
+}
+[data-theme="light"] {
+  --sleep-below: color-mix(in srgb, var(--viz-1) 38%, var(--surface));
+  --hm-sleep: #5856d6;
+}
+.sleep [hidden] { display: none !important; }
+
+/* заголовок: «Сон» + кнопка настроек справа */
+.sleep-header__row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.sleep-gear {
+  width: 44px; height: 44px; margin-right: -6px; flex-shrink: 0; border-radius: 12px;
+  display: grid; place-items: center; color: var(--blue); text-decoration: none;
+}
+.sleep-gear .hi { width: 24px; height: 24px; stroke-width: 2; }
+.sleep-gear:active { background: var(--surface-2); }
+
+/* пустое состояние первого запуска */
+.sleep-empty__icon { color: var(--hm-sleep); }
+.sleep-empty .med-empty__text { max-width: 290px; }
+.sleep-cta { text-decoration: none; }
+
+/* «Последний сон» */
+.sleep-last {
+  display: block; margin-top: 8px; padding: 16px; border-radius: var(--radius-lg);
+  color: var(--text); text-decoration: none;
+}
+a.sleep-last:active { background: var(--surface-2); }
+.sleep-last__when { margin: 0; font-size: 13px; font-weight: 700; color: var(--text2); }
+.sleep-last__dur { margin: 4px 0 0; font-family: var(--font-head); font-size: 32px; font-weight: 800; letter-spacing: -0.02em; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.sleep-last__times { margin: 4px 0 0; font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.sleep-last__q { margin: 6px 0 0; font-size: 15px; }
+.sleep-last__goal { display: flex; align-items: center; gap: 4px; margin: 8px 0 0; font-size: 13px; color: var(--text2); }
+.sleep-last__ok { width: 16px; height: 16px; stroke-width: 2.6; color: var(--green); }
+.sleep-last__meta { margin: 4px 0 0; font-size: 13px; color: var(--text2); }
+.sleep-last__title { margin: 4px 0 14px; font-size: 18px; font-weight: 800; }
+.sleep-last--none .sleep-cta { margin-top: 0; }
+.sleep-last__prev {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 44px;
+  margin: 10px -4px -6px; padding: 0 4px; color: var(--text2); font-size: 14px; text-decoration: none; border-radius: 10px;
+}
+.sleep-last__prev b { color: var(--text); }
+.sleep-last__chev { width: 16px; height: 16px; flex-shrink: 0; }
+
+/* полоска прогресса (цель, стабильность) */
+.sleep-bar { height: 8px; margin-top: 12px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
+.sleep-bar span { display: block; height: 100%; border-radius: 999px; background: var(--viz-1); }
+
+/* аналитика: период, навигация, карточки */
+.sleep-nav { display: flex; align-items: center; gap: 8px; margin: 10px 0; }
+.sleep-nav__btn { width: 44px; height: 44px; flex-shrink: 0; font-size: 20px; line-height: 1; }
+.sleep-nav__btn:disabled { opacity: 0.35; }
+.sleep-nav__title { flex: 1; min-width: 0; text-align: center; font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.sleep-today {
+  min-height: 44px; padding: 0 12px; flex-shrink: 0; border-radius: 10px;
+  background: var(--surface); border: 1px solid var(--border); color: var(--blue); font-size: 14px; font-weight: 700;
+}
+.sleep-card { margin-top: 10px; }
+.sleep-card__title { margin: 0 0 10px; font-size: 16px; }
+.sleep-kpi__label { margin: 0; font-size: 13px; color: var(--text2); }
+.sleep-kpi__val { margin: 2px 0 0; font-family: var(--font-head); font-size: 26px; font-weight: 800; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
+.sleep-kpi__val small { font-size: 15px; font-weight: 600; color: var(--text2); font-family: var(--font-body); }
+.sleep-kpi__val--sm { font-size: 22px; }
+.sleep-kpi__sub { margin: 4px 0 0; font-size: 13px; color: var(--text2); }
+.sleep-card .chart { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); }
+.sleep-grid { grid-template-columns: 1fr 1fr; }
+.sleep-grid a { color: var(--blue); font-weight: 700; text-decoration: none; }
+.sleep-swatch { background: var(--viz-1); height: 8px; width: 10px; }
+.sleep-swatch--below { background: var(--sleep-below); }
+.sleep-regime { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.sleep-cons { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.sleep-cons__head { display: flex; align-items: center; gap: 6px; }
+.sleep-cons__val { margin-left: auto; font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.sleep-cons .sleep-bar { margin-top: 8px; }
+.sleep-info {
+  width: 32px; height: 32px; margin: -6px 0; padding: 0; border-radius: 50%; flex-shrink: 0;
+  background: none; border: 0; color: var(--blue); font-size: 14px; font-weight: 800; position: relative;
+}
+.sleep-info::before { content: ''; position: absolute; inset: 6px; border: 1.5px solid currentColor; border-radius: 50%; }
+.sleep-info::after { content: ''; position: absolute; inset: -6px; } /* касание 44×44 */
+.sleep-insights { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.sleep-insights li { display: flex; gap: 10px; font-size: 14px; line-height: 1.4; }
+.sleep-insights li > span:first-child { flex-shrink: 0; width: 22px; text-align: center; }
+.sleep-wait { margin-top: 4px; }
+
+/* история */
+.sleep-history__head { align-items: center; }
+.sleep-history__head .med-add { text-decoration: none; }
+.sleep-row { color: var(--text); text-decoration: none; min-height: 64px; align-items: center; }
+.sleep-row:active { background: var(--surface-2); }
+.sleep-row__date { margin: 0; font-size: 13px; color: var(--text2); }
+.sleep-row__main { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 10px; margin: 2px 0 0; }
+.sleep-row__dur { font-size: 17px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.sleep-row__times { font-size: 14px; color: var(--text2); font-variant-numeric: tabular-nums; }
+.sleep-row__meta { margin: 2px 0 0; font-size: 12px; color: var(--text2); }
+.sleep-row__q { flex-shrink: 0; max-width: 40%; font-size: 13px; color: var(--text2); text-align: right; }
+
+/* форма */
+.sleep-when { display: flex; gap: 8px; }
+.sleep-when .input { min-width: 0; min-height: 48px; -webkit-appearance: none; appearance: none; text-align: left; font-variant-numeric: tabular-nums; }
+.sleep-when .input::-webkit-date-and-time-value { text-align: left; }
+.sleep-when__date { flex: 1.25; }
+.sleep-when__time { flex: 1; }
+.sleep-form .input[aria-invalid="true"] { border-color: var(--red); }
+.sleep-dur { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.sleep-dur__label { font-size: 14px; color: var(--text2); }
+.sleep-dur__val { font-family: var(--font-head); font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.sleep-quality { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; }
+.sleep-q {
+  min-width: 0; min-height: 64px; padding: 6px 0; border-radius: 12px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text2);
+}
+.sleep-q__emoji { font-size: 24px; line-height: 1; }
+.sleep-q__label { font-size: 11px; font-weight: 700; line-height: 1.15; text-align: center; letter-spacing: -0.02em; }
+.sleep-q[aria-checked="true"] { background: var(--blue); border-color: var(--blue); color: var(--on-blue); }
+.sleep-q:focus-visible, .sleep-tag:focus-visible, .sleep-stepper__btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.sleep-step-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.sleep-step-row .field__label { margin: 0; }
+.sleep-stepper { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.sleep-stepper__btn {
+  width: 44px; height: 44px; padding: 0; border-radius: 12px; flex-shrink: 0;
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text); font-size: 22px; font-weight: 700; line-height: 1;
+}
+.sleep-stepper__btn:disabled { opacity: 0.35; }
+.sleep-stepper__val { min-width: 36px; text-align: center; font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.sleep-step-row--stack { flex-direction: column; align-items: stretch; gap: 10px; }
+.sleep-stepper--wide { justify-content: space-between; }
+.sleep-stepper--wide .sleep-stepper__val { flex: 1; min-width: 0; font-size: 20px; }
+.sleep-stepper__input { width: 72px; min-height: 44px; padding: 8px 6px; text-align: center; font-weight: 700; font-variant-numeric: tabular-nums; }
+.sleep-nap-row { min-height: 44px; padding-top: 0; padding-bottom: 0; border-bottom: 0; cursor: pointer; }
+.sleep-nap-row__title { margin: 0; color: var(--text); font-weight: 700; }
+.sleep-nap-row__sub { font-size: 12px; color: var(--text2); }
+.sleep-nap-row + .sleep-step-row { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.sleep-tags { display: flex; flex-wrap: wrap; gap: 8px; }
+.sleep-tag {
+  display: inline-flex; align-items: center; gap: 6px;
+  min-height: 44px; padding: 0 14px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text); font-size: 14px; font-weight: 600;
+}
+.sleep-tag[aria-pressed="true"] { background: var(--blue); border-color: var(--blue); color: var(--on-blue); }
+.sleep-note { resize: vertical; min-height: 84px; line-height: 1.4; font-family: inherit; }
+.sleep-delete { color: var(--danger-text); min-height: 48px; }
+.sleep-set-time { width: 140px; flex-shrink: 0; min-height: 44px; -webkit-appearance: none; appearance: none; font-variant-numeric: tabular-nums; }
+@media (max-width: 360px) {
+  .sleep-q__label { font-size: 9.5px; }
+  .sleep-last__dur { font-size: 28px; }
+}
+
+/* Главная: значок и статусы карточки сна */
+.hrow__icon--sleep { color: var(--hm-sleep); background: color-mix(in srgb, var(--hm-sleep) 14%, transparent); }
+.hrow__status--ok { color: var(--hm-ink); display: inline-flex; align-items: center; gap: 4px; }
+.hrow__ok { width: 16px; height: 16px; stroke-width: 2.6; color: var(--green); }
+.hrow__status--add { color: var(--hm-accent); }

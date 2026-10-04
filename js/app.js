@@ -6,7 +6,7 @@
    Показатели — единая модель: каждый показатель = модуль #/metric/<key>.
    ========================================================= */
 
-import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup } from './services/storage.js';
+import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup, SleepStoreError } from './services/storage.js';
 import { createStatsEngine, evaluateWaterPlan, waterGoalDays, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay, dayNum } from './services/analytics.js';
 import { parseWaterMinderCsv, assignImportKeys, buildWaterImportPlan, applyWaterImportPlan, applyTodayWaterImport, isWaterMinderKey } from './services/waterImport.js';
 import { lineChart, barChart as svgBarChart } from './ui/charts.js';
@@ -18,6 +18,13 @@ import { openDocViewer as showDocViewer } from './ui/docViewer.js';
 import { setActiveTab, initBottomNav } from './ui/bottomNav.js';
 import { HOME_WATER_QUICK_ADD, waterProgress, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed } from './services/homeSummary.js';
 import { WEEKDAYS, MED_NAME_MAX, MED_DOSE_MAX, MED_NOTE_MAX, MED_TIMES_MAX, nextDose, medSchedule, medStatusOn, medDaySlots, isMedDueOn, nextDueDay, scheduleLabel, intakeSummary, normalizeMedInput, intakeHistory, medOccurrences } from './services/meds.js';
+import {
+  SLEEP_QUALITY, SLEEP_TAGS, SLEEP_GOAL_MIN, SLEEP_GOAL_MAX, SLEEP_GOAL_STEP, AWAKENINGS_MAX, NAP_MAX_MINUTES, SLEEP_NOTE_MAX, INSIGHT_MIN_DAYS,
+  qualityInfo, tagInfo, formatSleepDuration, formatSleepDelta, normalizeSleepInput, inferBedDate, calculateDuration, makeStamp, stampDay, stampTime,
+  getSleepForDate, averageSleep, averageBedtime, averageWakeTime, averageQuality, sleepConsistency, sleepGoalRate, currentSleepStreak, bestSleepStreak,
+  aggregateByWeek, aggregateByMonth, aggregateByYear, comparePeriods, factorInsights, insightText, periodBounds, shiftPeriod, entriesInRange,
+  napMinutes, totalDayMinutes, minutesToClock, clampSleepGoal, addDays as sleepAddDays,
+} from './services/sleep.js';
 import { nextFire } from './services/notifySchedule.js';
 import { createNotifier, describeNotifyState, armPatch, waterRulePatch, NOTIF_ROUTES, isSafeRoute } from './services/notifier.js';
 import { createPushClient, SYNC_FAIL_TEXT, SERVER_FALLBACK_MS } from './services/pushClient.js';
@@ -128,6 +135,8 @@ const HOME_ICONS = {
   chevron: '<path d="m9.5 6 6 6-6 6"/>',
   plus: '<path d="M12 5.5v13M5.5 12h13"/>',
   check: '<path d="m5.5 12.5 4.2 4.2 8.8-9.2"/>',
+  sleep: '<path d="M19.6 14.8A7.9 7.9 0 0 1 9.2 4.4a7.9 7.9 0 1 0 10.4 10.4z"/>',
+  sliders: '<path d="M4 7.5h9M17.5 7.5H20M4 16.5h3M11.5 16.5H20"/><circle cx="15.2" cy="7.5" r="2.2"/><circle cx="9.2" cy="16.5" r="2.2"/>',
 };
 HOME_ICONS.temperature = HOME_ICONS.pulse;
 HOME_ICONS.spo2 = HOME_ICONS.pulse;
@@ -159,9 +168,10 @@ function homeSection(title, route, label, more = 'Все') {
 async function HomeScreen() {
   const now = new Date();
   const today = dateKey(now);
-  const [water, goal, hyd, tests, metricsLog, visits, meds, takenToday, intakes] = await Promise.all([
+  const [water, goal, hyd, tests, metricsLog, visits, meds, takenToday, intakes, sleepEntries, sleepSettings] = await Promise.all([
     Storage.getWater(today), Storage.getWaterGoal(), Storage.getHydration(), Storage.getTests(), Storage.getMetricsLog(),
     Storage.getVisits(), Storage.getMeds(), Storage.getMedLog(today), Storage.getMedIntakes(today),
+    Storage.getSleepEntries(), Storage.getSleepSettings(),
   ]);
   const screen = el('<div class="home"></div>');
   /* мягкое появление — только при первом открытии Главной за запуск (не на каждом переключении вкладки) */
@@ -169,6 +179,7 @@ async function HomeScreen() {
   homeEntered = true;
 
   screen.appendChild(renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, intakes, metricsLog, enter }));
+  screen.appendChild(renderHomeSleep(getSleepForDate(sleepEntries, today), sleepSettings.goalMinutes));
   const upcoming = renderUpcoming({ meds, takenToday, intakes, visits, now });
   if (upcoming) screen.appendChild(upcoming);
   const attention = renderAttentionSection(tests);
@@ -288,6 +299,36 @@ function homeMetricCells({ meds, takenToday, intakes, metricsLog, today }) {
     });
   });
   return cells;
+}
+
+/* ---------- Сон: запись за сегодня (день пробуждения) или приглашение записать ---------- */
+function renderHomeSleep(e, goal) {
+  const sec = homeSection('Сон', 'sleep', 'Открыть раздел «Сон»');
+  const met = e && e.durationMinutes >= goal;
+  const row = el(`
+    <a class="hrow" href="#/sleep">
+      <span class="hrow__icon hrow__icon--sleep">${homeIcon('sleep')}</span>
+      <span class="hrow__body"><span class="hrow__title"></span>${e ? '<span class="hrow__sub hrow__sub--one"></span>' : ''}</span>
+      <span class="hrow__status ${e ? (met ? 'hrow__status--ok' : '') : 'hrow__status--add'}"></span>
+      ${homeIcon('chevron', 'hrow__chev')}
+    </a>
+  `);
+  const status = $('.hrow__status', row);
+  if (e) {
+    const pct = Math.round((e.durationMinutes / goal) * 100);
+    $('.hrow__title', row).textContent = formatSleepDuration(e.durationMinutes);
+    $('.hrow__sub', row).textContent = `${stampTime(e.sleepStart)} → ${stampTime(e.sleepEnd)}`;
+    status.innerHTML = met ? `Цель выполнена ${homeIcon('check', 'hrow__ok')}` : `${pct}% цели`;
+    row.setAttribute('aria-label', `Сон сегодня: ${formatSleepDuration(e.durationMinutes)}, ${stampTime(e.sleepStart)} → ${stampTime(e.sleepEnd)}, ${met ? 'цель выполнена' : `${pct}% цели`}. Открыть раздел «Сон»`);
+  } else {
+    $('.hrow__title', row).textContent = 'Сегодня нет записи';
+    status.textContent = 'Добавить';
+    row.setAttribute('aria-label', 'Сон: сегодня нет записи. Открыть раздел «Сон», чтобы добавить');
+  }
+  const list = el('<div class="hlist"></div>');
+  list.appendChild(row);
+  sec.appendChild(list);
+  return sec;
 }
 
 /* ---------- Ближайшее: следующее лекарство и следующий визит (время · тип · действие) ---------- */
@@ -1379,6 +1420,724 @@ async function MedFormScreen(id) {
 }
 
 /* =========================================================
+   Сон (#/sleep): последний сон · аналитика за неделю/месяц/год · история по месяцам.
+   Запись — #/sleep/new (#/sleep/new/<дата>), #/sleep/<id>; настройки — #/sleep/settings.
+   Модель и расчёты — services/sleep.js, хранение — Storage (sleep_log, sleep_settings).
+   ========================================================= */
+/* выбранный период аналитики и месяц истории живут, пока открыт LexLife (возврат из формы — туда же) */
+const sleepUi = { kind: 'month', anchor: null, histMonth: null };
+/* черновик формы: возврат в приложение (visibilitychange → render) не теряет введённое */
+let sleepDraft = null;
+
+const capFirst = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+const sleepTimes = (e) => `${stampTime(e.sleepStart)} → ${stampTime(e.sleepEnd)}`;
+const awakeningsText = (n) => (n ? `${n} ${plural(n, 'пробуждение', 'пробуждения', 'пробуждений')}` : 'без пробуждений');
+function sleepDayMonth(iso, today = dateKey()) {
+  const d = new Date(`${iso}T00:00:00`);
+  const sameYear = iso.slice(0, 4) === today.slice(0, 4);
+  return d.toLocaleDateString(RU, sameYear ? { day: 'numeric', month: 'long' } : { day: 'numeric', month: 'long', year: 'numeric' }).replace(/\s*г\.$/, '');
+}
+function sleepDayWord(iso, today = dateKey()) {
+  if (iso === today) return 'Сегодня';
+  if (iso === sleepAddDays(today, -1)) return 'Вчера';
+  return capFirst(sleepDayMonth(iso, today));
+}
+/* мелкая строка карточки: пробуждения · дневной сон */
+function sleepMeta(e) {
+  const parts = [];
+  if (e.awakenings != null) parts.push(awakeningsText(e.awakenings));
+  const nap = napMinutes(e);
+  if (nap) parts.push(`Дневной сон: ${formatSleepDuration(nap)}`);
+  return parts.join(' · ');
+}
+const SLEEP_MONTHS = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн', 'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек'];
+const SLEEP_WD = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+const SLEEP_KINDS = [['week', 'Неделя'], ['month', 'Месяц'], ['year', 'Год']];
+const SLEEP_PREV = { week: 'прошлой неделей', month: 'прошлым месяцем', year: 'прошлым годом' };
+const monthTitleOf = (ym) => { const [y, m] = ym.split('-').map(Number); return capFirst(new Date(y, m - 1, 1).toLocaleDateString(RU, { month: 'long', year: 'numeric' }).replace(/\s*г\.$/, '')); };
+function sleepPeriodTitle(b) {
+  if (b.kind === 'year') return b.start.slice(0, 4);
+  if (b.kind === 'month') return monthTitleOf(b.start.slice(0, 7));
+  const f = (iso) => new Date(`${iso}T00:00:00`).toLocaleDateString(RU, { day: 'numeric', month: 'short' });
+  return `${f(b.start)} – ${f(b.end)}`;
+}
+/* время суток → часы от полудня (ось графика режима: вечер и ночь идут подряд, без разрыва в полночь) */
+const clockHoursFromNoon = (hhmm) => (((Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5)) - 720) + 1440) % 1440) / 60;
+const hoursFromNoonClock = (h) => minutesToClock(h * 60 + 720);
+
+async function SleepScreen() {
+  const screen = el('<div class="sleep"></div>');
+  const today = dateKey();
+  const [entries, settings] = await Promise.all([Storage.getSleepEntries(), Storage.getSleepSettings()]);
+  const goal = settings.goalMinutes;
+  if (!sleepUi.anchor || sleepUi.anchor > today) sleepUi.anchor = today;
+  if (!sleepUi.histMonth || sleepUi.histMonth > today.slice(0, 7)) sleepUi.histMonth = today.slice(0, 7);
+
+  const header = el(`
+    <header class="header sleep-header">
+      <button class="back-btn" type="button">‹ Назад</button>
+      <div class="sleep-header__row">
+        <h1 class="header__title">Сон</h1>
+        <a class="sleep-gear" href="#/sleep/settings" aria-label="Настройки сна">${homeIcon('sliders')}</a>
+      </div>
+    </header>
+  `);
+  $('.back-btn', header).addEventListener('click', goBack);
+  screen.appendChild(header);
+
+  if (!entries.length) {
+    const empty = el(`
+      <section class="med-empty sleep-empty">
+        <span class="med-empty__icon sleep-empty__icon" aria-hidden="true">${homeIcon('sleep')}</span>
+        <h2 class="med-empty__title">Здесь появится история вашего сна</h2>
+        <p class="med-empty__text">Добавьте первую запись, чтобы LexLife начал строить аналитику.</p>
+        <a class="btn-primary btn-primary--brand med-empty__add sleep-cta" href="#/sleep/new">${homeIcon('plus')}<span>Добавить сон</span></a>
+      </section>
+    `);
+    screen.appendChild(empty);
+    return screen;
+  }
+
+  screen.appendChild(sleepLastCard(entries, goal, today));
+  const analytics = el('<section class="section sleep-analytics" aria-labelledby="sl-an-title"></section>');
+  const history = el('<section class="section sleep-history" aria-labelledby="sl-hist-title"></section>');
+  screen.append(analytics, history);
+
+  function paintAnalytics() {
+    analytics.innerHTML = '';
+    const b = periodBounds(sleepUi.kind, sleepUi.anchor);
+    const next = shiftPeriod(b, 1);
+    analytics.appendChild(el('<div class="section__head"><h2 class="section__title" id="sl-an-title">Аналитика</h2></div>'));
+    const seg = el(`<div class="st-period" role="group" aria-label="Период аналитики">${SLEEP_KINDS.map(([k, t]) => `<button class="st-period__btn${k === sleepUi.kind ? ' is-active' : ''}" type="button" data-k="${k}" aria-pressed="${k === sleepUi.kind}">${t}</button>`).join('')}</div>`);
+    seg.addEventListener('click', (e) => { const x = e.target.closest('[data-k]'); if (x && x.dataset.k !== sleepUi.kind) { sleepUi.kind = x.dataset.k; sleepUi.anchor = today; paintAnalytics(); } });
+    const nav = el(`
+      <div class="sleep-nav">
+        <button class="cal-nav__btn sleep-nav__btn" type="button" data-d="-1" aria-label="Предыдущий период">‹</button>
+        <span class="sleep-nav__title" aria-live="polite">${esc(sleepPeriodTitle(b))}</span>
+        <button class="cal-nav__btn sleep-nav__btn" type="button" data-d="1" aria-label="Следующий период"${next.start > today ? ' disabled' : ''}>›</button>
+      </div>
+    `);
+    nav.addEventListener('click', (e) => {
+      const x = e.target.closest('[data-d]');
+      if (!x || x.disabled) return;
+      sleepUi.anchor = shiftPeriod(b, Number(x.dataset.d)).start;
+      paintAnalytics();
+    });
+    analytics.append(seg, nav);
+
+    const cur = entriesInRange(entries, b.start, b.end);
+    if (cur.length < 2) {
+      analytics.appendChild(el(`
+        <div class="card st-empty sleep-wait">
+          <p class="st-empty__title">${cur.length ? 'Нужно несколько дней данных, чтобы показать тенденции' : 'За этот период записей нет'}</p>
+          <p class="st-empty__sub">${cur.length ? `Пока одна запись: ${esc(sleepDayMonth(cur[0].date, today))} · ${esc(formatSleepDuration(cur[0].durationMinutes))}. Графики появятся со второй.` : 'Выберите другой период или добавьте запись сна.'}</p>
+        </div>
+      `));
+      return;
+    }
+    const prev = shiftPeriod(b, -1);
+    analytics.appendChild(durationCard(b, cur, entriesInRange(entries, prev.start, prev.end)));
+    analytics.appendChild(regimeCard(b, cur));
+    analytics.appendChild(qualityCard(b, cur));
+    const nap = napCard(cur);
+    if (nap) analytics.appendChild(nap);
+    const ins = insightsCard(entries);
+    if (ins) analytics.appendChild(ins);
+  }
+
+  /* 1. Продолжительность: средний сон, сравнение, столбцы по дням / месяцам, цель и серии */
+  function durationCard(b, cur, prevList) {
+    const avg = averageSleep(cur);
+    const cmp = comparePeriods(cur, prevList);
+    const card = el(`
+      <div class="card st-card sleep-card">
+        <p class="sleep-kpi__label">Средний сон</p>
+        <p class="sleep-kpi__val">${esc(formatSleepDuration(avg))}</p>
+        ${cmp ? `<p class="sleep-kpi__sub">${esc(formatSleepDelta(cmp.delta))} по сравнению с ${SLEEP_PREV[b.kind]}</p>` : ''}
+      </div>
+    `);
+    const range = { start: dayNum(b.start), end: dayNum(b.end) };
+    let bars, xLabels;
+    if (b.kind === 'year') {
+      bars = aggregateByYear(entries, b.start).map((m) => ({ start: dayNum(m.start), end: dayNum(m.end), value: m.minutes == null ? null : m.minutes / 60, month: m }));
+      xLabels = bars.map((x, i) => ({ day: x.start + 14, label: SLEEP_MONTHS[i] }));
+    } else {
+      const slots = b.kind === 'week' ? aggregateByWeek(entries, b.start) : aggregateByMonth(entries, b.start);
+      bars = slots.map((s) => ({ start: dayNum(s.date), end: dayNum(s.date), value: s.minutes == null ? null : s.minutes / 60, slot: s }));
+      xLabels = b.kind === 'week'
+        ? slots.map((s, i) => ({ day: dayNum(s.date), label: SLEEP_WD[i] }))
+        : slots.filter((s) => [1, 5, 10, 15, 20, 25, 30].includes(Number(s.date.slice(8)))).map((s) => ({ day: dayNum(s.date), label: String(Number(s.date.slice(8))) }));
+    }
+    const metOf = (v) => v != null && v * 60 >= goal;
+    card.appendChild(svgBarChart({
+      range, bars, fit: false, xLabels,
+      goal: { value: goal / 60, label: `цель ${formatSleepDuration(goal)}` },
+      minSpan: 2,
+      yFormat: (v) => `${fmtN(v)} ч`,
+      barColor: (x) => (metOf(x.value) ? 'var(--viz-1)' : 'var(--sleep-below)'),
+      legendExtra: '<span class="chart__key"><i class="chart__swatch sleep-swatch"></i>цель выполнена</span><span class="chart__key"><i class="chart__swatch sleep-swatch sleep-swatch--below"></i>меньше цели</span>',
+      ariaLabel: `Продолжительность сна, ${sleepPeriodTitle(b)}: в среднем ${formatSleepDuration(avg)}, цель ${formatSleepDuration(goal)}. Выберите столбец, чтобы увидеть значение.`,
+      readout: (x) => {
+        if (x.month) {
+          const name = capFirst(new Date(`${x.month.start}T00:00:00`).toLocaleDateString(RU, { month: 'long' }));
+          if (x.value == null) return `<span class="chart__rv chart__rv--muted">нет записей</span><span class="chart__rd">${esc(name)}</span>`;
+          return `<span class="chart__rv">${esc(formatSleepDuration(x.month.minutes))} <small>в среднем</small></span><span class="chart__rd">${esc(name)} · ${x.month.count} ${plural(x.month.count, 'запись', 'записи', 'записей')}</span>`;
+        }
+        const s = x.slot;
+        const day = capFirst(new Date(`${s.date}T00:00:00`).toLocaleDateString(RU, { weekday: 'short', day: 'numeric', month: 'short' }));
+        if (!s.entry) return `<span class="chart__rv chart__rv--muted">нет записи</span><span class="chart__rd">${esc(day)}</span>`;
+        const diff = s.minutes - goal;
+        const st = diff >= 0 ? 'цель выполнена' : `на ${formatSleepDuration(-diff)} меньше цели`;
+        return `<span class="chart__rv">${esc(formatSleepDuration(s.minutes))}</span><span class="chart__rd">${esc(day)} · ${esc(sleepTimes(s.entry))} · ${esc(st)}</span>`;
+      },
+    }));
+    const rate = sleepGoalRate(cur, goal);
+    const cs = currentSleepStreak(entries, goal, today);
+    const bs = bestSleepStreak(entries, goal);
+    card.appendChild(el(`
+      <div class="sgrid sleep-grid">
+        <div class="sgrid__item"><div class="sgrid__label">Цель сна выполнена</div><div class="sgrid__val">${rate.rate == null ? '—' : `${Math.round(rate.rate * 100)}%`}</div><div class="sgrid__sub">${rate.met} из ${rate.total} ${plural(rate.total, 'дня', 'дней', 'дней')} с записью</div></div>
+        <div class="sgrid__item"><div class="sgrid__label">Цель</div><div class="sgrid__val">${esc(formatSleepDuration(goal))}</div><div class="sgrid__sub"><a href="#/sleep/settings">изменить</a></div></div>
+        <div class="sgrid__item"><div class="sgrid__label">Текущая серия</div><div class="sgrid__val">${cs} ${daysWord(cs)}</div><div class="sgrid__sub">подряд с целью</div></div>
+        <div class="sgrid__item"><div class="sgrid__label">Лучшая серия</div><div class="sgrid__val">${bs} ${daysWord(bs)}</div><div class="sgrid__sub">за всё время</div></div>
+      </div>
+    `));
+    card.appendChild(el('<p class="st-note">День без записи не считается ни выполненным, ни пропущенным: проценты и средние — только по записанным ночам. Серия — ночной сон не меньше цели подряд по сегодня (пока сегодня не записано — по вчера).</p>'));
+    return card;
+  }
+
+  /* 2. Режим сна: обычное время, стабильность, график времени отхода ко сну и подъёма */
+  function regimeCard(b, cur) {
+    const bed = averageBedtime(cur), wake = averageWakeTime(cur);
+    const cons = sleepConsistency(cur);
+    const card = el(`
+      <div class="card st-card sleep-card">
+        <h3 class="sleep-card__title">Режим сна</h3>
+        <div class="sleep-regime">
+          <div><p class="sleep-kpi__label">Обычно ложитесь</p><p class="sleep-kpi__val sleep-kpi__val--sm">${bed == null ? '—' : minutesToClock(bed)}</p></div>
+          <div><p class="sleep-kpi__label">Обычно просыпаетесь</p><p class="sleep-kpi__val sleep-kpi__val--sm">${wake == null ? '—' : minutesToClock(wake)}</p></div>
+        </div>
+        <div class="sleep-cons">
+          <div class="sleep-cons__head">
+            <span class="sleep-kpi__label">Стабильность режима</span>
+            <button class="sleep-info" type="button" aria-label="Что такое стабильность режима">?</button>
+            <b class="sleep-cons__val">${cons == null ? '—' : `${cons}%`}</b>
+          </div>
+          ${cons == null ? '<p class="sleep-kpi__sub">Нужно не меньше 3 записей за период.</p>' : `<div class="sleep-bar" role="progressbar" aria-label="Стабильность режима" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${cons}"><span style="width:${cons}%"></span></div>`}
+        </div>
+      </div>
+    `);
+    $('.sleep-info', card).addEventListener('click', () => showDialog({
+      title: 'Стабильность режима',
+      body: `<p>Показывает, насколько одинаковым было время сна и пробуждения в выбранный период.</p><p class="dialog__muted">Считается среднее отклонение времени отхода ко сну и подъёма от обычного для вас времени (по кругу суток, без скачка в полночь): 0 минут — 100%, 2 часа и больше — 0%. Это не медицинский показатель.</p>`,
+      actions: [{ label: 'Понятно', value: true, kind: 'primary' }],
+    }));
+    const bedPts = cur.map((e) => ({ day: dayNum(e.date), value: clockHoursFromNoon(stampTime(e.sleepStart)), e }));
+    const wakePts = cur.map((e) => ({ day: dayNum(e.date), value: clockHoursFromNoon(stampTime(e.sleepEnd)), e }));
+    card.appendChild(lineChart({
+      range: { start: dayNum(b.start), end: dayNum(b.end) }, fit: false,
+      xLabels: b.kind === 'year' ? SLEEP_MONTHS.map((m, i) => ({ day: dayNum(`${b.start.slice(0, 4)}-${String(i + 1).padStart(2, '0')}-15`), label: m })) : null,
+      series: [
+        { key: 'bed', label: 'отход ко сну', color: 'var(--viz-1)', points: bedPts },
+        { key: 'wake', label: 'подъём', color: 'var(--viz-2)', points: wakePts },
+      ],
+      goals: [{ value: clockHoursFromNoon(settings.bedtime), label: settings.bedtime }, { value: clockHoursFromNoon(settings.wakeTime), label: settings.wakeTime }],
+      goalLegend: `желаемое время ${settings.bedtime} и ${settings.wakeTime}`,
+      minSpan: 2,
+      yStep: (() => { const v = [...bedPts, ...wakePts].map((p) => p.value); return Math.max(...v) - Math.min(...v) > 10 ? 4 : 2; })(),
+      yFormat: (v) => hoursFromNoonClock(v),
+      ariaLabel: `Время отхода ко сну и подъёма, ${sleepPeriodTitle(b)}: обычно ${bed == null ? '—' : minutesToClock(bed)} и ${wake == null ? '—' : minutesToClock(wake)}`,
+      readout: (day) => {
+        const p = bedPts.find((q) => q.day === day);
+        const d = capFirst(new Date(`${p.e.date}T00:00:00`).toLocaleDateString(RU, { weekday: 'short', day: 'numeric', month: 'short' }));
+        return `<span class="chart__rv">${esc(sleepTimes(p.e))}</span><span class="chart__rd">${esc(d)} · легли → проснулись</span>`;
+      },
+    }));
+    return card;
+  }
+
+  /* 3. Качество: среднее и динамика (год — средние по месяцам) */
+  function qualityCard(b, cur) {
+    const avg = averageQuality(cur);
+    const rated = cur.filter((e) => e.quality != null);
+    const card = el(`
+      <div class="card st-card sleep-card">
+        <h3 class="sleep-card__title">Качество сна</h3>
+        <p class="sleep-kpi__label">Среднее качество</p>
+        <p class="sleep-kpi__val">${avg == null ? '—' : `${fmtN(avg, 1)} <small>/ 5</small>`}</p>
+        <p class="sleep-kpi__sub">${rated.length ? `по ${rated.length} ${plural(rated.length, 'оценённой ночи', 'оценённым ночам', 'оценённым ночам')}` : 'В этом периоде нет оценок качества.'}</p>
+      </div>
+    `);
+    let pts;
+    if (b.kind === 'year') {
+      pts = aggregateByYear(entries, b.start).filter((m) => m.quality != null).map((m) => ({ day: dayNum(m.start) + 14, value: m.quality, label: capFirst(new Date(`${m.start}T00:00:00`).toLocaleDateString(RU, { month: 'long' })), month: true }));
+    } else {
+      pts = rated.map((e) => ({ day: dayNum(e.date), value: e.quality, label: capFirst(new Date(`${e.date}T00:00:00`).toLocaleDateString(RU, { weekday: 'short', day: 'numeric', month: 'short' })) }));
+    }
+    if (pts.length >= 2) {
+      card.appendChild(lineChart({
+        range: { start: dayNum(b.start), end: dayNum(b.end) }, fit: false,
+        xLabels: b.kind === 'year' ? SLEEP_MONTHS.map((m, i) => ({ day: dayNum(`${b.start.slice(0, 4)}-${String(i + 1).padStart(2, '0')}-15`), label: m })) : null,
+        series: [{ key: 'q', label: 'качество', color: 'var(--viz-1)', points: pts }],
+        domain: { lo: 1, hi: 5 }, minSpan: 4,
+        yFormat: (v) => (Number.isInteger(v) ? String(v) : ''),
+        ariaLabel: `Качество сна по шкале 1–5, ${sleepPeriodTitle(b)}: в среднем ${avg == null ? '—' : fmtN(avg, 1)}`,
+        readout: (day) => {
+          const p = pts.find((q) => q.day === day);
+          const qi = qualityInfo(Math.round(p.value));
+          return `<span class="chart__rv">${p.month ? `${esc(fmtN(p.value, 1))} <small>/ 5 в среднем</small>` : `${qi ? `${qi.emoji} ` : ''}${esc(qi ? qi.label : '')}`}</span><span class="chart__rd">${esc(p.label)}</span>`;
+        },
+      }));
+    }
+    return card;
+  }
+
+  /* 4. Дневной сон — отдельно от ночного; общий сон за сутки — с подписью */
+  function napCard(cur) {
+    const withNap = cur.filter((e) => napMinutes(e) > 0);
+    if (!withNap.length) return null;
+    const avgNap = Math.round(withNap.reduce((s, e) => s + napMinutes(e), 0) / withNap.length);
+    const total = Math.round(cur.reduce((s, e) => s + totalDayMinutes(e), 0) / cur.length);
+    return el(`
+      <div class="card st-card sleep-card">
+        <h3 class="sleep-card__title">Дневной сон</h3>
+        <div class="sgrid sleep-grid">
+          <div class="sgrid__item"><div class="sgrid__label">Дней с дневным сном</div><div class="sgrid__val">${withNap.length}</div><div class="sgrid__sub">в среднем ${esc(formatSleepDuration(avgNap))}</div></div>
+          <div class="sgrid__item"><div class="sgrid__label">Общий сон за сутки</div><div class="sgrid__val">${esc(formatSleepDuration(total))}</div><div class="sgrid__sub">ночной + дневной, в среднем</div></div>
+        </div>
+        <p class="st-note">Средний сон, цель и серии считаются только по ночному сну.</p>
+      </div>
+    `);
+  }
+
+  /* 5. Что связано с вашим сном — по всем записям, только простые наблюдения */
+  function insightsCard(all) {
+    const list = factorInsights(all);
+    const anyTags = all.some((e) => Array.isArray(e.tags) && e.tags.length);
+    if (!list.length && !anyTags) return null;
+    const card = el(`
+      <div class="card st-card sleep-card">
+        <h3 class="sleep-card__title">Что связано с вашим сном</h3>
+        ${list.length ? `<ul class="sleep-insights">${list.slice(0, 5).map((x) => `<li><span aria-hidden="true">${tagInfo(x.key).emoji}</span><span>${esc(insightText(x))}</span></li>`).join('')}</ul>` : ''}
+        <p class="st-note">${list.length ? 'Это наблюдения по вашим записям за всё время, а не медицинские выводы: совпадение не означает причину.' : `Наблюдения появятся, когда будет не меньше ${INSIGHT_MIN_DAYS} дней с фактором и ${INSIGHT_MIN_DAYS} без него.`}</p>
+      </div>
+    `);
+    return card;
+  }
+
+  /* История: месяц, новые сверху; карточка → запись */
+  function paintHistory() {
+    history.innerHTML = '';
+    const curMonth = today.slice(0, 7);
+    const ym = sleepUi.histMonth;
+    const [y, m] = ym.split('-').map(Number);
+    const shift = (d) => { const x = new Date(y, m - 1 + d, 1); return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}`; };
+    const head = el(`
+      <div class="section__head sleep-history__head">
+        <h2 class="section__title" id="sl-hist-title">История</h2>
+        <a class="med-add" href="#/sleep/new" aria-label="Добавить запись сна">${homeIcon('plus')}<span>Добавить</span></a>
+      </div>
+    `);
+    const nav = el(`
+      <div class="sleep-nav">
+        <button class="cal-nav__btn sleep-nav__btn" type="button" data-d="-1" aria-label="Предыдущий месяц">‹</button>
+        <span class="sleep-nav__title" aria-live="polite">${esc(monthTitleOf(ym))}</span>
+        ${ym < curMonth ? '<button class="sleep-today" type="button" data-today>Сегодня</button>' : ''}
+        <button class="cal-nav__btn sleep-nav__btn" type="button" data-d="1" aria-label="Следующий месяц"${ym >= curMonth ? ' disabled' : ''}>›</button>
+      </div>
+    `);
+    nav.addEventListener('click', (e) => {
+      const x = e.target.closest('button');
+      if (!x || x.disabled) return;
+      sleepUi.histMonth = x.hasAttribute('data-today') ? curMonth : shift(Number(x.dataset.d));
+      paintHistory();
+    });
+    history.append(head, nav);
+    const list = entries.filter((e) => e.date.startsWith(`${ym}-`));
+    if (!list.length) { history.appendChild(el('<div class="list-card"><div class="empty">В этом месяце записей сна нет.</div></div>')); return; }
+    const box = el('<div class="list-card sleep-list"></div>');
+    list.forEach((e) => {
+      const q = qualityInfo(e.quality);
+      const meta = sleepMeta(e);
+      const row = el(`
+        <a class="row sleep-row" href="#/sleep/${encodeURIComponent(e.id)}">
+          <div class="row__body">
+            <p class="sleep-row__date"></p>
+            <p class="sleep-row__main"><b class="sleep-row__dur"></b><span class="sleep-row__times"></span></p>
+            ${meta ? '<p class="sleep-row__meta"></p>' : ''}
+          </div>
+          ${q ? `<span class="sleep-row__q"><span aria-hidden="true">${q.emoji}</span> ${esc(q.label)}</span>` : ''}
+          <span class="row__chevron" aria-hidden="true">›</span>
+        </a>
+      `);
+      const wd = new Date(`${e.date}T00:00:00`).toLocaleDateString(RU, { weekday: 'short' });
+      $('.sleep-row__date', row).textContent = `${capFirst(sleepDayMonth(e.date, today))} · ${wd}`;
+      $('.sleep-row__dur', row).textContent = formatSleepDuration(e.durationMinutes);
+      $('.sleep-row__times', row).textContent = sleepTimes(e);
+      if (meta) $('.sleep-row__meta', row).textContent = meta;
+      row.setAttribute('aria-label', `${sleepDayMonth(e.date, today)}: ${formatSleepDuration(e.durationMinutes)}, ${sleepTimes(e)}${q ? `, ${q.label}` : ''}${meta ? `, ${meta}` : ''}. Открыть запись`);
+      box.appendChild(row);
+    });
+    history.appendChild(box);
+  }
+
+  paintAnalytics();
+  paintHistory();
+  return screen;
+}
+
+/* Карточка «Последний сон»: сегодня записан — итог дня; нет — приглашение записать */
+function sleepLastCard(entries, goal, today) {
+  const e = getSleepForDate(entries, today);
+  if (!e) {
+    const last = entries[0];
+    const card = el(`
+      <section class="card sleep-last sleep-last--none" aria-label="Сон сегодня">
+        <p class="sleep-last__when">Сегодня</p>
+        <p class="sleep-last__title">Сегодня сон ещё не записан</p>
+        <a class="btn-primary btn-primary--brand sleep-cta" href="#/sleep/new">${homeIcon('plus')}<span>Добавить сон</span></a>
+        ${last ? `<a class="sleep-last__prev" href="#/sleep/${encodeURIComponent(last.id)}"><span>Последняя запись · ${esc(sleepDayWord(last.date, today).toLowerCase())}: <b>${esc(formatSleepDuration(last.durationMinutes))}</b></span>${homeIcon('chevron', 'sleep-last__chev')}</a>` : ''}
+      </section>
+    `);
+    return card;
+  }
+  const q = qualityInfo(e.quality);
+  const pct = Math.round((e.durationMinutes / goal) * 100);
+  const met = e.durationMinutes >= goal;
+  const meta = sleepMeta(e);
+  const card = el(`
+    <a class="card sleep-last" href="#/sleep/${encodeURIComponent(e.id)}">
+      <p class="sleep-last__when">Сегодня</p>
+      <p class="sleep-last__dur">${esc(formatSleepDuration(e.durationMinutes))}</p>
+      <p class="sleep-last__times">${esc(sleepTimes(e))}</p>
+      ${q ? `<p class="sleep-last__q"><span aria-hidden="true">${q.emoji}</span> ${esc(q.sleep)}</p>` : ''}
+      <div class="sleep-bar" role="progressbar" aria-label="Сон от цели" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.min(pct, 100)}"><span style="width:${Math.min(pct, 100)}%"></span></div>
+      <p class="sleep-last__goal">${met ? `${homeIcon('check', 'sleep-last__ok')}Цель выполнена` : `${pct}% от цели`} · цель ${esc(formatSleepDuration(goal))}</p>
+      ${meta ? `<p class="sleep-last__meta">${esc(meta)}</p>` : ''}
+    </a>
+  `);
+  card.setAttribute('aria-label', `Сон сегодня: ${formatSleepDuration(e.durationMinutes)}, ${sleepTimes(e)}${q ? `, ${q.sleep.toLowerCase()}` : ''}, ${met ? 'цель выполнена' : `${pct}% от цели`}. Открыть запись`);
+  return card;
+}
+
+/* Форма записи сна: новая (#/sleep/new[/<дата пробуждения>]) или правка (#/sleep/<id>) */
+async function SleepFormScreen(id, presetDate = null) {
+  const today = dateKey();
+  const [existing, settings] = await Promise.all([id ? Storage.getSleepEntry(id) : null, Storage.getSleepSettings()]);
+  const screen = el('<div class="med-form sleep-form"></div>');
+  const route = location.hash;
+  const leave = () => { sleepDraft = null; goBackOr('sleep'); };
+  screen.appendChild(backHeader(id ? 'Запись сна' : 'Новая запись сна', { label: 'Назад', onBack: leave }));
+  if (id && !existing) {
+    screen.appendChild(el('<div class="empty">Запись сна не найдена — возможно, она удалена.</div>'));
+    return screen;
+  }
+  const wake0 = presetDate && /^\d{4}-\d{2}-\d{2}$/.test(presetDate) && presetDate <= today ? presetDate : today;
+  let st = existing ? {
+    bedDate: stampDay(existing.sleepStart), bedTime: stampTime(existing.sleepStart),
+    wakeDate: existing.date, wakeTime: stampTime(existing.sleepEnd),
+    quality: existing.quality ?? null, awakenings: existing.awakenings ?? 0,
+    napEnabled: napMinutes(existing) > 0, napMinutes: napMinutes(existing) || 30,
+    tags: new Set(existing.tags || []), note: existing.note || '', bedManual: true,
+  } : {
+    bedDate: inferBedDate(wake0, settings.bedtime, settings.wakeTime), bedTime: settings.bedtime,
+    wakeDate: wake0, wakeTime: settings.wakeTime,
+    quality: null, awakenings: 0, napEnabled: false, napMinutes: 30, tags: new Set(), note: '', bedManual: false,
+  };
+  if (sleepDraft && sleepDraft.route === route && Date.now() - sleepDraft.at < 30 * 60000) st = { ...sleepDraft.state, tags: new Set(sleepDraft.state.tags) };
+  const saveDraft = () => { sleepDraft = { route, at: Date.now(), state: { ...st, tags: [...st.tags] } }; };
+
+  const form = el(`
+    <form class="med-form__form" novalidate>
+      <div class="input-card">
+        <fieldset class="med-form__set">
+          <legend class="field__label">Лёг спать</legend>
+          <div class="sleep-when">
+            <input class="input sleep-when__date" id="sf-bed-date" type="date" aria-label="Дата, когда легли спать" required>
+            <input class="input sleep-when__time" id="sf-bed-time" type="time" aria-label="Время, когда легли спать" required>
+          </div>
+        </fieldset>
+        <fieldset class="med-form__set">
+          <legend class="field__label">Проснулся</legend>
+          <div class="sleep-when">
+            <input class="input sleep-when__date" id="sf-wake-date" type="date" max="${today}" aria-label="Дата пробуждения" aria-describedby="sf-day-hint" required>
+            <input class="input sleep-when__time" id="sf-wake-time" type="time" aria-label="Время пробуждения" required>
+          </div>
+          <p class="med-form__hint" id="sf-day-hint"></p>
+        </fieldset>
+        <div class="sleep-dur">
+          <span class="sleep-dur__label">Продолжительность</span>
+          <b class="sleep-dur__val" aria-live="polite"></b>
+        </div>
+        <p class="med-form__err" id="sf-time-err" role="alert" hidden></p>
+      </div>
+
+      <div class="input-card">
+        <fieldset class="med-form__set">
+          <legend class="field__label">Качество сна <span class="med-form__opt">· необязательно</span></legend>
+          <div class="sleep-quality" role="radiogroup" aria-label="Качество сна">
+            ${SLEEP_QUALITY.map((q) => `<button class="sleep-q" type="button" role="radio" data-q="${q.value}" aria-checked="false" aria-label="${q.value} из 5: ${q.label}"><span class="sleep-q__emoji" aria-hidden="true">${q.emoji}</span><span class="sleep-q__label" aria-hidden="true">${q.label}</span></button>`).join('')}
+          </div>
+        </fieldset>
+        <div class="sleep-step-row med-form__last">
+          <span class="field__label" id="sf-aw-label">Пробуждения ночью</span>
+          <div class="sleep-stepper" role="group" aria-labelledby="sf-aw-label">
+            <button class="sleep-stepper__btn" type="button" data-aw="-1" aria-label="Меньше пробуждений">−</button>
+            <output class="sleep-stepper__val" id="sf-aw" aria-live="polite"></output>
+            <button class="sleep-stepper__btn" type="button" data-aw="1" aria-label="Больше пробуждений">+</button>
+          </div>
+        </div>
+        <p class="med-form__err" id="sf-aw-err" role="alert" hidden></p>
+      </div>
+
+      <div class="input-card">
+        <div class="rs-row sleep-nap-row">
+          <div><div class="field__label sleep-nap-row__title" id="sf-nap-label">Дневной сон</div><div class="sleep-nap-row__sub">Есть дневной сон</div></div>
+          <button class="rs-toggle" id="sf-nap" type="button" role="switch" aria-labelledby="sf-nap-label" aria-checked="false"><span class="rs-toggle__knob"></span></button>
+        </div>
+        <div class="sleep-step-row" data-part="nap">
+          <label class="field__label" for="sf-nap-min">Длительность, мин</label>
+          <div class="sleep-stepper">
+            <button class="sleep-stepper__btn" type="button" data-nap="-10" aria-label="Меньше на 10 минут">−</button>
+            <input class="input sleep-stepper__input" id="sf-nap-min" type="number" inputmode="numeric" min="1" max="${NAP_MAX_MINUTES}" step="5">
+            <button class="sleep-stepper__btn" type="button" data-nap="10" aria-label="Больше на 10 минут">+</button>
+          </div>
+        </div>
+        <p class="med-form__err" id="sf-nap-err" role="alert" hidden></p>
+      </div>
+
+      <div class="input-card">
+        <fieldset class="med-form__set med-form__last">
+          <legend class="field__label">Что могло повлиять на сон? <span class="med-form__opt">· необязательно</span></legend>
+          <div class="sleep-tags">
+            ${SLEEP_TAGS.map((t) => `<button class="sleep-tag" type="button" data-tag="${t.key}" aria-pressed="false"><span aria-hidden="true">${t.emoji}</span> ${esc(t.label)}</button>`).join('')}
+          </div>
+        </fieldset>
+      </div>
+
+      <div class="input-card">
+        <div class="field med-form__last">
+          <label class="field__label" for="sf-note">Заметка <span class="med-form__opt">· необязательно</span></label>
+          <textarea class="input sleep-note" id="sf-note" rows="3" maxlength="${SLEEP_NOTE_MAX}" placeholder="Например, долго не мог заснуть, проснулся около 4 утра"></textarea>
+        </div>
+      </div>
+
+      <div class="med-form__actions">
+        <button class="btn-primary btn-primary--brand" type="submit">Сохранить</button>
+        <button class="btn-ghost med-form__cancel" type="button">Отмена</button>
+        ${existing ? '<button class="btn-ghost sleep-delete" type="button">Удалить запись</button>' : ''}
+      </div>
+    </form>
+  `);
+  const bedDate = $('#sf-bed-date', form), bedTime = $('#sf-bed-time', form);
+  const wakeDate = $('#sf-wake-date', form), wakeTime = $('#sf-wake-time', form);
+  const durVal = $('.sleep-dur__val', form), timeErr = $('#sf-time-err', form);
+  const napMin = $('#sf-nap-min', form);
+  bedDate.value = st.bedDate; bedTime.value = st.bedTime; wakeDate.value = st.wakeDate; wakeTime.value = st.wakeTime;
+  napMin.value = String(st.napMinutes);
+  $('#sf-note', form).value = st.note;
+
+  const input = () => ({ ...st, tags: [...st.tags] });
+  function paintTime() {
+    const r = normalizeSleepInput(input(), { today });
+    const terr = r.errors.start || r.errors.end || r.errors.duration;
+    const dur = calculateDuration(makeStamp(st.bedDate, st.bedTime), makeStamp(st.wakeDate, st.wakeTime));
+    durVal.textContent = terr ? '—' : formatSleepDuration(dur);
+    $('#sf-day-hint', form).textContent = st.wakeDate ? `Запись относится к дню пробуждения: ${sleepDayMonth(st.wakeDate, today)}` : '';
+    return terr;
+  }
+  function showTimeErr(msg) {
+    timeErr.hidden = !msg;
+    timeErr.textContent = msg || '';
+    [bedDate, bedTime, wakeDate, wakeTime].forEach((x) => (msg ? x.setAttribute('aria-invalid', 'true') : x.removeAttribute('aria-invalid')));
+  }
+  const onTime = () => {
+    st.bedTime = bedTime.value; st.wakeTime = wakeTime.value; st.wakeDate = wakeDate.value;
+    /* дата засыпания подстраивается, пока её не меняли вручную: 23:40 → накануне, 00:30 → тот же день */
+    if (!st.bedManual && st.wakeDate) { st.bedDate = inferBedDate(st.wakeDate, st.bedTime, st.wakeTime); bedDate.value = st.bedDate; }
+    const err = paintTime();
+    if (!timeErr.hidden) showTimeErr(err);
+    saveDraft();
+  };
+  [bedTime, wakeTime, wakeDate].forEach((x) => { x.addEventListener('input', onTime); x.addEventListener('change', onTime); });
+  const onBedDate = () => { st.bedDate = bedDate.value; st.bedManual = true; const err = paintTime(); if (!timeErr.hidden) showTimeErr(err); saveDraft(); };
+  bedDate.addEventListener('input', onBedDate);
+  bedDate.addEventListener('change', onBedDate);
+
+  const paintQuality = () => $$('.sleep-q', form).forEach((b) => {
+    const on = Number(b.dataset.q) === st.quality;
+    b.setAttribute('aria-checked', String(on));
+    b.tabIndex = on || (st.quality == null && b.dataset.q === '1') ? 0 : -1;
+  });
+  $('.sleep-quality', form).addEventListener('click', (e) => {
+    const b = e.target.closest('.sleep-q');
+    if (!b) return;
+    const q = Number(b.dataset.q);
+    st.quality = st.quality === q ? null : q; // повторное касание снимает оценку
+    paintQuality(); saveDraft();
+  });
+  $('.sleep-quality', form).addEventListener('keydown', (e) => {
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return;
+    e.preventDefault();
+    const d = e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 1;
+    st.quality = Math.min(5, Math.max(1, (st.quality || (d > 0 ? 0 : 6)) + d));
+    paintQuality(); saveDraft();
+    $(`.sleep-q[data-q="${st.quality}"]`, form).focus();
+  });
+
+  const paintAw = () => {
+    $('#sf-aw', form).textContent = String(st.awakenings);
+    $('[data-aw="-1"]', form).disabled = st.awakenings <= 0;
+    $('[data-aw="1"]', form).disabled = st.awakenings >= AWAKENINGS_MAX;
+  };
+  $$('[data-aw]', form).forEach((b) => b.addEventListener('click', () => {
+    st.awakenings = Math.min(AWAKENINGS_MAX, Math.max(0, st.awakenings + Number(b.dataset.aw)));
+    paintAw(); saveDraft();
+  }));
+
+  const napToggle = $('#sf-nap', form);
+  const paintNap = () => {
+    napToggle.classList.toggle('is-on', st.napEnabled);
+    napToggle.setAttribute('aria-checked', String(st.napEnabled));
+    $('[data-part="nap"]', form).hidden = !st.napEnabled;
+    if (!st.napEnabled) $('#sf-nap-err', form).hidden = true;
+  };
+  napToggle.addEventListener('click', () => { st.napEnabled = !st.napEnabled; paintNap(); saveDraft(); });
+  /* вся строка — зона касания переключателя (сам он 48×28) */
+  $('.sleep-nap-row', form).addEventListener('click', (e) => { if (!e.target.closest('#sf-nap')) napToggle.click(); });
+  napMin.addEventListener('input', () => { st.napMinutes = napMin.value === '' ? '' : Number(napMin.value); saveDraft(); });
+  $$('[data-nap]', form).forEach((b) => b.addEventListener('click', () => {
+    const cur = Number(st.napMinutes) || 0;
+    st.napMinutes = Math.min(NAP_MAX_MINUTES, Math.max(10, Math.round((cur + Number(b.dataset.nap)) / 5) * 5));
+    napMin.value = String(st.napMinutes);
+    saveDraft();
+  }));
+
+  const paintTags = () => $$('.sleep-tag', form).forEach((b) => b.setAttribute('aria-pressed', String(st.tags.has(b.dataset.tag))));
+  $('.sleep-tags', form).addEventListener('click', (e) => {
+    const b = e.target.closest('.sleep-tag');
+    if (!b) return;
+    if (st.tags.has(b.dataset.tag)) st.tags.delete(b.dataset.tag); else st.tags.add(b.dataset.tag);
+    paintTags(); saveDraft();
+  });
+  $('#sf-note', form).addEventListener('input', (e) => { st.note = e.target.value; saveDraft(); });
+  $('.med-form__cancel', form).addEventListener('click', leave);
+
+  async function openDuplicate(dup) {
+    const go = await showDialog({
+      title: `За ${sleepDayMonth(dup.date, today)} сон уже записан`,
+      body: `<p class="dialog__muted">Одна дата пробуждения — одна запись: ${esc(formatSleepDuration(dup.durationMinutes))}, ${esc(sleepTimes(dup))}. Откройте её, чтобы изменить, или выберите другую дату.</p>`,
+      actions: [{ label: 'Отмена', value: false }, { label: 'Открыть запись', value: true, kind: 'primary' }],
+    });
+    if (go) { sleepDraft = null; location.replace(`#/sleep/${encodeURIComponent(dup.id)}`); }
+  }
+
+  let saving = false;
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (saving) return;
+    const r = normalizeSleepInput(input(), { today });
+    showTimeErr(r.errors.start || r.errors.end || r.errors.duration);
+    const awErr = $('#sf-aw-err', form), napErr = $('#sf-nap-err', form);
+    awErr.hidden = !r.errors.awakenings; awErr.textContent = r.errors.awakenings || '';
+    napErr.hidden = !r.errors.nap; napErr.textContent = r.errors.nap || '';
+    if (r.errors.nap) napMin.setAttribute('aria-invalid', 'true'); else napMin.removeAttribute('aria-invalid');
+    if (!r.ok) {
+      const first = r.errors.start ? bedTime : r.errors.end || r.errors.duration ? wakeTime : r.errors.nap ? napMin : null;
+      if (first) first.focus();
+      return;
+    }
+    saving = true;
+    const btn = $('button[type="submit"]', form);
+    btn.classList.add('is-busy');
+    try {
+      if (existing) await Storage.updateSleepEntry(existing.id, r.value);
+      else await Storage.addSleepEntry(r.value);
+    } catch (err) {
+      saving = false;
+      btn.classList.remove('is-busy');
+      if (err instanceof SleepStoreError && err.code === 'DUPLICATE_DATE' && err.existing) { await openDuplicate(err.existing); return; }
+      flash(err instanceof SleepStoreError && err.code !== 'INVALID' ? err.message : 'Не удалось сохранить запись сна');
+      return;
+    }
+    sleepDraft = null;
+    flash('Сохранено ✓');
+    location.replace('#/sleep');
+  });
+
+  const del = $('.sleep-delete', form);
+  if (del) del.addEventListener('click', async () => {
+    const ok = await showDialog({
+      title: `Удалить запись сна за ${sleepDayMonth(existing.date, today)}?`,
+      body: `<p class="dialog__muted">${esc(formatSleepDuration(existing.durationMinutes))}, ${esc(sleepTimes(existing))}. Аналитика пересчитается без этой ночи.</p>`,
+      actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+    });
+    if (!ok) return;
+    try { await Storage.removeSleepEntry(existing.id); } catch { flash('Не удалось удалить'); return; }
+    sleepDraft = null;
+    flash('Удалено');
+    location.replace('#/sleep');
+  });
+
+  screen.appendChild(form);
+  paintTime(); paintQuality(); paintAw(); paintNap(); paintTags();
+  return screen;
+}
+
+/* Настройки сна: цель (4–12 ч, шаг 15 мин), желаемое время сна и подъёма */
+async function SleepSettingsScreen() {
+  const s = await Storage.getSleepSettings();
+  const screen = el('<div class="med-form sleep-form"></div>');
+  const leave = () => goBackOr('sleep');
+  screen.appendChild(backHeader('Настройки сна', { label: 'Назад', onBack: leave }));
+  let goal = s.goalMinutes;
+  const form = el(`
+    <form class="med-form__form" novalidate>
+      <div class="input-card">
+        <div class="sleep-step-row sleep-step-row--stack med-form__last">
+          <span class="field__label" id="ss-goal-label">Целевая продолжительность</span>
+          <div class="sleep-stepper sleep-stepper--wide" role="group" aria-labelledby="ss-goal-label">
+            <button class="sleep-stepper__btn" type="button" data-g="-1" aria-label="Меньше на 15 минут">−</button>
+            <output class="sleep-stepper__val" id="ss-goal" aria-live="polite"></output>
+            <button class="sleep-stepper__btn" type="button" data-g="1" aria-label="Больше на 15 минут">+</button>
+          </div>
+        </div>
+        <p class="med-form__hint">От ${SLEEP_GOAL_MIN / 60} до ${SLEEP_GOAL_MAX / 60} часов, шаг ${SLEEP_GOAL_STEP} минут. Цель — для ночного сна: по ней считаются выполнение и серии.</p>
+      </div>
+      <div class="input-card">
+        <div class="rs-row"><label class="field__label" for="ss-bed" style="margin:0">Желаемое время сна</label><input class="input sleep-set-time" id="ss-bed" type="time" required></div>
+        <div class="rs-row"><label class="field__label" for="ss-wake" style="margin:0">Желаемое время подъёма</label><input class="input sleep-set-time" id="ss-wake" type="time" required></div>
+        <p class="med-form__hint">Подставляется в новую запись и показывается на графике режима. Напоминания «Пора готовиться ко сну» и «Записать сон» появятся в одном из следующих обновлений.</p>
+      </div>
+      <div class="med-form__actions">
+        <button class="btn-primary btn-primary--brand" type="submit">Сохранить</button>
+        <button class="btn-ghost med-form__cancel" type="button">Отмена</button>
+      </div>
+    </form>
+  `);
+  const paintGoal = () => {
+    $('#ss-goal', form).textContent = formatSleepDuration(goal);
+    $('[data-g="-1"]', form).disabled = goal <= SLEEP_GOAL_MIN;
+    $('[data-g="1"]', form).disabled = goal >= SLEEP_GOAL_MAX;
+  };
+  $$('[data-g]', form).forEach((b) => b.addEventListener('click', () => { goal = clampSleepGoal(goal + Number(b.dataset.g) * SLEEP_GOAL_STEP); paintGoal(); }));
+  $('#ss-bed', form).value = s.bedtime;
+  $('#ss-wake', form).value = s.wakeTime;
+  $('.med-form__cancel', form).addEventListener('click', leave);
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const bedtime = $('#ss-bed', form).value, wakeTime = $('#ss-wake', form).value;
+    if (!/^\d{2}:\d{2}$/.test(bedtime) || !/^\d{2}:\d{2}$/.test(wakeTime)) { flash('Укажите время сна и подъёма'); return; }
+    try { await Storage.updateSleepSettings({ goalMinutes: goal, bedtime, wakeTime }); } catch { flash('Не удалось сохранить'); return; }
+    flash('Сохранено ✓');
+    location.replace('#/sleep');
+  });
+  screen.appendChild(form);
+  paintGoal();
+  return screen;
+}
+
+/* =========================================================
    Вкладка 4 — Анализы: журнал (#/tests) → полный анализ (#/test/<id>) →
    история показателя (#/test-history/<ключ>); форма — #/test/new, #/test/<id>/edit.
    ========================================================= */
@@ -2094,6 +2853,7 @@ async function restoreFlow(file) {
     ['Визиты', summary.visits],
     ['Уведомления', summary.notifications],
     ['Дни активности', summary.activityDays],
+    ['Сон', `${summary.sleep || 0} ${plural(summary.sleep || 0, 'запись', 'записи', 'записей')}`],
   ];
   if (full) rows.push(['Документы анализов (PDF/фото)', full.attachments.length]);
   const schemaLine = info.migrated ? `${info.schemaVersion} → будет обновлена до ${CURRENT_SCHEMA_VERSION}` : String(info.schemaVersion);
@@ -3194,14 +3954,14 @@ async function NotificationsScreen() {
 const CAL_WD = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 
 async function loadCalendarData() {
-  const [visits, tests, meds, notifs, waterGoal] = await Promise.all([
-    Storage.getVisits(), Storage.getTests(), Storage.getMeds(), Storage.getNotifications(), Storage.getWaterGoal(),
+  const [visits, tests, meds, notifs, waterGoal, sleep] = await Promise.all([
+    Storage.getVisits(), Storage.getTests(), Storage.getMeds(), Storage.getNotifications(), Storage.getWaterGoal(), Storage.getSleepEntries(),
   ]);
   const nextDoses = meds
     .filter((m) => m.active && m.every_days)
     .map((m) => ({ med: m, date: nextDose(m) }))
     .filter((x) => x.date);
-  return { visits, tests, meds, notifs, waterGoal, nextDoses };
+  return { visits, tests, meds, notifs, waterGoal, nextDoses, sleep };
 }
 
 /* разовые события конкретной даты — они же дают точку на сетке месяца/недели */
@@ -3219,9 +3979,13 @@ function dayPointEvents(dateStr, data) {
 function dayHasDot(dateStr, data) {
   return dayPointEvents(dateStr, data).length > 0;
 }
-/* полная повестка дня: разовые события + ежедневные (лекарства, цель воды) — для панели дня */
+/* полная повестка дня: разовые события + ежедневные (сон, лекарства, цель воды) — для панели дня.
+   Сон — запись за день пробуждения (строится из sleep_log, отдельно не хранится); точку на сетке
+   не ставит, как и другие ежедневные записи, иначе точки визитов и анализов потеряются. */
 function dayAgendaEvents(dateStr, data) {
   const ev = dayPointEvents(dateStr, data).slice();
+  const sl = getSleepForDate(data.sleep || [], dateStr);
+  if (sl) ev.push({ icon: '😴', title: `Сон · ${formatSleepDuration(sl.durationMinutes)}`, sub: `${stampTime(sl.sleepStart)} → ${stampTime(sl.sleepEnd)}${sl.quality ? ` · ${qualityInfo(sl.quality).label}` : ''}`, time: null, route: `sleep/${encodeURIComponent(sl.id)}` });
   data.meds.forEach((m) => medOccurrences(m, dateStr).forEach(({ time }) => { if (time) ev.push({ icon: '💊', title: m.name, sub: 'Приём лекарства', time, route: 'meds' }); }));
   ev.push({ icon: '💧', title: `Цель воды: ${fmtNum(data.waterGoal / 1000)} л`, sub: 'Ежедневная цель', time: null, route: 'metric/water' });
   ev.sort((a, b) => (a.time || '99:99').localeCompare(b.time || '99:99'));
@@ -3983,6 +4747,7 @@ const DRAWER_SECTIONS = [
   ],
   [
     { route: 'activity', icon: '🏃', title: 'Активность' },
+    { route: 'sleep', icon: '😴', title: 'Сон' },
     { route: 'metric/water', icon: '💧', title: 'Вода' },
     { route: 'visits', icon: '🩺', title: 'Врачи и визиты' },
   ],
@@ -4094,6 +4859,10 @@ function resolve() {
     if (rest.endsWith('/edit')) return { fn: () => VisitFormScreen(rest.slice(0, -5)), tab: null, main: false };
     return { fn: () => VisitDetailScreen(rest), tab: null, main: false };
   }
+  if (h === 'sleep') return { fn: SleepScreen, tab: null, main: false };
+  if (h === 'sleep/settings') return { fn: SleepSettingsScreen, tab: null, main: false };
+  if (h === 'sleep/new' || h.startsWith('sleep/new/')) return { fn: () => SleepFormScreen(null, h.slice(10) || null), tab: null, main: false };
+  if (h.startsWith('sleep/')) return { fn: () => SleepFormScreen(safeDecode(h.slice(6))), tab: null, main: false };
   if (h === 'med/new') return { fn: () => MedFormScreen(null), tab: 'meds', main: false };
   if (h.startsWith('med/') && h.endsWith('/edit')) return { fn: () => MedFormScreen(safeDecode(h.slice(4, -5))), tab: 'meds', main: false };
   if (h === 'test/new') return { fn: () => TestFormScreen(null), tab: 'tests', main: false };
