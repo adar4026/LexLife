@@ -2,7 +2,7 @@
    app.js — точка входа, роутер, Drawer и экраны (MVP v1.0)
    Async-first: данные через StorageService с await.
    Навигация: нижний таб-бар (Главная/Показатели/Лекарства/Анализы)
-   + боковое меню (Drawer, ☰ справа сверху).
+   + боковое меню (Drawer; открывается аватаром профиля справа сверху).
    Показатели — единая модель: каждый показатель = модуль #/metric/<key>.
    ========================================================= */
 
@@ -4779,6 +4779,7 @@ async function buildDrawer() {
     </button>
   `);
   drawer.appendChild(head);
+  paintAvatarBtn(p);
   const scroller = el('<div class="drawer-scroll"></div>');
   drawer.appendChild(scroller);
   const mode = migrationMode();
@@ -4805,6 +4806,16 @@ async function buildDrawer() {
     const it = e.target.closest('[data-route]');
     if (it) { closeDrawer(); location.hash = `#/${it.getAttribute('data-route')}`; }
   });
+}
+/* Аватар в шапке — кнопка Drawer: фото профиля, без фото — инициалы или силуэт.
+   Обновляется вместе с шапкой Drawer (buildDrawer вызывается и после сохранения профиля). */
+const AVATAR_PH_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="9" r="4"/><path d="M4.5 20.5c1.2-3.6 4.1-5.5 7.5-5.5s6.3 1.9 7.5 5.5"/></svg>';
+function paintAvatarBtn(p) {
+  const box = $('#avatar-btn-img');
+  const initials = String(p.name || '').trim().split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join('');
+  box.classList.toggle('avatar-btn__img--ph', !p.photo);
+  box.innerHTML = p.photo ? `<img src="${esc(p.photo)}" alt="" decoding="async">`
+    : initials ? `<span class="avatar-btn__initials">${esc(initials)}</span>` : AVATAR_PH_SVG;
 }
 function openDrawer() { lockPageScroll(); $('#drawer').classList.add('open'); $('#scrim').classList.add('open'); }
 function closeDrawer() { $('#drawer').classList.remove('open'); $('#scrim').classList.remove('open'); unlockPageScroll(); }
@@ -4919,7 +4930,7 @@ async function render() {
   const token = ++renderToken;
   closeDrawer();
   setActiveTab($('#tab-bar'), tab);
-  $('#menu-btn').classList.toggle('hidden', !main);
+  $('#avatar-btn').classList.toggle('hidden', !main);
   const node = await fn();
   if (token !== renderToken) return;
   const mount = $('#screen');
@@ -4933,7 +4944,7 @@ async function render() {
 }
 
 function initChrome() {
-  $('#menu-btn').addEventListener('click', openDrawer);
+  $('#avatar-btn').addEventListener('click', openDrawer);
   $('#scrim').addEventListener('click', closeDrawer);
   /* затемнение не пропускает жест прокрутки на страницу (тап по-прежнему закрывает) */
   $('#scrim').addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });

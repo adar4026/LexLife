@@ -35,6 +35,7 @@
   --radius-lg: 16px;
 
   --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   /* Нижняя навигация — единый источник геометрии:
      --tab-h      высота капсулы;
@@ -941,26 +942,59 @@ button.tv-doc:active { background: var(--surface-2); }
 }
 
 /* =========================================================
-   Боковое меню (Drawer), кнопка ☰, светлая тема, модуль показателя
+   Боковое меню (Drawer), аватар-кнопка, светлая тема, модуль показателя
    ========================================================= */
 
-/* Кнопка ☰ */
-.menu-btn {
+/* Аватар профиля — кнопка Drawer (правый верх, поверх экрана: заголовок не сдвигает).
+   Видимый круг 54px (52px на невысоких экранах), зона касания на 2px больше (≥ 44×44);
+   центр — на линии заголовка Главной (safe-top + 30px), край круга — 12px от правого
+   края с учётом safe-area (альбомная ориентация). */
+.avatar-btn {
+  --avatar-size: 54px;
   position: fixed;
-  top: calc(var(--safe-top) + 8px);
-  right: 12px;
+  top: calc(var(--safe-top) + 30px - var(--avatar-size) / 2 - 1px);
+  right: calc(var(--safe-right) + 11px);
   z-index: 150;
-  width: 44px;
-  height: 44px;
-  border-radius: 12px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-  font-size: 18px;
+  width: calc(var(--avatar-size) + 2px);
+  height: calc(var(--avatar-size) + 2px);
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
   display: grid;
   place-items: center;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 0.12s ease, opacity 0.12s ease;
 }
-.menu-btn.hidden { display: none; }
+.avatar-btn:active { transform: scale(0.94); opacity: 0.8; }
+.avatar-btn:focus-visible { outline: none; }
+.avatar-btn:focus-visible .avatar-btn__img { box-shadow: 0 0 0 3px var(--blue); }
+.avatar-btn.hidden { display: none; }
+.avatar-btn__img {
+  width: var(--avatar-size);
+  height: var(--avatar-size);
+  border-radius: 50%;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  border: 1.5px solid var(--avatar-ring);
+  box-shadow: var(--avatar-shadow);
+  background: var(--surface-2);
+  color: var(--text2);
+}
+.avatar-btn__img img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.avatar-btn__img--ph svg { width: 58%; height: 58%; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; }
+.avatar-btn__initials { font-family: var(--font-body); font-size: 19px; font-weight: 800; letter-spacing: 0.02em; color: var(--text); }
+@media (max-height: 700px) { .avatar-btn { --avatar-size: 52px; } }
+:root {
+  --avatar-ring: rgba(255, 255, 255, 0.22);
+  --avatar-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+[data-theme="light"] {
+  --avatar-ring: #ffffff;
+  --avatar-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.12), 0 2px 8px rgba(0, 0, 0, 0.1);
+}
 
 /* Затемнение */
 .scrim {
@@ -1504,12 +1538,9 @@ textarea.input { resize: vertical; font-family: inherit; }
 
 /* фон страницы на Главной — фирменный светлый / тёмно-бирюзовый; остальные экраны не меняются */
 body:has(.home) { background: var(--hm-bg); }
-.app:has(.home) .menu-btn {
+.app:has(.home) .avatar-btn__img--ph {
   background: var(--hm-soft);
-  border-color: var(--hm-soft-border);
   color: var(--hm-ink);
-  -webkit-backdrop-filter: blur(14px) saturate(140%);
-  backdrop-filter: blur(14px) saturate(140%);
 }
 
 .home {
@@ -1613,8 +1644,8 @@ body:has(.home) { background: var(--hm-bg); }
   65% { transform: translate3d(13%, 6%, 0) rotate(2deg) scale(1.07); opacity: 0.5; }
 }
 
-/* дата — заголовок экрана, на одной линии с кнопкой ☰ (центр — safe-top + 30px) */
-.hh__head { padding-right: 56px; }
+/* дата — заголовок экрана, на одной линии с аватаром (центр — safe-top + 30px) */
+.hh__head { padding-right: 60px; }
 .hh__date {
   margin: 0;
   min-height: 36px;

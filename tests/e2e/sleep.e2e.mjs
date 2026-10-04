@@ -61,7 +61,7 @@ export async function run({ keep = false } = {}) {
 
     /* 1–4. шторка: «😴 Сон» между «Активность» и «Вода», открывает раздел */
     await go('#/home');
-    $('#menu-btn').click();
+    $('#avatar-btn').click();
     await sleep(200);
     const items = $$('#drawer .drawer-item').map((b) => txt(b));
     const iA = items.indexOf('🏃 Активность'), iS = items.indexOf('😴 Сон'), iW = items.indexOf('💧 Вода');

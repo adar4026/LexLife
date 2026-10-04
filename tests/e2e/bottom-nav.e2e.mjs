@@ -120,7 +120,7 @@ export async function run() {
 
     /* Drawer как раньше */
     await go('#/home');
-    $('#menu-btn').click();
+    $('#avatar-btn').click();
     await sleep(320);
     check('Drawer открывается поверх капсулы', $('#drawer').classList.contains('open') && +getComputedStyle($('#drawer')).zIndex > +getComputedStyle(nav).zIndex);
     $('#scrim').click();

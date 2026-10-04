@@ -7,7 +7,7 @@
 
 ## 1. Обзор
 
-PWA без фреймворков (чистый HTML/CSS/ES-модули), все данные локально (`localStorage`), офлайн через Service Worker. Интерфейс русский, тёмная/светлая тема. Навигация: нижний таб-бар (4 вкладки) + боковое меню Drawer (☰ справа).
+PWA без фреймворков (чистый HTML/CSS/ES-модули), все данные локально (`localStorage`), офлайн через Service Worker. Интерфейс русский, тёмная/светлая тема. Навигация: нижний таб-бар (4 вкладки) + боковое меню Drawer (открывается круглым аватаром профиля справа вверху).
 
 | Аспект | Решение |
 |---|---|
@@ -33,7 +33,7 @@ LexLife/
 ├── worker/                      # Cloudflare Worker: API, cron, Web Push (VAPID + aes128gcm), headers
 ├── migrations/                  # D1: только инфраструктура уведомлений
 ├── scripts/                     # build-assets (dist/ из allowlist), gen-vapid
-├── index.html                  # Оболочка: <main id="screen">, таб-бар, ☰, Drawer, scrim
+├── index.html                  # Оболочка: <main id="screen">, таб-бар, аватар-кнопка Drawer, Drawer, scrim
 ├── manifest.json                # PWA-манифест
 ├── sw.js                        # Service Worker (app-shell + кэш шрифтов + notificationclick + Web Push)
 ├── css/styles.css               # Все стили: токены, тёмная/светлая тема, компоненты
@@ -68,7 +68,7 @@ LexLife/
 ```
 🏠 Главная  ·  📊 Показатели  ·  💊 Лекарства  ·  🩸 Анализы
 ```
-`TAB_ROUTES = ['home', 'metrics', 'meds', 'tests']`. Кнопка **☰** (правый верх) видна на «основных» экранах (4 вкладки + модули показателей) и открывает Drawer.
+`TAB_ROUTES = ['home', 'metrics', 'meds', 'tests']`. Круглый **аватар профиля** (`#avatar-btn`, правый верх, `position: fixed` — заголовок экрана не сдвигает) виден на «основных» экранах (4 вкладки + модули показателей) и открывает Drawer (`openDrawer`). Фото — `profile.photo`, без фото — инициалы имени или силуэт; обновляется в `buildDrawer()` (в т.ч. после сохранения профиля). Отдельной кнопки ☰ нет.
 
 ### Боковое меню (Drawer, выезжает справа)
 ```
@@ -94,7 +94,7 @@ LexLife/
                      notifications · goals · stats · security
 fallback → home
 ```
-Роутер `resolve()`: `metric/water` → модуль воды (`WaterScreen`), прочие `metric/<key>` → `MetricScreen(key)`; `visit/*` → детальный экран / форму визита; под-экраны Drawer подсвечивают вкладку как «не-таб» (☰ скрыта, есть кнопка «‹ Назад»).
+Роутер `resolve()`: `metric/water` → модуль воды (`WaterScreen`), прочие `metric/<key>` → `MetricScreen(key)`; `visit/*` → детальный экран / форму визита; под-экраны Drawer подсвечивают вкладку как «не-таб» (аватар скрыт, есть кнопка «‹ Назад»).
 
 ---
 
