@@ -295,6 +295,18 @@ test('лекарства на сегодня: курс «раз в N дней» 
   assert.deepEqual(medsToday([c], { today: '2026-02-14', takenToday: ['Курс'] }), { due: 1, taken: 1 });
 });
 
+test('лекарства: несколько приёмов в день — план и «Ближайшее» по каждому приёму (med_intakes)', () => {
+  const m = { id: 'm1', name: 'Два приёма', active: true, dose: '', schedule: { mode: 'daily', days: [], times: ['08:00', '20:00'] } };
+  const morning = [{ medId: 'm1', scheduledTime: '08:00', takenAt: '2026-02-14T08:05:00.000Z' }];
+  assert.deepEqual(medsToday([m], { today: '2026-02-14' }), { due: 2, taken: 0 });
+  assert.deepEqual(medsToday([m], { today: '2026-02-14', intakes: morning }), { due: 2, taken: 1 });
+  const at = (h, mi) => new Date(2026, 1, 14, h, mi);
+  assert.deepEqual(upcomingMed([m], { now: at(7, 0) }), { id: 'm1', name: 'Два приёма', dose: '', date: '2026-02-14', time: '08:00' });
+  assert.equal(upcomingMed([m], { now: at(7, 0), intakes: morning }).time, '20:00', 'утренний отмечен — следующий вечерний');
+  assert.deepEqual([upcomingMed([m], { now: at(21, 0) }).date, upcomingMed([m], { now: at(21, 0) }).time], ['2026-02-15', '08:00']);
+  assert.equal(upcomingMed([{ ...m, deletedAt: '2026-02-01T00:00:00.000Z' }], { now: at(7, 0) }), null, 'удалённое не показывается');
+});
+
 test('ближайший визит: запланированный или «следующий визит», не в прошлом, самый ранний', () => {
   const visits = [
     { id: 'v1', date: '2026-01-10', status: 'done', specialty: 'Кардиолог', doctor: 'Петров', nextDate: '2026-03-01' },

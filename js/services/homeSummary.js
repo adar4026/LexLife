@@ -8,14 +8,15 @@
      которые приложение уже отмечает как вне диапазона (evaluateField — справочные
      значения приложения для основных полей; outOfLabRange — диапазон бланка для
      показателей лаборатории). Новых медицинских правил здесь нет;
-   • upcomingMed — «Ближайшее»: одно ближайшее предстоящее лекарство по его
-     собственному расписанию (reminder_time / every_days) и отметке «принял сегодня»;
+   • upcomingMed — «Ближайшее»: один ближайший предстоящий приём лекарства по его
+     расписанию (services/meds.js) и отметкам приёмов за сегодня;
    • recentActivity — «Последняя активность»: из последнего анализа, последнего
      измерения и последнего прошедшего визита — самый поздний по дате.
    ========================================================= */
 
 import { REFERENCE, TEST_FIELDS, sortTests, dateKey } from './storage.js';
 import { evaluateField, outOfLabRange, resultKey, urineStandard, groupSummary } from './testsJournal.js';
+import { nextDose, medSchedule, medDaySlots, medOccurrences, isMedDueOn, nextDueDay, intakeSummary } from './meds.js';
 
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 
@@ -109,75 +110,46 @@ export function attentionItems(tests, { limit = 3 } = {}) {
 }
 
 /* ---------- «Ближайшее»: лекарства ---------- */
+/* nextDose переехал в meds.js (единая логика расписания) — экспорт сохранён */
+export { nextDose };
 
-/* Следующая доза курса «раз в N дней» (не раньше today; курс ещё не начался — его начало) или null.
-   Тот же расчёт, что раньше жил в app.js (экран «Лекарства», Календарь). */
-export function nextDose(med, today = dateKey()) {
-  if (!med.every_days || !med.start) return null;
-  const ms = 86400000;
-  const start = new Date(med.start + 'T00:00:00');
-  const day = new Date(today + 'T00:00:00');
-  if (start > day) return med.start;
-  const cycles = Math.ceil((day - start) / ms / med.every_days);
-  return dateKey(new Date(start.getTime() + cycles * med.every_days * ms));
-}
-
-const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 const hhmm = (d) => `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 
-/* Одно ближайшее предстоящее лекарство или null.
-   meds — health_meds; takenToday — med_log за сегодня (имена). Учитываются только активные лекарства
-   со своим расписанием: reminder_time — ежедневно в это время (для курса «раз в N дней» — в дни доз),
-   every_days без времени — в день дозы. Сегодняшний приём уже отмечен или его время прошло —
-   берётся следующий. Курс закончился (end) — не показывается.
+/* Один ближайший предстоящий приём лекарства или null.
+   meds — health_meds; intakes — med_intakes за сегодня; takenToday — старый med_log за сегодня (имена).
+   Учитываются лекарства со временем приёма (schedule.times / reminder_time) или курсом «раз в N дней»
+   (без времени — по дате). Сегодняшний приём уже отмечен или его время прошло — берётся следующий:
+   следующее время сегодня, иначе первый приём ближайшего дня по расписанию (дни недели, курс, end).
    → { id, name, dose, date, time|null } */
-export function upcomingMed(meds, { now = new Date(), takenToday = [] } = {}) {
+export function upcomingMed(meds, { now = new Date(), takenToday = [], intakes = [] } = {}) {
   const today = dateKey(now);
-  const tm = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
-  const tomorrow = dateKey(tm);
   const nowT = hhmm(now);
-  const taken = new Set(Array.isArray(takenToday) ? takenToday : []);
   let best = null;
-  (Array.isArray(meds) ? meds : []).forEach((m) => {
-    if (!m || !m.active || typeof m.name !== 'string' || !m.name.trim()) return;
-    const time = TIME_RE.test(m.reminder_time || '') ? m.reminder_time : null;
-    const course = m.every_days && m.start;
-    if (!time && !course) return;
-    /* сегодняшний приём ещё впереди? */
-    const todayOpen = !taken.has(m.name) && (!time || time > nowT);
-    let date;
-    if (course) {
-      date = nextDose(m, today);
-      if (date === today && !todayOpen) date = nextDose(m, tomorrow);
-    } else {
-      date = todayOpen ? today : tomorrow;
-    }
-    if (!date || (m.end && date > m.end)) return;
+  const consider = (m, date, time) => {
     const key = `${date}T${time || '00:00'}`;
     if (!best || key < best.key) best = { key, id: m.id, name: m.name, dose: m.dose || '', date, time };
+  };
+  (Array.isArray(meds) ? meds : []).forEach((m) => {
+    if (!m || typeof m.name !== 'string' || !m.name.trim() || m.deletedAt) return;
+    const course = !!(m.every_days && m.start);
+    if (!medSchedule(m).times.length && !course) return;
+    const open = medDaySlots(m, today, { intakes, legacyNames: takenToday })
+      .find((x) => !x.extra && !x.taken && (x.time ? x.time > nowT : true) && isMedDueOn(m, today));
+    if (open) { consider(m, today, open.time); return; }
+    const day = nextDueDay(m, today);
+    if (day) consider(m, day, medOccurrences(m, day)[0].time);
   });
   if (!best) return null;
   const { key, ...item } = best;
   return item;
 }
 
-/* Лекарства на сегодня — те же отметки, что на экране «Лекарства» («принял сегодня» по имени).
-   В план дня входит активное лекарство, если курс не закончился (end) и не начался позже (start);
-   курс «раз в N дней» — только в день дозы. Лекарство без расписания отмечается ежедневно — входит.
+/* Лекарства на сегодня — приёмы по расписанию дня (несколько времён = несколько приёмов) и сколько
+   из них отмечено. «По необходимости» в план не входит; курс «раз в N дней» — только в день дозы;
+   лекарство без времени — один приём в день. takenToday — старые отметки по имени (med_log).
    → { due, taken } (taken ≤ due) */
-export function medsToday(meds, { today = dateKey(), takenToday = [] } = {}) {
-  const taken = new Set(Array.isArray(takenToday) ? takenToday : []);
-  let due = 0;
-  let done = 0;
-  (Array.isArray(meds) ? meds : []).forEach((m) => {
-    if (!m || !m.active || typeof m.name !== 'string' || !m.name.trim()) return;
-    if (m.end && today > m.end) return;
-    if (m.start && today < m.start) return;
-    if (m.every_days && m.start && nextDose(m, today) !== today) return;
-    due += 1;
-    if (taken.has(m.name)) done += 1;
-  });
-  return { due, taken: done };
+export function medsToday(meds, { today = dateKey(), takenToday = [], intakes = [] } = {}) {
+  return intakeSummary(meds, today, { intakes, legacyNames: takenToday });
 }
 
 /* Ближайший визит — как в Календаре: запланированный визит (status 'planned') на дату не раньше

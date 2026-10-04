@@ -36,13 +36,14 @@ export const KEYS = {
   notifications: 'notifications', // правила уведомлений (готовы под push)
   activityDays: 'activity_days',
   activityGoals: 'activity_goals',
-  medLog: 'med_log',
+  medLog: 'med_log',            // старый журнал: { "ГГГГ-ММ-ДД": ["Имя", ...] } — только чтение
+  medIntakes: 'med_intakes',    // приёмы: { "ГГГГ-ММ-ДД": [{ medId, scheduledTime, takenAt }] }
 };
 
 /* Ключи с пользовательскими данными (для бэкапа/очистки) — без служебного meta */
 const DATA_KEYS = [
   KEYS.alerts, KEYS.tests, KEYS.meds, KEYS.visits, KEYS.metrics, KEYS.metricsLog, KEYS.profile, KEYS.hydration, KEYS.notifications,
-  KEYS.activityDays, KEYS.activityGoals, KEYS.medLog,
+  KEYS.activityDays, KEYS.activityGoals, KEYS.medLog, KEYS.medIntakes,
 ];
 
 /* UI-настройка темы: хранится строкой (не JSON), живёт вне DATA_KEYS, но входит в бэкап (settings.theme) */
@@ -69,6 +70,7 @@ const KEY_LABELS = {
   [KEYS.metrics]: 'Цели показателей', [KEYS.metricsLog]: 'История показателей', [KEYS.profile]: 'Профиль',
   [KEYS.hydration]: 'План воды', [KEYS.notifications]: 'Уведомления', [KEYS.activityDays]: 'Активность',
   [KEYS.activityGoals]: 'Цели активности', [KEYS.medLog]: 'Журнал приёма лекарств',
+  [KEYS.medIntakes]: 'Приёмы лекарств',
 };
 
 /* Ошибка бэкапа с кодом — UI показывает message как есть */
@@ -142,6 +144,28 @@ function rememberRemovedKeys(day, removed) {
   if (!keys.length) return;
   day.removedKeys = [...new Set([...(Array.isArray(day.removedKeys) ? day.removedKeys : []), ...keys])];
 }
+/* Один приём лекарства за день — чистая функция над записями дня.
+   state: { intakes: [{ medId, scheduledTime, takenAt }] из med_intakes[day], legacy: [имена] из med_log[day] }.
+   taken: true — добавить приём (повтор не дублирует), false — удалить только этот приём (medId + time).
+   Старая отметка по имени (name в legacy) учитывается, пока у лекарства нет приёмов за день; при первой
+   новой отметке она переносится в приём legacyTime (takenAt: null — время приёма неизвестно).
+   → { intakes, legacy, legacyChanged } (вход не изменяется) */
+export function applyMedIntake(state, { medId, time = null, taken, name = null, legacyTime = null, takenAt = nowISO() }) {
+  let intakes = (Array.isArray(state && state.intakes) ? state.intakes : []).filter(isPlainObj).map((r) => ({ ...r }));
+  let legacy = Array.isArray(state && state.legacy) ? state.legacy.slice() : [];
+  let legacyChanged = false;
+  const t = time || null;
+  if (name && legacy.includes(name) && !intakes.some((r) => r.medId === medId)) {
+    legacy = legacy.filter((x) => x !== name);
+    legacyChanged = true;
+    intakes.push({ medId, scheduledTime: legacyTime || null, takenAt: null });
+  }
+  const same = (r) => r.medId === medId && (r.scheduledTime || null) === t;
+  if (taken) { if (!intakes.some(same)) intakes.push({ medId, scheduledTime: t, takenAt }); }
+  else intakes = intakes.filter((r) => !same(r));
+  return { intakes, legacy, legacyChanged };
+}
+
 /* §6.5 — метка времени в полном ISO (UTC) */
 const nowISO = () => new Date().toISOString();
 const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -355,6 +379,12 @@ const METRIC_VALUE_OK = {
 };
 const metricValueOk = (m, x) => (METRIC_VALUE_OK[m] || isNumOrNull)(x);
 const NOTIF_TYPE_LIST = ['meds', 'water', 'pressure', 'weight', 'tests', 'visits'];
+/* Расписание лекарства (аддитивное поле): режим, дни недели (0=Вс…6=Сб, как в notifications), времена */
+export const MED_MODES = ['daily', 'days', 'asNeeded'];
+const isWeekdays = (v) => Array.isArray(v) && v.every((d) => Number.isInteger(d) && d >= 0 && d <= 6);
+const MED_SCHEDULE_OK = (s) => s == null || (isPlainObj(s) && MED_MODES.includes(s.mode)
+  && (s.days == null || isWeekdays(s.days)) && (s.times == null || (Array.isArray(s.times) && s.times.every((t) => isTimeStr(t) && t !== ''))));
+const MED_INTAKE_OK = (r) => isPlainObj(r) && isSafeId(r.medId) && isTimeOrNull(r.scheduledTime) && isStrOrNull(r.takenAt);
 
 /* Структура каждого ключа финальной схемы (CURRENT_SCHEMA_VERSION).
    Поля, которые UI подставляет в разметку без экранирования (id, фото, числа, время),
@@ -365,7 +395,8 @@ const KEY_VALIDATORS = {
     && TEST_FIELDS.every((f) => isNumOrNull(t[f])) && testExtrasOk(t)),
   [KEYS.meds]: listOf((m) => typeof m.name === 'string' && (m.id == null || isSafeId(m.id))
     && isTimeOrNull(m.reminder_time) && isNumOrNull(m.every_days) && isDateOrNull(m.start) && isStrOrNull(m.end)
-    && isStrOrNull(m.icon) && isStrOrNull(m.dose) && isStrOrNull(m.purpose)),
+    && isStrOrNull(m.icon) && isStrOrNull(m.dose) && isStrOrNull(m.purpose)
+    && MED_SCHEDULE_OK(m.schedule) && isStrOrNull(m.note) && isStrOrNull(m.deletedAt)),
   [KEYS.visits]: listOf((v) => isSafeId(v.id) && isDateStr(v.date) && isDateOrNull(v.nextDate)
     && ['doctor', 'specialty', 'clinic', 'reason', 'conclusion', 'recommendations', 'status'].every((f) => isStrOrNull(v[f]))
     && (v.attachments == null || Array.isArray(v.attachments))
@@ -387,6 +418,7 @@ const KEY_VALIDATORS = {
     && (a.plank == null || (Array.isArray(a.plank) && a.plank.every(isNumOrNull)))),
   [KEYS.activityGoals]: mapOf((x) => isNumOrNull(x)),
   [KEYS.medLog]: mapOf((list, d) => isDateStr(d) && d !== '' && Array.isArray(list) && list.every((x) => typeof x === 'string')),
+  [KEYS.medIntakes]: mapOf((list, d) => isDateStr(d) && d !== '' && Array.isArray(list) && list.every(MED_INTAKE_OK)),
 };
 
 /* Проверка набора данных финальной схемы; бросает BackupError с названием раздела */
@@ -681,6 +713,8 @@ export class StorageService {
     const meta = await this._read(KEYS.meta, null);
     if (!meta || !meta.seededAt) await this._seed();
     else await this._migrate();
+    /* аддитивный раздел без смены схемы: у существующих установок появляется пустым */
+    if ((await this._read(KEYS.medIntakes, null)) == null) await this._write(KEYS.medIntakes, {});
     return this;
   }
 
@@ -736,6 +770,7 @@ export class StorageService {
     if ((await this._read(KEYS.notifications, null)) == null) await this._write(KEYS.notifications, defaultNotifications());
     if ((await this._read(KEYS.activityDays, null)) == null) await this._write(KEYS.activityDays, {});
     if ((await this._read(KEYS.medLog, null)) == null) await this._write(KEYS.medLog, {});
+    if ((await this._read(KEYS.medIntakes, null)) == null) await this._write(KEYS.medIntakes, {});
   }
 
   /* ---- Предупреждения ---- */
@@ -1066,36 +1101,105 @@ export class StorageService {
       .sort((a, b) => a.date.localeCompare(b.date));
   }
 
-  /* ---- Лекарства ---- */
-  async getMeds() {
-    return this._read(KEYS.meds, []);
+  /* ---- Лекарства ----
+     health_meds — препараты; schedule / note / deletedAt — аддитивные поля (services/meds.js).
+     med_intakes — отметки по локальной дате: одна запись = один принятый приём
+     (medId + scheduledTime, null — приём без времени). med_log — старый журнал по имени:
+     только чтение, кроме переноса старой отметки дня в приём (applyMedIntake).
+     Изменения лекарств и приёмов сериализуются: быстрые касания не теряют запись. */
+  _serialMeds(fn) {
+    const run = (this._medsQueue || Promise.resolve()).then(fn, fn);
+    this._medsQueue = run.catch(() => {});
+    return run;
+  }
+  async _writeMedsKey(key, value) {
+    if (!(await this._write(key, value))) throw new Error('Не удалось сохранить: недостаточно места на устройстве.');
+  }
+  /* удалённые (deletedAt) остаются в базе ради истории приёмов и связей визитов — в списках их нет */
+  async getMeds({ includeDeleted = false } = {}) {
+    const list = await this._read(KEYS.meds, []);
+    return includeDeleted ? list : list.filter((m) => !m.deletedAt);
+  }
+  async getMed(id) {
+    return (await this._read(KEYS.meds, [])).find((m) => m.id === id && !m.deletedAt) || null;
   }
   async addMed(med) {
-    const list = await this._read(KEYS.meds, []);
-    const entry = { id: uid(), icon: '💊', active: true, ...med };
-    list.push(entry);
-    await this._write(KEYS.meds, list);
-    return entry;
+    return this._serialMeds(async () => {
+      const list = await this._read(KEYS.meds, []);
+      const entry = { id: uid(), icon: '💊', active: true, ...med };
+      list.push(entry);
+      await this._writeMedsKey(KEYS.meds, list);
+      return entry;
+    });
+  }
+  /* Правка: остальные поля записи (every_days, start, end, purpose, icon, active) сохраняются */
+  async updateMed(id, patch) {
+    return this._serialMeds(async () => {
+      const list = await this._read(KEYS.meds, []);
+      const i = list.findIndex((m) => m.id === id && !m.deletedAt);
+      if (i < 0) return null;
+      list[i] = { ...list[i], ...patch, id };
+      await this._writeMedsKey(KEYS.meds, list);
+      return list[i];
+    });
+  }
+  /* «Удалить»: препарат пропадает из списков; запись остаётся с deletedAt, история приёмов не трогается */
+  async removeMed(id) {
+    return this._serialMeds(async () => {
+      const list = await this._read(KEYS.meds, []);
+      const i = list.findIndex((m) => m.id === id && !m.deletedAt);
+      if (i < 0) return false;
+      list[i] = { ...list[i], active: false, deletedAt: nowISO() };
+      await this._writeMedsKey(KEYS.meds, list);
+      return true;
+    });
+  }
+  /* У лекарств из старых копий может не быть id (схема это допускала) — без него приём не отметить.
+     Дописывает только id, остальное не меняется; пишет, лишь если такие записи есть. */
+  async ensureMedIds() {
+    return this._serialMeds(async () => {
+      const list = await this._read(KEYS.meds, []);
+      let changed = false;
+      list.forEach((m) => { if (isPlainObj(m) && m.id == null) { m.id = uid(); changed = true; } });
+      if (changed) await this._writeMedsKey(KEYS.meds, list);
+      return changed;
+    });
   }
 
-  /* лог приёма: { "YYYY-MM-DD": ["Имя", ...] } (формат ТЗ) */
+  /* старый журнал «принял сегодня»: { "ГГГГ-ММ-ДД": ["Имя", ...] } (формат ТЗ) */
   async getMedLog(day = dateKey()) {
     const all = await this._read(KEYS.medLog, {});
     return all[day] || [];
   }
-  /* весь журнал приёма (только чтение — для статистики) */
+  /* весь старый журнал (только чтение — статистика) */
   async getAllMedLog() {
     return this._read(KEYS.medLog, {});
   }
-  async toggleMedTaken(name, day = dateKey()) {
-    const all = await this._read(KEYS.medLog, {});
-    const list = all[day] || [];
-    const i = list.indexOf(name);
-    if (i >= 0) list.splice(i, 1);
-    else list.push(name);
-    all[day] = list;
-    await this._write(KEYS.medLog, all);
-    return list.includes(name);
+  async getMedIntakes(day = dateKey()) {
+    const all = await this._read(KEYS.medIntakes, {});
+    return Array.isArray(all[day]) ? all[day] : [];
+  }
+  async getAllMedIntakes() {
+    return this._read(KEYS.medIntakes, {});
+  }
+  /* Отметить / снять один приём (medId + время) за день day — меняется только запись этого дня.
+     name + legacyTime: старая отметка дня по имени (med_log) переносится в приём legacyTime,
+     чтобы не пропасть при первой новой отметке этого лекарства в тот же день. */
+  async setMedIntake({ medId, time = null, taken, day = dateKey(), name = null, legacyTime = null, now = new Date() }) {
+    if (!isSafeId(medId) || !isDateStr(day) || day === '' || !isTimeOrNull(time)) throw new Error('setMedIntake: некорректный приём');
+    return this._serialMeds(async () => {
+      const [intakes, log] = await Promise.all([this._read(KEYS.medIntakes, {}), this._read(KEYS.medLog, {})]);
+      const next = applyMedIntake({ intakes: intakes[day], legacy: log[day] }, { medId, time, taken, name, legacyTime, takenAt: now.toISOString() });
+      if (next.intakes.length) intakes[day] = next.intakes;
+      else delete intakes[day];
+      await this._writeMedsKey(KEYS.medIntakes, intakes);
+      if (next.legacyChanged) {
+        if (next.legacy.length) log[day] = next.legacy;
+        else delete log[day];
+        await this._writeMedsKey(KEYS.medLog, log);
+      }
+      return next.intakes;
+    });
   }
 
   /* ---- Врачи и визиты ---- */

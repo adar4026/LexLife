@@ -1963,3 +1963,148 @@ body:has(.home) { background: var(--hm-bg); }
   .hh__fill, .hh-btn, .hm, .hev, .hrow { transition: none; }
   .hh-btn:active, .hev:active, .hrow:active { transform: none; }
 }
+
+/* =========================================================
+   Лекарства: пустое состояние, карточки с приёмами (отметка на каждый приём),
+   история по дням, форма лекарства. Только существующие токены темы;
+   --on-blue — текст на фирменном синем (тёмная тема: тёмный текст, белый на #58a6ff
+   не проходит контраст; светлая — белый на #0a72e8, ≥ 4.5:1).
+   ========================================================= */
+:root { --on-blue: #0d1117; }
+[data-theme="light"] { --on-blue: #fff; }
+
+.meds [hidden], .med-form [hidden] { display: none !important; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+.btn-primary--brand {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: 48px; background: var(--blue); color: var(--on-blue);
+}
+.btn-primary--brand .hi { width: 20px; height: 20px; stroke-width: 2.4; }
+
+/* пустое состояние */
+.med-empty {
+  margin-top: 14px; padding: 26px 20px 20px; text-align: center;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+}
+.med-empty__icon {
+  width: 56px; height: 56px; margin: 0 auto 12px; border-radius: 16px;
+  display: grid; place-items: center; background: var(--surface-2); color: var(--blue);
+}
+.med-empty__icon .hi { width: 28px; height: 28px; stroke-width: 1.8; }
+.med-empty__title { font-size: 18px; margin: 0; }
+.med-empty__text { font-size: 14px; line-height: 1.4; color: var(--text2); margin: 6px auto 18px; max-width: 260px; }
+.med-empty__add { margin-top: 0; }
+.med-hint { font-size: 13px; line-height: 1.4; color: var(--text2); text-align: center; margin: 14px 16px 0; }
+
+/* строка над списком: сводка дня + «Добавить» (заголовок экрана остаётся главным) */
+.med-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 12px 2px 10px; }
+.med-sum { margin: 0; font-size: 14px; font-weight: 600; color: var(--text2); min-width: 0; }
+.med-add {
+  display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0;
+  min-height: 44px; padding: 0 14px 0 10px; border-radius: 999px;
+  background: var(--surface); border: 1px solid var(--border); color: var(--blue);
+  font-size: 15px; font-weight: 700;
+}
+.med-add .hi { width: 18px; height: 18px; stroke-width: 2.4; }
+.med-add:active { opacity: 0.6; }
+
+/* карточка лекарства */
+.med-list { display: grid; gap: 10px; }
+.med-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.med-card__head { display: flex; align-items: flex-start; gap: 12px; padding: 12px 4px 12px 14px; }
+.med-card__icon {
+  width: 36px; height: 36px; border-radius: 10px; flex-shrink: 0;
+  display: grid; place-items: center; background: var(--surface-2); color: var(--hm-med);
+}
+.med-card__body { flex: 1; min-width: 0; padding-top: 1px; }
+.med-card__name { font-family: var(--font-body); font-size: 16px; font-weight: 800; letter-spacing: 0; margin: 0; overflow-wrap: anywhere; }
+.med-card__meta, .med-card__note { font-size: 13px; line-height: 1.35; color: var(--text2); margin: 2px 0 0; overflow-wrap: anywhere; }
+.med-card__more {
+  width: 44px; height: 44px; margin: -6px 0; flex-shrink: 0; border-radius: 12px;
+  display: grid; place-items: center; background: none; border: 0; color: var(--text2); padding: 0;
+}
+.med-card__more:active { background: var(--surface-2); }
+.med-card__off { margin: 0; padding: 11px 14px 12px; border-top: 1px solid var(--border); font-size: 13px; color: var(--text2); }
+
+.med-slots { list-style: none; margin: 0; padding: 0; }
+.med-slot { border-top: 1px solid var(--border); }
+.med-slot__btn {
+  width: 100%; min-height: 52px; display: flex; align-items: center; gap: 12px;
+  padding: 6px 14px; background: none; border: 0; color: var(--text); text-align: left;
+}
+.med-slot__btn:active { background: var(--surface-2); }
+.med-slot__btn:disabled { opacity: 0.7; }
+.med-slot__time { min-width: 56px; font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.med-slot__state { flex: 1; min-width: 0; font-size: 14px; color: var(--text2); }
+.med-slot__state small { font-size: 12px; }
+.med-slot.is-taken .med-slot__state { color: var(--text); font-weight: 600; }
+.med-slot__check {
+  width: 28px; height: 28px; flex-shrink: 0; border-radius: 50%;
+  border: 2px solid var(--text2); display: grid; place-items: center; color: transparent;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.med-slot__check svg { width: 16px; height: 16px; }
+.med-slot.is-taken .med-slot__check { background: var(--green); border-color: var(--green); color: var(--bg); }
+[data-theme="light"] .med-slot.is-taken .med-slot__check { color: #fff; }
+
+/* история по дням */
+.med-history { margin-top: 18px; }
+.med-history__head {
+  display: flex; align-items: baseline; gap: 8px; min-height: 44px; padding: 10px 2px;
+  font-size: 15px; font-weight: 700; cursor: pointer; list-style: none;
+}
+.med-history__head::-webkit-details-marker { display: none; }
+.med-history__head::after { content: '›'; display: inline-block; margin-left: auto; color: var(--text2); font-size: 20px; line-height: 1; transition: transform 0.15s ease; }
+.med-history[open] .med-history__head::after { transform: rotate(90deg); }
+.med-history__head small { font-size: 13px; font-weight: 400; color: var(--text2); }
+.med-history__list { list-style: none; margin: 0; padding: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+.med-history__day { display: flex; gap: 12px; padding: 10px 14px; font-size: 14px; }
+.med-history__day + .med-history__day { border-top: 1px solid var(--border); }
+.med-history__date { width: 92px; flex-shrink: 0; color: var(--text2); }
+.med-history__items { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+
+/* форма */
+.med-form__set { border: 0; margin: 0 0 14px; padding: 0; min-width: 0; }
+.med-form__set legend { padding: 0; }
+.med-form__last { margin-bottom: 0; }
+.med-form__opt { font-weight: 400; }
+.med-form__err { margin: 6px 0 0; font-size: 13px; font-weight: 600; color: var(--danger-text); }
+.med-form__hint { margin: 6px 0 0; font-size: 13px; line-height: 1.4; color: var(--text2); }
+.med-form .input[aria-invalid="true"] { border-color: var(--red); }
+.med-modes { display: grid; gap: 2px; }
+.med-mode { display: flex; align-items: center; gap: 12px; min-height: 44px; font-size: 16px; cursor: pointer; position: relative; }
+.med-mode input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.med-mode__dot { width: 22px; height: 22px; flex-shrink: 0; border-radius: 50%; border: 2px solid var(--text2); }
+.med-mode input:checked + .med-mode__dot { border-color: var(--blue); background: var(--blue); box-shadow: inset 0 0 0 4px var(--surface); }
+.med-mode input:focus-visible + .med-mode__dot { outline: 2px solid var(--blue); outline-offset: 2px; }
+.med-days { display: flex; gap: 3px; }
+.med-day {
+  flex: 1; min-width: 0; min-height: 44px; padding: 0; border-radius: 10px;
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text2); font-size: 14px; font-weight: 700;
+}
+.med-day[aria-pressed="true"] { background: var(--blue); border-color: var(--blue); color: var(--on-blue); }
+.med-times { display: grid; gap: 8px; }
+.med-times:empty { display: none; }
+.med-time { display: flex; gap: 8px; align-items: center; }
+.med-time__input { flex: 1; min-width: 0; min-height: 48px; -webkit-appearance: none; appearance: none; text-align: left; font-variant-numeric: tabular-nums; }
+.med-time__input::-webkit-date-and-time-value { text-align: left; }
+.med-time__del {
+  width: 44px; height: 44px; flex-shrink: 0; border-radius: 10px; padding: 0;
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text2); font-size: 22px; line-height: 1;
+}
+.med-times__add {
+  display: inline-flex; align-items: center; gap: 6px; min-height: 44px; margin-top: 2px; padding: 0 2px;
+  background: none; border: 0; color: var(--blue); font-size: 15px; font-weight: 700;
+}
+.med-times__add .hi { width: 18px; height: 18px; stroke-width: 2.4; }
+.med-form__actions { display: grid; gap: 10px; margin-top: 4px; }
+.med-form__actions .btn-primary { margin-top: 0; }
+.med-form__actions .btn-ghost { min-height: 48px; }
+
+/* меню действий в диалоге — столбцом; «Удалить» — красный текст (подтверждение — отдельным шагом) */
+.dialog__actions--stack { flex-direction: column; }
+.dialog__btn--destructive { color: var(--danger-text); }

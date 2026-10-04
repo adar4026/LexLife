@@ -16,7 +16,8 @@ import { parsePreparedTest, importPreparedTest, PreparedImportError } from './se
 import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
 import { openDocViewer as showDocViewer } from './ui/docViewer.js';
 import { setActiveTab, initBottomNav } from './ui/bottomNav.js';
-import { HOME_WATER_QUICK_ADD, waterProgress, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed, nextDose } from './services/homeSummary.js';
+import { HOME_WATER_QUICK_ADD, waterProgress, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed } from './services/homeSummary.js';
+import { WEEKDAYS, MED_NAME_MAX, MED_DOSE_MAX, MED_NOTE_MAX, MED_TIMES_MAX, nextDose, medSchedule, medStatusOn, medDaySlots, isMedDueOn, nextDueDay, scheduleLabel, intakeSummary, normalizeMedInput, intakeHistory, medOccurrences } from './services/meds.js';
 import { nextFire } from './services/notifySchedule.js';
 import { createNotifier, describeNotifyState, armPatch, waterRulePatch, NOTIF_ROUTES, isSafeRoute } from './services/notifier.js';
 import { createPushClient, SYNC_FAIL_TEXT, SERVER_FALLBACK_MS } from './services/pushClient.js';
@@ -158,17 +159,17 @@ function homeSection(title, route, label, more = 'Все') {
 async function HomeScreen() {
   const now = new Date();
   const today = dateKey(now);
-  const [water, goal, hyd, tests, metricsLog, visits, meds, takenToday] = await Promise.all([
+  const [water, goal, hyd, tests, metricsLog, visits, meds, takenToday, intakes] = await Promise.all([
     Storage.getWater(today), Storage.getWaterGoal(), Storage.getHydration(), Storage.getTests(), Storage.getMetricsLog(),
-    Storage.getVisits(), Storage.getMeds(), Storage.getMedLog(today),
+    Storage.getVisits(), Storage.getMeds(), Storage.getMedLog(today), Storage.getMedIntakes(today),
   ]);
   const screen = el('<div class="home"></div>');
   /* мягкое появление — только при первом открытии Главной за запуск (не на каждом переключении вкладки) */
   const enter = !homeEntered;
   homeEntered = true;
 
-  screen.appendChild(renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, metricsLog, enter }));
-  const upcoming = renderUpcoming({ meds, takenToday, visits, now });
+  screen.appendChild(renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, intakes, metricsLog, enter }));
+  const upcoming = renderUpcoming({ meds, takenToday, intakes, visits, now });
   if (upcoming) screen.appendChild(upcoming);
   const attention = renderAttentionSection(tests);
   if (attention) screen.appendChild(attention);
@@ -181,7 +182,7 @@ async function HomeScreen() {
    Главный показатель дня — вода: выпито / цель и отметка плана гидратации (та же оценка,
    что на экране «Вода»). Ниже — показатели дня 2×2 и два действия. Фон — световые волны
    .hh-ambient (только CSS, в границах hero, растворяются к «Ближайшему»). */
-function renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, metricsLog, enter }) {
+function renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, intakes, metricsLog, enter }) {
   const hero = el(`
     <section class="hh${enter ? ' hh--enter' : ''}" aria-labelledby="hh-title">
       <div class="hh-ambient" aria-hidden="true"><span class="hh-wave hh-wave--a"></span><span class="hh-wave hh-wave--b"></span><span class="hh-wave hh-wave--c"></span></div>
@@ -233,7 +234,7 @@ function renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, metric
   paint(water);
 
   const grid = $('.hm-grid', hero);
-  homeMetricCells({ meds, takenToday, metricsLog, today }).forEach((c, i) => {
+  homeMetricCells({ meds, takenToday, intakes, metricsLog, today }).forEach((c, i) => {
     const cell = el(`
       <a class="hm hm--${c.tone}" href="${c.href}" style="--i:${i}">
         <span class="hm__label">${homeIcon(c.icon, 'hm__icon')}<span class="hm__name"></span></span>
@@ -264,9 +265,9 @@ function renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, metric
   return hero;
 }
 
-/* Показатели дня 2×2: лекарства (отметки «принял сегодня») · давление · пульс · вес (последние записи) */
-function homeMetricCells({ meds, takenToday, metricsLog, today }) {
-  const m = medsToday(meds, { today, takenToday });
+/* Показатели дня 2×2: лекарства (отмеченные приёмы сегодня) · давление · пульс · вес (последние записи) */
+function homeMetricCells({ meds, takenToday, intakes, metricsLog, today }) {
+  const m = medsToday(meds, { today, takenToday, intakes });
   const cells = [{
     tone: 'med', icon: 'med', name: 'Лекарства', href: '#/meds', unit: '',
     value: m.due ? `${m.taken} / ${m.due}` : null,
@@ -290,12 +291,12 @@ function homeMetricCells({ meds, takenToday, metricsLog, today }) {
 }
 
 /* ---------- Ближайшее: следующее лекарство и следующий визит (время · тип · действие) ---------- */
-function renderUpcoming({ meds, takenToday, visits, now }) {
+function renderUpcoming({ meds, takenToday, intakes, visits, now }) {
   const today = dateKey(now);
   const tomorrow = dateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1));
   const dayWord = (d) => (d === today ? 'Сегодня' : d === tomorrow ? 'Завтра' : fmtWhen(d, today));
   const items = [];
-  const u = upcomingMed(meds, { now, takenToday });
+  const u = upcomingMed(meds, { now, takenToday, intakes });
   if (u) items.push({ sort: `${u.date}T${u.time || '00:00'}`, tone: 'med', icon: 'med', href: '#/meds', title: u.name,
     top: u.time || dayWord(u.date), bottom: u.time ? dayWord(u.date) : '', sub: ['Лекарство', u.dose].filter(Boolean).join(' · ') });
   const v = upcomingVisit(visits, today);
@@ -1007,36 +1008,373 @@ async function WaterScreen() {
 }
 
 /* =========================================================
-   Вкладка 3 — Лекарства
+   Вкладка 3 — Лекарства: приёмы на сегодня (отметка — на каждый приём, не на препарат),
+   история по дням. Форма — #/med/new, #/med/<id>/edit. Расписание и приёмы — services/meds.js.
    ========================================================= */
+const MED_MORE_SVG = '<svg class="hi" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5.5" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="18.5" cy="12" r="1.4" fill="currentColor" stroke="none"/></svg>';
+const hhmmOf = (iso) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? '' : `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+function medDayWord(day, today) {
+  const d = new Date(day + 'T00:00:00');
+  const t = new Date(today + 'T00:00:00');
+  const diff = Math.round((d - t) / 86400000);
+  if (diff === 0) return 'сегодня';
+  if (diff === 1) return 'завтра';
+  if (diff === -1) return 'вчера';
+  return d.toLocaleDateString(RU, { weekday: 'short', day: 'numeric', month: 'short' }).replace(/\s*г\.$/, '');
+}
+
+/* Порядок карточек: приёмы сегодня (по первому времени) → «по необходимости» → не сегодня → не принимается */
+function medRank(m, today) {
+  if (medStatusOn(m, today) !== 'active') return [3, ''];
+  if (medSchedule(m).mode === 'asNeeded') return [1, ''];
+  if (!isMedDueOn(m, today)) return [2, ''];
+  return [0, medSchedule(m).times[0] || '99:99'];
+}
+
 async function MedsScreen() {
-  const screen = el('<div></div>');
+  const screen = el('<div class="meds"></div>');
+  const today = dateKey();
+  let meds = [];
+  let intakes = [];
+  let legacyNames = [];
+
+  const header = () => el(`<header class="header"><p class="header__eyebrow">${esc(fmtFull(new Date()))}</p><h1 class="header__title">Лекарства</h1></header>`);
+
+  function summaryText() {
+    const s = intakeSummary(meds, today, { intakes, legacyNames });
+    if (!s.due) return 'Сегодня приёмов по расписанию нет';
+    if (s.taken >= s.due) return `Сегодня всё принято · ${s.due} ${plural(s.due, 'приём', 'приёма', 'приёмов')}`;
+    return `Сегодня принято ${s.taken} из ${s.due}`;
+  }
+
+  function renderSlot(m, x) {
+    const at = x.takenAt ? hhmmOf(x.takenAt) : '';
+    const state = x.taken ? (at ? `Принято${x.time ? '' : ' сегодня'} в ${at}` : 'Принято') : (x.time ? 'Не принято' : 'Принял сегодня');
+    const li = el(`
+      <li class="med-slot${x.taken ? ' is-taken' : ''}">
+        <button class="med-slot__btn" type="button" aria-pressed="${x.taken}">
+          ${x.time ? `<span class="med-slot__time">${esc(x.time)}</span>` : ''}
+          <span class="med-slot__state">${esc(state)}${x.extra ? '<small> · вне расписания</small>' : ''}</span>
+          <span class="med-slot__check" aria-hidden="true">${CHECK_SVG}</span>
+        </button>
+      </li>
+    `);
+    const btn = $('button', li);
+    btn.setAttribute('aria-label', `${m.name}, ${x.time ? x.time : 'приём сегодня'}: ${x.taken ? 'принято' : 'не принято'}`);
+    btn.dataset.slot = x.time || '';
+    btn.addEventListener('click', () => toggle(m, x, btn));
+    return li;
+  }
+
+  function offLine(m) {
+    const st = medStatusOn(m, today);
+    if (st === 'inactive') return 'Приём выключен';
+    if (st === 'ended') return `Курс завершён ${fmtWhen(m.end, today)}`;
+    const next = nextDueDay(m, today, 400);
+    if (st === 'notStarted') return `Начало курса — ${medDayWord(m.start, today)}`;
+    return next ? `Сегодня приёма нет · следующий — ${medDayWord(next, today)}` : 'Сегодня приёма нет';
+  }
+
+  function renderCard(m) {
+    const slots = medDaySlots(m, today, { intakes, legacyNames });
+    const s = medSchedule(m);
+    const meta = [m.dose, scheduleLabel(m), m.purpose].filter(Boolean);
+    if (!slots.length && s.times.length) meta.push(s.times.join(', '));
+    const card = el(`
+      <article class="med-card" data-id="${esc(m.id)}">
+        <div class="med-card__head">
+          <span class="med-card__icon" aria-hidden="true">${homeIcon('med')}</span>
+          <div class="med-card__body">
+            <h3 class="med-card__name"></h3>
+            <p class="med-card__meta"></p>
+          </div>
+          <button class="med-card__more" type="button">${MED_MORE_SVG}</button>
+        </div>
+      </article>
+    `);
+    $('.med-card__name', card).textContent = m.name;
+    $('.med-card__meta', card).textContent = meta.join(' · ');
+    $('.med-card__more', card).setAttribute('aria-label', `Действия: ${m.name}`);
+    if (m.note) {
+      const note = el('<p class="med-card__note"></p>');
+      note.textContent = m.note;
+      $('.med-card__body', card).appendChild(note);
+    }
+    if (slots.length) {
+      const ul = el('<ul class="med-slots"></ul>');
+      slots.forEach((x) => ul.appendChild(renderSlot(m, x)));
+      card.appendChild(ul);
+    } else {
+      const off = el('<p class="med-card__off"></p>');
+      off.textContent = offLine(m);
+      card.appendChild(off);
+    }
+    $('.med-card__more', card).addEventListener('click', () => medActions(m));
+    return card;
+  }
+
+  async function toggle(m, x, btn) {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    const first = medDaySlots(m, today, { intakes, legacyNames })[0];
+    try {
+      await Storage.setMedIntake({ medId: m.id, time: x.time, taken: !x.taken, day: today, name: m.name, legacyTime: first ? first.time : null });
+    } catch {
+      btn.disabled = false;
+      flash('Не удалось сохранить отметку');
+      return;
+    }
+    [intakes, legacyNames] = await Promise.all([Storage.getMedIntakes(today), Storage.getMedLog(today)]);
+    /* перерисовать только эту карточку и сводку: прокрутка и фокус остаются на месте */
+    const old = btn.closest('.med-card');
+    const fresh = renderCard(m);
+    old.replaceWith(fresh);
+    const again = $$('.med-slot__btn', fresh).find((b) => b.dataset.slot === (x.time || ''));
+    if (again) again.focus({ preventScroll: true });
+    const sum = $('.med-sum', screen);
+    if (sum) sum.textContent = summaryText();
+    paintHistory();
+  }
+
+  async function medActions(m) {
+    const act = await showDialog({
+      title: m.name, stack: true, cancelValue: null,
+      actions: [
+        { label: 'Редактировать', value: 'edit' },
+        { label: 'Удалить', value: 'delete', kind: 'destructive' },
+        { label: 'Отмена', value: null },
+      ],
+    });
+    if (act === 'edit') location.hash = `#/med/${encodeURIComponent(m.id)}/edit`;
+    if (act !== 'delete') return;
+    const ok = await showDialog({
+      title: `Удалить ${m.name}?`,
+      body: '<p class="dialog__muted">Лекарство исчезнет из списка. История приёма сохранится.</p>',
+      actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+    });
+    if (!ok) return;
+    try { await Storage.removeMed(m.id); } catch { flash('Не удалось удалить'); return; }
+    flash('Удалено');
+    await paint();
+  }
+
+  let historyOpen = false;
+  async function paintHistory() {
+    const box = $('.med-history', screen);
+    if (!box) return;
+    const [all, allIntakes, allLegacy] = await Promise.all([Storage.getMeds({ includeDeleted: true }), Storage.getAllMedIntakes(), Storage.getAllMedLog()]);
+    const days = intakeHistory(all, allIntakes, allLegacy, { until: today, days: 14 });
+    box.hidden = !days.length;
+    const list = $('.med-history__list', box);
+    list.innerHTML = '';
+    days.forEach(({ day, items }) => {
+      const row = el('<li class="med-history__day"><span class="med-history__date"></span><span class="med-history__items"></span></li>');
+      const w = medDayWord(day, today);
+      $('.med-history__date', row).textContent = w.charAt(0).toUpperCase() + w.slice(1);
+      $('.med-history__items', row).textContent = items.map((it) => (it.time ? `${it.name} ${it.time}` : it.name)).join(' · ');
+      list.appendChild(row);
+    });
+  }
+
   async function paint() {
-    const [meds, takenToday] = await Promise.all([Storage.getMeds(), Storage.getMedLog()]);
+    meds = await Storage.getMeds();
+    if (meds.some((m) => m.id == null)) { await Storage.ensureMedIds(); meds = await Storage.getMeds(); }
+    [intakes, legacyNames] = await Promise.all([Storage.getMedIntakes(today), Storage.getMedLog(today)]);
     screen.innerHTML = '';
-    screen.appendChild(el(`<header class="header"><p class="header__eyebrow">${esc(fmtFull(new Date()))}</p><h1 class="header__title">Лекарства</h1></header>`));
-    const list = el('<section class="section" style="margin-top:14px"><div class="list-card"></div></section>');
-    const box = $('.list-card', list);
-    if (!meds.length) box.appendChild(el('<div class="empty">Пока нет лекарств</div>'));
-    else meds.forEach((m) => {
-      const taken = takenToday.includes(m.name);
-      const nd = nextDose(m);
-      const sub = [m.dose, m.purpose].filter(Boolean).join(' · ');
-      const sched = m.reminder_time ? `Напоминание ${m.reminder_time}` : nd ? `След. доза: ${fmtDate(nd)}` : '';
-      const row = el(`
-        <div class="row ${taken ? 'row--done' : ''}">
-          <span class="row__icon">${esc(m.icon || '💊')}</span>
-          <div class="row__body"><p class="row__title">${esc(m.name)}</p><p class="row__sub">${esc(sub)}${sched ? ' · ' + esc(sched) : ''}</p></div>
-          <button class="check ${taken ? 'check--done' : ''}" type="button" aria-label="Отметить приём">${CHECK_SVG}</button>
+    screen.appendChild(header());
+
+    if (!meds.length) {
+      const empty = el(`
+        <section class="med-empty">
+          <span class="med-empty__icon" aria-hidden="true">${homeIcon('med')}</span>
+          <h2 class="med-empty__title">Лекарств пока нет</h2>
+          <p class="med-empty__text">Добавьте препарат и укажите расписание приёма.</p>
+          <button class="btn-primary btn-primary--brand med-empty__add" type="button">${homeIcon('plus')}<span>Добавить лекарство</span></button>
+        </section>
+      `);
+      $('.med-empty__add', empty).addEventListener('click', () => { location.hash = '#/med/new'; });
+      screen.appendChild(empty);
+      screen.appendChild(el('<p class="med-hint">Здесь можно отмечать приём лекарств и видеть историю по дням.</p>'));
+    } else {
+      const head = el(`
+        <div class="med-head">
+          <p class="med-sum"></p>
+          <button class="med-add" type="button" aria-label="Добавить лекарство">${homeIcon('plus')}<span>Добавить</span></button>
         </div>
       `);
-      $('.check', row).addEventListener('click', async () => { await Storage.toggleMedTaken(m.name); await paint(); });
-      box.appendChild(row);
-    });
-    screen.appendChild(list);
-    screen.appendChild(el('<p class="empty">Отметьте «принял сегодня» галочкой. История приёма сохраняется по дням.</p>'));
+      $('.med-sum', head).textContent = summaryText();
+      $('.med-add', head).addEventListener('click', () => { location.hash = '#/med/new'; });
+      screen.appendChild(head);
+      const list = el('<div class="med-list"></div>');
+      meds.map((m, i) => ({ m, i, r: medRank(m, today) }))
+        .sort((a, b) => a.r[0] - b.r[0] || a.r[1].localeCompare(b.r[1]) || a.i - b.i)
+        .forEach(({ m }) => list.appendChild(renderCard(m)));
+      screen.appendChild(list);
+    }
+
+    const hist = el(`
+      <details class="med-history" hidden${historyOpen ? ' open' : ''}>
+        <summary class="med-history__head">История приёма <small>14 дней</small></summary>
+        <ul class="med-history__list"></ul>
+      </details>
+    `);
+    hist.addEventListener('toggle', () => { historyOpen = hist.open; });
+    screen.appendChild(hist);
+    await paintHistory();
   }
   await paint();
+  return screen;
+}
+
+/* Форма лекарства: название (обязательно), дозировка, режим приёма, дни, времена, комментарий */
+async function MedFormScreen(id) {
+  const existing = id ? await Storage.getMed(id) : null;
+  const screen = el('<div class="med-form"></div>');
+  const leave = () => goBackOr('meds');
+  screen.appendChild(backHeader(id ? 'Редактировать' : 'Новое лекарство', { label: 'Назад', onBack: leave }));
+  if (id && !existing) {
+    screen.appendChild(el('<div class="empty">Лекарство не найдено</div>'));
+    return screen;
+  }
+  const sched = existing ? medSchedule(existing) : { mode: 'daily', days: [], times: [] };
+  const state = { mode: sched.mode, days: new Set(sched.days), times: sched.times.slice() };
+  const MODES = [['daily', 'Каждый день'], ['days', 'По выбранным дням'], ['asNeeded', 'По необходимости']];
+
+  const form = el(`
+    <form class="med-form__form" novalidate>
+      <div class="input-card">
+        <div class="field">
+          <label class="field__label" for="mf-name">Название препарата</label>
+          <input class="input" id="mf-name" type="text" maxlength="${MED_NAME_MAX}" autocomplete="off" autocapitalize="sentences"
+            placeholder="Например, Витамин D" aria-required="true" aria-describedby="mf-name-err" enterkeyhint="next">
+          <p class="med-form__err" id="mf-name-err" role="alert" hidden></p>
+        </div>
+        <div class="field med-form__last">
+          <label class="field__label" for="mf-dose">Дозировка <span class="med-form__opt">· необязательно</span></label>
+          <input class="input" id="mf-dose" type="text" maxlength="${MED_DOSE_MAX}" autocomplete="off" placeholder="Например, 10 мг или 1 таблетка" enterkeyhint="done">
+        </div>
+      </div>
+
+      <div class="input-card">
+        <fieldset class="med-form__set">
+          <legend class="field__label">Режим приёма</legend>
+          <div class="med-modes">
+            ${MODES.map(([v, t]) => `<label class="med-mode"><input type="radio" name="mf-mode" value="${v}"${state.mode === v ? ' checked' : ''}><span class="med-mode__dot" aria-hidden="true"></span><span>${t}</span></label>`).join('')}
+          </div>
+        </fieldset>
+        <fieldset class="med-form__set" data-part="days">
+          <legend class="field__label">Дни приёма</legend>
+          <div class="med-days" aria-describedby="mf-days-err">
+            ${WEEKDAYS.map((w) => `<button class="med-day" type="button" data-day="${w.day}" aria-pressed="${state.days.has(w.day)}" aria-label="${w.name}">${w.short}</button>`).join('')}
+          </div>
+          <p class="med-form__err" id="mf-days-err" role="alert" hidden></p>
+        </fieldset>
+        <fieldset class="med-form__set med-form__last" data-part="times">
+          <legend class="field__label">Время приёма</legend>
+          <div class="med-times"></div>
+          <button class="med-times__add" type="button">${homeIcon('plus')}<span>Добавить время</span></button>
+          <p class="med-form__hint" data-part="times-hint">Без времени — одна отметка в день.</p>
+        </fieldset>
+        ${existing && existing.every_days && existing.start ? `<p class="med-form__hint">Курс «раз в ${esc(existing.every_days)} дн.» с ${esc(fmtDate(existing.start))} сохраняется: приёмы — только в дни курса.</p>` : ''}
+      </div>
+
+      <div class="input-card">
+        <div class="field med-form__last">
+          <label class="field__label" for="mf-note">Комментарий <span class="med-form__opt">· необязательно</span></label>
+          <input class="input" id="mf-note" type="text" maxlength="${MED_NOTE_MAX}" autocomplete="off" placeholder="Например, после еды" enterkeyhint="done">
+        </div>
+      </div>
+
+      <div class="med-form__actions">
+        <button class="btn-primary btn-primary--brand" type="submit">Сохранить</button>
+        <button class="btn-ghost med-form__cancel" type="button">Отмена</button>
+      </div>
+    </form>
+  `);
+  const nameIn = $('#mf-name', form);
+  nameIn.value = existing ? existing.name || '' : '';
+  $('#mf-dose', form).value = existing ? existing.dose || '' : '';
+  $('#mf-note', form).value = existing ? existing.note || '' : '';
+  const timesBox = $('.med-times', form);
+  const nameErr = $('#mf-name-err', form);
+  const daysErr = $('#mf-days-err', form);
+
+  const syncTimes = () => { state.times = $$('.med-time__input', timesBox).map((i) => i.value).filter(Boolean); };
+  function paintTimes() {
+    timesBox.innerHTML = '';
+    state.times.forEach((t, i) => {
+      const row = el(`
+        <div class="med-time">
+          <label class="sr-only" for="mf-t${i}">Время приёма ${i + 1}</label>
+          <input class="input med-time__input" type="time" id="mf-t${i}" value="${esc(t)}">
+          <button class="med-time__del" type="button" aria-label="Удалить время ${esc(t)}">×</button>
+        </div>
+      `);
+      $('.med-time__del', row).addEventListener('click', () => { syncTimes(); state.times.splice(i, 1); paintTimes(); $('.med-times__add', form).focus(); });
+      timesBox.appendChild(row);
+    });
+    $('.med-times__add', form).hidden = state.times.length >= MED_TIMES_MAX;
+    $('[data-part="times-hint"]', form).hidden = state.times.length > 0;
+  }
+  function paintMode() {
+    $('[data-part="days"]', form).hidden = state.mode !== 'days';
+    $('[data-part="times"]', form).hidden = state.mode === 'asNeeded';
+  }
+  $$('input[name="mf-mode"]', form).forEach((r) => r.addEventListener('change', () => { state.mode = r.value; daysErr.hidden = true; paintMode(); }));
+  $$('.med-day', form).forEach((b) => b.addEventListener('click', () => {
+    const d = Number(b.dataset.day);
+    if (state.days.has(d)) state.days.delete(d); else state.days.add(d);
+    b.setAttribute('aria-pressed', String(state.days.has(d)));
+    if (state.days.size) daysErr.hidden = true;
+  }));
+  $('.med-times__add', form).addEventListener('click', () => {
+    syncTimes();
+    const next = ['08:00', '20:00', '14:00', '12:00', '22:00', '10:00', '18:00', '16:00'].find((t) => !state.times.includes(t)) || '12:00';
+    state.times.push(next);
+    paintTimes();
+    const inputs = $$('.med-time__input', timesBox);
+    inputs[inputs.length - 1].focus();
+  });
+  nameIn.addEventListener('input', () => { if (nameIn.value.trim()) { nameErr.hidden = true; nameIn.removeAttribute('aria-invalid'); } });
+  $('.med-form__cancel', form).addEventListener('click', leave);
+
+  let saving = false;
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (saving) return;
+    syncTimes();
+    const r = normalizeMedInput({
+      name: nameIn.value, dose: $('#mf-dose', form).value, note: $('#mf-note', form).value,
+      mode: state.mode, days: [...state.days], times: state.times,
+    });
+    nameErr.hidden = !r.errors.name;
+    nameErr.textContent = r.errors.name || '';
+    if (r.errors.name) nameIn.setAttribute('aria-invalid', 'true'); else nameIn.removeAttribute('aria-invalid');
+    daysErr.hidden = !r.errors.days;
+    daysErr.textContent = r.errors.days || '';
+    if (!r.ok) {
+      (r.errors.name ? nameIn : $('.med-day', form)).focus();
+      return;
+    }
+    saving = true;
+    const btn = $('button[type="submit"]', form);
+    btn.classList.add('is-busy');
+    try {
+      if (id) await Storage.updateMed(id, r.value);
+      else await Storage.addMed(r.value);
+    } catch {
+      saving = false;
+      btn.classList.remove('is-busy');
+      flash('Не удалось сохранить');
+      return;
+    }
+    flash('Сохранено ✓');
+    location.replace('#/meds');
+  });
+
+  screen.appendChild(form);
+  paintTimes();
+  paintMode();
   return screen;
 }
 
@@ -2432,7 +2770,7 @@ async function VisitsScreen() {
 }
 
 async function VisitDetailScreen(id) {
-  const [visit, tests, meds] = await Promise.all([Storage.getVisit(id), Storage.getTests(), Storage.getMeds()]);
+  const [visit, tests, meds] = await Promise.all([Storage.getVisit(id), Storage.getTests(), Storage.getMeds({ includeDeleted: true })]);
   const screen = el('<div></div>');
   if (!visit) { screen.appendChild(backHeader('Визит', { label: 'Визиты', onBack: () => { location.hash = '#/visits'; } })); screen.appendChild(el('<div class="empty">Визит не найден</div>')); return screen; }
   screen.appendChild(backHeader('Визит', { label: 'Визиты', onBack: () => { location.hash = '#/visits'; } }));
@@ -2495,7 +2833,9 @@ async function VisitDetailScreen(id) {
 }
 
 async function VisitFormScreen(id) {
-  const [existing, tests, meds] = await Promise.all([id ? Storage.getVisit(id) : null, Storage.getTests(), Storage.getMeds()]);
+  const [existing, tests, allMeds] = await Promise.all([id ? Storage.getVisit(id) : null, Storage.getTests(), Storage.getMeds({ includeDeleted: true })]);
+  /* удалённое лекарство остаётся в выборе, только если визит уже на него ссылается — связь не теряется при сохранении */
+  const meds = allMeds.filter((m) => !m.deletedAt || (existing?.links?.medIds || []).includes(m.id));
   const v = existing || { date: dateKey(), status: 'done', links: { testIds: [], medIds: [], reminderIds: [] }, attachments: [] };
   const screen = el('<div></div>');
   screen.appendChild(backHeader(id ? 'Редактировать визит' : 'Новый визит', { label: 'Назад', onBack: goBack }));
@@ -2882,7 +3222,7 @@ function dayHasDot(dateStr, data) {
 /* полная повестка дня: разовые события + ежедневные (лекарства, цель воды) — для панели дня */
 function dayAgendaEvents(dateStr, data) {
   const ev = dayPointEvents(dateStr, data).slice();
-  data.meds.forEach((m) => { if (m.active && m.reminder_time) ev.push({ icon: '💊', title: m.name, sub: 'Приём лекарства', time: m.reminder_time, route: 'meds' }); });
+  data.meds.forEach((m) => medOccurrences(m, dateStr).forEach(({ time }) => { if (time) ev.push({ icon: '💊', title: m.name, sub: 'Приём лекарства', time, route: 'meds' }); }));
   ev.push({ icon: '💧', title: `Цель воды: ${fmtNum(data.waterGoal / 1000)} л`, sub: 'Ежедневная цель', time: null, route: 'metric/water' });
   ev.sort((a, b) => (a.time || '99:99').localeCompare(b.time || '99:99'));
   return ev;
@@ -3073,11 +3413,11 @@ function lastLabel(point, today) {
 const pressureTxt = (s, d) => (s && d ? `${fmtN(s, 0)}/${fmtN(d, 0)}` : '—');
 
 async function StatsScreen() {
-  const [metricsLog, metricsConfig, activityDays, activityGoals, tests, medLog, meds] = await Promise.all([
+  const [metricsLog, metricsConfig, activityDays, activityGoals, tests, medLog, meds, medIntakes] = await Promise.all([
     Storage.getMetricsLog(), Storage.getMetricsConfig(), Storage.getAllActivity(), Storage.getGoals(),
-    Storage.getTests(), Storage.getAllMedLog(), Storage.getMeds(),
+    Storage.getTests(), Storage.getAllMedLog(), Storage.getMeds(), Storage.getAllMedIntakes(),
   ]);
-  const engine = createStatsEngine({ metricsLog, metricsConfig, activityDays, activityGoals, tests, medLog, meds, testFields: TEST_FIELDS }, dateKey());
+  const engine = createStatsEngine({ metricsLog, metricsConfig, activityDays, activityGoals, tests, medLog, medIntakes, meds, testFields: TEST_FIELDS }, dateKey());
   const screen = el('<div class="stats"></div>');
   let period = loadStatsPeriod();
   let actMode = null;
@@ -3556,13 +3896,14 @@ function goBack() { if (history.length > 1) history.back(); else location.hash =
 /* Модальный диалог: body — готовый HTML (данные экранируются вызывающим через esc).
    actions: [{ label, value, kind: 'primary'|'danger', onClick }] — onClick вызывается
    синхронно в обработчике касания (нужно для Share Sheet на iOS). → Promise<value> */
-function showDialog({ title, body = '', actions }) {
+function showDialog({ title, body = '', actions, stack = false, cancelValue }) {
   return new Promise((resolve) => {
-    const wrap = el('<div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-title"><div class="dialog__card"><h2 class="dialog__title" id="dlg-title"></h2><div class="dialog__body"></div><div class="dialog__actions"></div></div></div>');
+    const wrap = el(`<div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-title"><div class="dialog__card"><h2 class="dialog__title" id="dlg-title"></h2><div class="dialog__body"></div><div class="dialog__actions${stack ? ' dialog__actions--stack' : ''}"></div></div></div>`);
     $('.dialog__title', wrap).textContent = title;
     $('.dialog__body', wrap).innerHTML = body;
     const close = (v) => { document.removeEventListener('keydown', onKey); wrap.remove(); resolve(v); };
-    const onKey = (e) => { if (e.key === 'Escape') close(actions[0].value); };
+    /* stack — действия столбцом (меню); cancelValue — что вернуть по Escape, если не первое действие */
+    const onKey = (e) => { if (e.key === 'Escape') close(cancelValue !== undefined ? cancelValue : actions[0].value); };
     actions.forEach((a) => {
       const b = el(`<button type="button" class="dialog__btn${a.kind ? ` dialog__btn--${a.kind}` : ''}"></button>`);
       b.textContent = a.label;
@@ -3753,6 +4094,8 @@ function resolve() {
     if (rest.endsWith('/edit')) return { fn: () => VisitFormScreen(rest.slice(0, -5)), tab: null, main: false };
     return { fn: () => VisitDetailScreen(rest), tab: null, main: false };
   }
+  if (h === 'med/new') return { fn: () => MedFormScreen(null), tab: 'meds', main: false };
+  if (h.startsWith('med/') && h.endsWith('/edit')) return { fn: () => MedFormScreen(safeDecode(h.slice(4, -5))), tab: 'meds', main: false };
   if (h === 'test/new') return { fn: () => TestFormScreen(null), tab: 'tests', main: false };
   if (h.startsWith('test/')) {
     const rest = h.slice(5);
