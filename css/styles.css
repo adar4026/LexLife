@@ -1447,6 +1447,8 @@ textarea.input { resize: vertical; font-family: inherit; }
   --hm-cta-shadow: none;
   --hm-surface: rgba(255, 255, 255, 0.045);
   --hm-warn: #e2b155;
+  --hm-plan: #ff5a52;
+  --hm-plan-halo: rgba(10, 26, 32, 0.55);
   /* световые волны hero: глубокий teal / blue, без неона */
   --hm-amb-top: #0c2028;
   --hm-amb-mid: #08171d;
@@ -1485,6 +1487,8 @@ textarea.input { resize: vertical; font-family: inherit; }
   --hm-cta-shadow: 0 2px 6px -4px rgba(22, 122, 139, 0.45);
   --hm-surface: rgba(255, 255, 255, 0.74);
   --hm-warn: #b7791f;
+  --hm-plan: #d7261e;
+  --hm-plan-halo: rgba(255, 255, 255, 0.7);
   --hm-amb-top: #ddf4f7;
   --hm-amb-mid: #eaf8f8;
   --hm-wave-a: rgba(127, 215, 208, 0.7);
@@ -1666,11 +1670,11 @@ body:has(.home) { background: var(--hm-bg); }
 .hh__caption { margin: 6px 0 0; font-size: 17px; color: var(--hm-muted); }
 
 .hh__bar {
+  position: relative;
   margin-top: 22px;
   height: 8px;
   border-radius: 999px;
   background: var(--hm-track);
-  overflow: hidden;
 }
 .hh__fill {
   display: block;
@@ -1680,6 +1684,20 @@ body:has(.home) { background: var(--hm-bg); }
   background: var(--hm-fill);
   transition: width 0.5s ease;
 }
+/* плановая метка: где по плану должен быть объём к текущему моменту (--plan 0…1); выступает
+   за трек на 4px сверху и снизу и не выходит за его края по горизонтали */
+.hh__plan {
+  position: absolute;
+  top: -4px;
+  bottom: -4px;
+  left: clamp(0px, calc(var(--plan, 0) * 100% - 1px), calc(100% - 2px));
+  width: 2px;
+  border-radius: 1px;
+  background: var(--hm-plan);
+  box-shadow: 0 0 0 1px var(--hm-plan-halo);
+  pointer-events: none;
+}
+.hh__plan[hidden] { display: none; }
 .hh__meta {
   display: flex;
   align-items: center;

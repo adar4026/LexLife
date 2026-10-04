@@ -16,7 +16,7 @@ import { parsePreparedTest, importPreparedTest, PreparedImportError } from './se
 import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
 import { openDocViewer as showDocViewer } from './ui/docViewer.js';
 import { setActiveTab, initBottomNav } from './ui/bottomNav.js';
-import { HOME_WATER_QUICK_ADD, waterProgress, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed } from './services/homeSummary.js';
+import { HOME_WATER_QUICK_ADD, waterProgress, homeWaterStatus, waterPlanMarker, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed } from './services/homeSummary.js';
 import { WEEKDAYS, MED_NAME_MAX, MED_DOSE_MAX, MED_NOTE_MAX, MED_TIMES_MAX, nextDose, medSchedule, medStatusOn, medDaySlots, isMedDueOn, nextDueDay, scheduleLabel, intakeSummary, normalizeMedInput, intakeHistory, medOccurrences } from './services/meds.js';
 import {
   SLEEP_QUALITY, SLEEP_TAGS, SLEEP_GOAL_MIN, SLEEP_GOAL_MAX, SLEEP_GOAL_STEP, AWAKENINGS_MAX, NAP_MAX_MINUTES, SLEEP_NOTE_MAX, INSIGHT_MIN_DAYS,
@@ -122,6 +122,8 @@ function metricCard(key, latest) {
 const HOME_QUICK_METRICS = ['pressure', 'pulse', 'weight']; // ячейки после «Лекарств»
 const HOME_WATER_ADD = HOME_WATER_QUICK_ADD; // мл — кнопка hero «+ 300 мл», запись через Storage.addWaterEntry
 let homeEntered = false;
+let homeMarkerTimer = null; // лёгкое обновление раз в минуту: только положение плановой метки + a11y, без перерендера
+function stopHomeMarkerTimer() { clearInterval(homeMarkerTimer); homeMarkerTimer = null; }
 
 /* Линейные иконки одного семейства с таб-баром (24×24, обводка currentColor) */
 const HOME_ICONS = {
@@ -190,8 +192,9 @@ async function HomeScreen() {
 }
 
 /* ---------- Hero: композиция прямо на фоне страницы (без карточки) ----------
-   Главный показатель дня — вода: выпито / цель и отметка плана гидратации (та же оценка,
-   что на экране «Вода»). Ниже — показатели дня 2×2 и два действия. Фон — световые волны
+   Главный показатель дня — вода: выпито / цель, остаток до цели (homeWaterStatus) и на шкале
+   красная метка плана к текущему моменту (plannedByNow → waterPlanMarker).
+   Ниже — показатели дня 2×2 и два действия. Фон — световые волны
    .hh-ambient (только CSS, в границах hero, растворяются к «Ближайшему»). */
 function renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, intakes, metricsLog, enter }) {
   const hero = el(`
@@ -203,7 +206,7 @@ function renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, intake
       <div class="hh__main">
         <a class="hh__value water-main-value" href="#/metric/water">${WATER_DROP_SVG}<span class="hh__num"></span><span class="hh__unit">мл</span></a>
         <p class="hh__caption"></p>
-        <div class="hh__bar" role="progressbar" aria-label="Вода: выпито от цели" aria-valuemin="0" aria-valuemax="100"><span class="hh__fill"></span></div>
+        <div class="hh__bar" role="progressbar" aria-label="Вода: выпито от цели" aria-valuemin="0" aria-valuemax="100"><span class="hh__fill"></span><span class="hh__plan" aria-hidden="true" hidden></span></div>
         <p class="hh__meta"><span class="hh__pct"></span><span class="hh__status" aria-live="polite"></span></p>
       </div>
       <div class="hh__cta">
@@ -215,34 +218,39 @@ function renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, intake
   `);
   if (deploymentRole() === 'legacy') $('.hh__head', hero).after(legacyNotice());
 
+  let currentWaterMl = water; // для периодического обновления метки (та же вода, меняется только время)
   const paint = (cur) => {
+    currentWaterMl = cur;
     const p = waterProgress(cur, goal);
+    const s = homeWaterStatus(p.current, p.goal);
     const planned = hyd && hyd.wakeStart && hyd.wakeEnd ? plannedByNow(p.goal, hyd, nowMinutes()) : 0;
-    const s = waterDayStatus(p.current, p.goal, planned);
+    const mark = waterPlanMarker(planned, p.goal);
     const pct = p.goal ? Math.round((p.current / p.goal) * 100) : 0;
     $('.hh__num', hero).textContent = fmtMl(p.current);
     $('.hh__caption', hero).textContent = p.goal ? `воды из ${fmtMl(p.goal)} мл` : 'воды сегодня';
-    $('.hh__fill', hero).style.width = `${Math.min(pct, 100)}%`;
+    $('.hh__fill', hero).style.width = `${p.progress * 100}%`;
+    const plan = $('.hh__plan', hero);
+    plan.hidden = mark == null;
+    if (mark != null) plan.style.setProperty('--plan', String(mark));
     const bar = $('.hh__bar', hero);
     bar.setAttribute('aria-valuenow', String(Math.min(pct, 100)));
-    bar.setAttribute('aria-valuetext', p.goal ? `${fmtMl(p.current)} из ${fmtMl(p.goal)} мл, ${pct}%` : `${fmtMl(p.current)} мл`);
+    bar.setAttribute('aria-valuetext', p.goal ? `${fmtMl(p.current)} из ${fmtMl(p.goal)} мл, ${pct}%; по плану к этому времени ${fmtMl(planned)} мл` : `${fmtMl(p.current)} мл`);
     $('.hh__pct', hero).textContent = p.goal ? `${pct}% от цели` : '';
     const st = $('.hh__status', hero);
     st.className = `hh__status hh__status--${s.state}`;
     st.innerHTML = s.state === 'done'
       ? `${homeIcon('check')}Цель выполнена${s.over ? ` · +${esc(fmtMl(s.over))} мл` : ''}`
-      : s.state === 'behind'
-        ? `<span class="hh__dot"></span>Отстаёте от плана на ${esc(fmtMl(s.behind))} мл`
-        : s.state === 'ahead'
-          ? `<span class="hh__dot"></span>Опережение на ${esc(fmtMl(s.ahead))} мл`
-          : s.state === 'start'
-            ? '<span class="hh__dot"></span>День только начался'
-            : s.state === 'onTrack'
-              ? '<span class="hh__dot"></span>Всё идёт по плану'
-              : 'Цель не задана';
+      : s.state === 'remaining'
+        ? `<span class="hh__dot"></span>Осталось: ${esc(fmtMl(s.remaining))} мл`
+        : 'Цель не задана';
     $('.hh__value', hero).setAttribute('aria-label', `Вода сегодня: ${fmtMl(p.current)}${p.goal ? ` из ${fmtMl(p.goal)}` : ''} мл. Открыть модуль воды`);
   };
   paint(water);
+  /* плановая метка зависит только от времени (вода и цель — нет): раз в минуту пересчитываем
+     то же paint() — он лишь переставляет метку и обновляет aria-valuetext, без перерендера экрана.
+     stopHomeMarkerTimer() в render() гасит таймер при уходе с Главной или при повторном входе на неё. */
+  stopHomeMarkerTimer();
+  homeMarkerTimer = setInterval(() => paint(currentWaterMl), 60000);
 
   const grid = $('.hm-grid', hero);
   homeMetricCells({ meds, takenToday, intakes, metricsLog, today }).forEach((c, i) => {
@@ -4902,6 +4910,7 @@ function goBackOr(route) {
 let renderToken = 0;
 let currentRoute = null;
 async function render() {
+  stopHomeMarkerTimer(); // уходим с текущего экрана (в т.ч. повторно на Главную) — старый таймер не должен жить дальше
   clearTimeout(scrollSaveTimer); // отложенное сохранение не должно попасть в запись нового экрана
   const { fn, tab, main } = resolve();
   const route = location.hash.replace(/^#\/?/, '');

@@ -1,7 +1,9 @@
 /* =========================================================
    homeSummary.js — данные главного экрана: чистые функции без DOM и хранилища.
    • waterProgress — прогресс воды за сегодня (без отрицательного «осталось»);
-   • waterDayStatus — главный показатель дня: вода относительно плана гидратации;
+   • homeWaterStatus — статус воды на Главной: остаток до дневной цели / превышение;
+   • waterPlanMarker — положение плановой метки на шкале воды Главной;
+   • waterDayStatus — вода относительно плана гидратации (с допуском);
    • medsToday — лекарства на сегодня: сколько в плане дня и сколько отмечено;
    • upcomingVisit — ближайший запланированный / следующий визит (как в Календаре);
    • attentionItems — «Требует внимания»: последние значения показателей анализов,
@@ -37,6 +39,24 @@ export function waterProgress(current, goal) {
 
 /* Быстрое действие hero «+ N мл»: одна запись воды этим объёмом (Storage.addWaterEntry) */
 export const HOME_WATER_QUICK_ADD = 300;
+
+/* Статус воды на Главной — остаток до дневной цели (план гидратации здесь не участвует;
+   оценка по плану — waterDayStatus, экран «Вода»).
+   → { state: 'none' (цели нет) | 'done' (цель выполнена) | 'remaining', remaining (мл, ≥ 0), over (мл сверх цели) } */
+export function homeWaterStatus(current, goal) {
+  const p = waterProgress(current, goal);
+  if (!p.goal) return { state: 'none', remaining: 0, over: 0 };
+  if (p.reached) return { state: 'done', remaining: 0, over: p.over };
+  return { state: 'remaining', remaining: p.remaining, over: 0 };
+}
+
+/* Положение плановой метки на шкале воды Главной: доля цели, которую по плану нужно выпить
+   к текущему моменту (plannedMl считает app.js — plannedByNow). → 0…1, или null — цели нет, метки нет */
+export function waterPlanMarker(plannedMl, goal) {
+  if (!isNum(goal) || goal <= 0) return null;
+  const planned = isNum(plannedMl) ? plannedMl : 0;
+  return Math.min(Math.max(planned / goal, 0), 1);
+}
 
 /* Допуск плана воды, мл: отклонение в его пределах — «по плану»; пока план к текущему моменту
    не больше допуска и ничего не выпито — «день только начался» (до подъёма план = 0) */

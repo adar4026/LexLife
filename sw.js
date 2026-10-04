@@ -8,7 +8,7 @@
    короткий commit: каждый deploy main = новый sw.js = обновление кэша.
    ========================================================= */
 
-const CACHE_VERSION = 'lexlife-v47';
+const CACHE_VERSION = 'lexlife-v48';
 const FONT_CACHE = 'lexlife-fonts-v1';
 /* Журнал показанных срабатываний (push/локально) — общий со страницей (js/services/occurrenceStore.js) */
 const OCC_CACHE = 'lexlife-occ-v1';
