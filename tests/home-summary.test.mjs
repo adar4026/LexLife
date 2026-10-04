@@ -13,7 +13,7 @@
    ========================================================= */
 
 import assert from 'node:assert/strict';
-import { HOME_WATER_QUICK_ADD, WATER_PLAN_TOLERANCE, waterProgress, homeWaterStatus, waterPlanMarker, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed, nextDose } from '../js/services/homeSummary.js';
+import { HOME_WATER_QUICK_ADD, WATER_PLAN_TOLERANCE, waterProgress, homeWaterStatus, waterPlanMarker, waterPlanDelta, WATER_PLAN_DELTA_TOLERANCE, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed, nextDose } from '../js/services/homeSummary.js';
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -296,6 +296,52 @@ test('Главная: плановая метка на шкале воды — �
   assert.equal(waterPlanMarker(1300, -2600), null);
   // 10:36, режим 07:00–23:00: plannedByNow = round(2600 × 216 / 960) = 585 → метка на 22,5 %, заливка 900 / 2600 ≈ 34,6 %
   assert.equal(waterPlanMarker(585, 2600), 0.225);
+});
+
+/* Отклонение от плана под шкалой Главной: delta = выпито − план к текущему моменту (тот же plannedMl, что у метки) */
+test('Главная: отклонение от плана — отставание (900 при плане 1 013 → −113)', () => {
+  assert.deepEqual(waterPlanDelta(900, 2600, 1013), { state: 'behind', delta: -113 });
+  assert.deepEqual(waterPlanDelta(0, 2600, 163), { state: 'behind', delta: -163 }); // 08:00, 07:00–23:00, ничего не выпито
+});
+
+test('Главная: отклонение от плана — опережение (900 при плане 840 → +60); +50 — ещё «по плану»', () => {
+  assert.deepEqual(waterPlanDelta(900, 2600, 840), { state: 'ahead', delta: 60 });
+  assert.deepEqual(waterPlanDelta(900, 2600, 850), { state: 'onPlan', delta: 50 }); // граница допуска
+  assert.deepEqual(waterPlanDelta(300, 2600, 0), { state: 'ahead', delta: 300 }); // до подъёма план 0
+  assert.deepEqual(waterPlanDelta(2800, 2600, 2600), { state: 'ahead', delta: 200 }); // после окна план = цель
+});
+
+test('Главная: «по плану» — допуск ±50 мл только для статуса, delta остаётся точным', () => {
+  assert.equal(WATER_PLAN_DELTA_TOLERANCE, 50);
+  assert.deepEqual(waterPlanDelta(900, 2600, 900), { state: 'onPlan', delta: 0 });
+  assert.deepEqual(waterPlanDelta(0, 2600, 0), { state: 'onPlan', delta: 0 }); // ночь, до подъёма
+  assert.deepEqual(waterPlanDelta(900, 2600, 900.4), { state: 'onPlan', delta: 0 }); // целые мл, без «−0»
+  assert.ok(!Object.is(waterPlanDelta(900, 2600, 900.4).delta, -0));
+  assert.deepEqual(waterPlanDelta(900, 2600, 902), { state: 'onPlan', delta: -2 });
+  assert.deepEqual(waterPlanDelta(900, 2600, 950), { state: 'onPlan', delta: -50 }); // граница
+  assert.deepEqual(waterPlanDelta(900, 2600, 951), { state: 'behind', delta: -51 });
+  assert.deepEqual(waterPlanDelta(900, 2600, 849), { state: 'ahead', delta: 51 });
+  assert.deepEqual(waterPlanDelta(0, 2600, 27), { state: 'onPlan', delta: -27 }); // 07:10, ничего не выпито
+});
+
+test('Главная: отклонение — граничные значения: нет цели, план вне 0…цель, мусор', () => {
+  assert.deepEqual(waterPlanDelta(900, 0, 500), { state: 'none', delta: 0 });
+  assert.deepEqual(waterPlanDelta(900, undefined, 500), { state: 'none', delta: 0 });
+  assert.deepEqual(waterPlanDelta(100, 2600, 99999), { state: 'behind', delta: -2500 }); // план не больше цели — как у метки
+  assert.deepEqual(waterPlanDelta(100, 2600, -50), { state: 'ahead', delta: 100 });
+  assert.deepEqual(waterPlanDelta(100, 2600, undefined), { state: 'ahead', delta: 100 }); // режим дня не задан → план 0, метка в начале
+  assert.deepEqual(waterPlanDelta(NaN, 2600, 0), { state: 'onPlan', delta: 0 });
+});
+
+test('Главная: отклонение объясняет метку — оба от одного plannedMl; «Осталось» считается от цели, не от плана', () => {
+  // 10:36, режим 07:00–23:00, цель 2600: plannedByNow = 585 → метка 22,5 %, выпито 900 → +315
+  assert.equal(waterPlanMarker(585, 2600), 0.225);
+  assert.deepEqual(waterPlanDelta(900, 2600, 585), { state: 'ahead', delta: 315 });
+  assert.deepEqual(homeWaterStatus(900, 2600), { state: 'remaining', remaining: 1700, over: 0 });
+  // время идёт (та же вода): 12:00 → 813 (+87), 14:00 → 1138 (−238); «Осталось» не меняется
+  assert.deepEqual(waterPlanDelta(900, 2600, Math.round(2600 * 300 / 960)), { state: 'ahead', delta: 87 });
+  assert.deepEqual(waterPlanDelta(900, 2600, Math.round(2600 * 420 / 960)), { state: 'behind', delta: -238 });
+  assert.equal(homeWaterStatus(900, 2600).remaining, 1700);
 });
 
 /* Регрессия-кейс 10:26, 600 / 2600 (prod v47): статус зависит от режима дня hydration_cfg.

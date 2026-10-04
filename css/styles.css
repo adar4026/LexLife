@@ -1487,6 +1487,7 @@ textarea.input { resize: vertical; font-family: inherit; }
   --hm-warn: #e2b155;
   --hm-plan: #ff5a52;
   --hm-plan-halo: rgba(10, 26, 32, 0.55);
+  --hm-ahead: #4fd18b;
   /* световые волны hero: глубокий teal / blue, без неона */
   --hm-amb-top: #0c2028;
   --hm-amb-mid: #08171d;
@@ -1527,6 +1528,7 @@ textarea.input { resize: vertical; font-family: inherit; }
   --hm-warn: #b7791f;
   --hm-plan: #d7261e;
   --hm-plan-halo: rgba(255, 255, 255, 0.7);
+  --hm-ahead: #1d7a3a;
   --hm-amb-top: #ddf4f7;
   --hm-amb-mid: #eaf8f8;
   --hm-wave-a: rgba(127, 215, 208, 0.7);
@@ -1702,7 +1704,29 @@ body:has(.home) { background: var(--hm-bg); }
   }
 }
 .hh__unit { margin-left: 9px; font-size: 17px; font-weight: 700; color: var(--hm-unit); }
-.hh__caption { margin: 6px 0 0; font-size: 17px; color: var(--hm-muted); }
+/* подпись цели и остаток до неё — одна строка; остаток вторичный (15px, как строка под шкалой) */
+.hh__caption {
+  margin: 6px 0 0;
+  font-size: 17px;
+  color: var(--hm-muted);
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  white-space: nowrap;
+}
+.hh__left {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+.hh__left .hi { width: 16px; height: 16px; stroke-width: 2.4; flex-shrink: 0; }
+.hh__left--done { color: var(--hm-accent); font-weight: 700; }
 
 .hh__bar {
   position: relative;
@@ -1743,16 +1767,11 @@ body:has(.home) { background: var(--hm-bg); }
   font-size: 15px;
 }
 .hh__pct { font-weight: 700; color: var(--hm-ink); font-variant-numeric: tabular-nums; }
-.hh__status {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--hm-muted);
-}
-.hh__status .hi { width: 17px; height: 17px; stroke-width: 2.4; }
-.hh__status--done { color: var(--hm-accent); font-weight: 700; }
-.hh__dot { width: 7px; height: 7px; border-radius: 50%; background: var(--hm-accent); flex-shrink: 0; }
-.hh__status--behind .hh__dot { background: var(--hm-warn); }
+/* отклонение от плана к текущему моменту — числовая подпись красной метки */
+.hh__dev { color: var(--hm-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.hh__dev b { font-weight: 700; }
+.hh__dev--behind { color: var(--hm-plan); }
+.hh__dev--ahead { color: var(--hm-ahead); }
 
 /* ---------- показатели дня: 2×2, без карточек — тонкие разделители ---------- */
 .hm-grid {

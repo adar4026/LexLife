@@ -3,6 +3,7 @@
    • waterProgress — прогресс воды за сегодня (без отрицательного «осталось»);
    • homeWaterStatus — статус воды на Главной: остаток до дневной цели / превышение;
    • waterPlanMarker — положение плановой метки на шкале воды Главной;
+   • waterPlanDelta — отклонение от плана к текущему моменту (подпись этой метки);
    • waterDayStatus — вода относительно плана гидратации (с допуском);
    • medsToday — лекарства на сегодня: сколько в плане дня и сколько отмечено;
    • upcomingVisit — ближайший запланированный / следующий визит (как в Календаре);
@@ -56,6 +57,23 @@ export function waterPlanMarker(plannedMl, goal) {
   if (!isNum(goal) || goal <= 0) return null;
   const planned = isNum(plannedMl) ? plannedMl : 0;
   return Math.min(Math.max(planned / goal, 0), 1);
+}
+
+/* Допуск текстового статуса отклонения на Главной, мл: |delta| ≤ допуска — «По плану».
+   На сам delta и на положение метки не влияет. */
+export const WATER_PLAN_DELTA_TOLERANCE = 50;
+
+/* Отклонение от плана воды к текущему моменту — числовая подпись той же красной метки:
+   delta = выпито − план к текущему моменту (plannedMl — plannedByNow из app.js, ограничен целью,
+   как и метка), точно, в целых мл. Допуск WATER_PLAN_DELTA_TOLERANCE — только для state.
+   → { state: 'none' (цели нет) | 'behind' (delta < −50) | 'ahead' (delta > 50) | 'onPlan' (−50…50), delta (целые мл) } */
+export function waterPlanDelta(current, goal, plannedMl) {
+  const p = waterProgress(current, goal);
+  if (!p.goal) return { state: 'none', delta: 0 };
+  const planned = isNum(plannedMl) ? Math.min(Math.max(plannedMl, 0), p.goal) : 0;
+  const delta = Math.round(p.current - planned) || 0; // || 0 — без «−0»
+  const state = delta < -WATER_PLAN_DELTA_TOLERANCE ? 'behind' : delta > WATER_PLAN_DELTA_TOLERANCE ? 'ahead' : 'onPlan';
+  return { state, delta };
 }
 
 /* Допуск плана воды, мл: отклонение в его пределах — «по плану»; пока план к текущему моменту
