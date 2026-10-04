@@ -8,7 +8,7 @@
    короткий commit: каждый deploy main = новый sw.js = обновление кэша.
    ========================================================= */
 
-const CACHE_VERSION = 'lexlife-v51';
+const CACHE_VERSION = 'lexlife-v52';
 const FONT_CACHE = 'lexlife-fonts-v1';
 /* Журнал показанных срабатываний (push/локально) — общий со страницей (js/services/occurrenceStore.js) */
 const OCC_CACHE = 'lexlife-occ-v1';
@@ -38,6 +38,7 @@ const APP_SHELL = [
   './js/ui/charts.js',
   './js/ui/docViewer.js',
   './js/ui/bottomNav.js',
+  './js/ui/backNav.js',
   './js/vendor/pdfjs/pdf.min.js',
   './js/vendor/pdfjs/pdf.worker.min.js',
   './manifest.json',

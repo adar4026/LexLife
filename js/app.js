@@ -16,6 +16,7 @@ import { parsePreparedTest, importPreparedTest, PreparedImportError } from './se
 import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
 import { openDocViewer as showDocViewer } from './ui/docViewer.js';
 import { setActiveTab, initBottomNav } from './ui/bottomNav.js';
+import { BackButton, goBack, goBackTo, replaceRoute, replaceUrl, initNavHistory, readEntryUi, saveEntryUi } from './ui/backNav.js';
 import { HOME_WATER_QUICK_ADD, waterProgress, homeWaterStatus, waterPlanMarker, waterPlanDelta, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed } from './services/homeSummary.js';
 import { WEEKDAYS, MED_NAME_MAX, MED_DOSE_MAX, MED_NOTE_MAX, MED_TIMES_MAX, nextDose, medSchedule, medStatusOn, medDaySlots, isMedDueOn, nextDueDay, scheduleLabel, intakeSummary, normalizeMedInput, intakeHistory, medOccurrences } from './services/meds.js';
 import {
@@ -465,10 +466,12 @@ async function MetricsScreen() {
 async function MetricScreen(key) {
   const M = METRICS[key];
   const screen = el('<div></div>');
-  let period = 'week';
+  const PERIOD_UI = ['week', 'month', 'year'];
+  let period = PERIOD_UI.includes(readEntryUi('metric')) ? readEntryUi('metric') : 'week';
   let editingGoal = false;
 
   async function paint() {
+    saveEntryUi('metric', period); // «Назад» с вложенного экрана — тот же период
     const [log, cfg] = await Promise.all([Storage.getMetricLog(key), Storage.getMetricConfig(key)]);
     const goal = cfg.goal;
     const days = Object.keys(log).sort();
@@ -476,7 +479,7 @@ async function MetricScreen(key) {
     const cur = lastDay != null ? log[lastDay] : null;
     screen.innerHTML = '';
 
-    screen.appendChild(backHeader(`${M.emoji} ${M.name}`, { label: 'Показатели', onBack: () => { location.hash = '#/metrics'; } }));
+    screen.appendChild(backHeader(`${M.emoji} ${M.name}`, { fallback: 'metrics' }));
 
     /* 1. Текущее значение + 2. Цель */
     const card = el(`
@@ -730,10 +733,11 @@ function flashNotifyResult(granted, onText) {
 
 async function WaterScreen() {
   const screen = el('<div></div>');
-  let period = 'year'; // 'week' | 'month' | 'year' — по умолчанию «Год», как у графика
+  let period = ['week', 'month', 'year'].includes(readEntryUi('water')) ? readEntryUi('water') : 'year'; // 'week' | 'month' | 'year' — по умолчанию «Год», как у графика
   let editingGoal = false;
 
   async function paint() {
+    saveEntryUi('water', period); // «Назад» из журнала воды — тот же период
     const [log, goal, record, loggedStreak, goalStreak, hyd] = await Promise.all([
       Storage.getWaterLog(), Storage.getWaterGoal(), Storage.getWaterRecord(), Storage.getWaterLoggedStreak(), Storage.getWaterStreak(), Storage.getHydration(),
     ]);
@@ -744,7 +748,7 @@ async function WaterScreen() {
     const remaining = Math.max(0, goal - total);
     const color = fillColor(pct);
     screen.innerHTML = '';
-    screen.appendChild(backHeader('💧 Вода', { label: 'Показатели', onBack: () => { location.hash = '#/metrics'; } }));
+    screen.appendChild(backHeader('💧 Вода', { fallback: 'metrics' }));
 
     /* 1. Кольцо + 2. текущий объём / цель */
     const r = 60, circ = 2 * Math.PI * r;
@@ -1288,8 +1292,8 @@ async function MedsScreen() {
 async function MedFormScreen(id) {
   const existing = id ? await Storage.getMed(id) : null;
   const screen = el('<div class="med-form"></div>');
-  const leave = () => goBackOr('meds');
-  screen.appendChild(backHeader(id ? 'Редактировать' : 'Новое лекарство', { label: 'Назад', onBack: leave }));
+  const leave = () => goBack('meds');
+  screen.appendChild(backHeader(id ? 'Редактировать' : 'Новое лекарство', { onBack: leave }));
   if (id && !existing) {
     screen.appendChild(el('<div class="empty">Лекарство не найдено</div>'));
     return screen;
@@ -1427,7 +1431,7 @@ async function MedFormScreen(id) {
       return;
     }
     flash('Сохранено ✓');
-    location.replace('#/meds');
+    goBackTo('meds');
   });
 
   screen.appendChild(form);
@@ -1491,15 +1495,14 @@ async function SleepScreen() {
   if (!sleepUi.histMonth || sleepUi.histMonth > today.slice(0, 7)) sleepUi.histMonth = today.slice(0, 7);
 
   const header = el(`
-    <header class="header sleep-header">
-      <button class="back-btn" type="button">‹ Назад</button>
+    <header class="header header--nav sleep-header">
       <div class="sleep-header__row">
         <h1 class="header__title">Сон</h1>
         <a class="sleep-gear" href="#/sleep/settings" aria-label="Настройки сна">${homeIcon('sliders')}</a>
       </div>
     </header>
   `);
-  $('.back-btn', header).addEventListener('click', goBack);
+  header.prepend(BackButton({ fallback: 'home' }));
   screen.appendChild(header);
 
   if (!entries.length) {
@@ -1843,8 +1846,8 @@ async function SleepFormScreen(id, presetDate = null) {
   const [existing, settings] = await Promise.all([id ? Storage.getSleepEntry(id) : null, Storage.getSleepSettings()]);
   const screen = el('<div class="med-form sleep-form"></div>');
   const route = location.hash;
-  const leave = () => { sleepDraft = null; goBackOr('sleep'); };
-  screen.appendChild(backHeader(id ? 'Запись сна' : 'Новая запись сна', { label: 'Назад', onBack: leave }));
+  const leave = () => { sleepDraft = null; goBack('sleep'); };
+  screen.appendChild(backHeader(id ? 'Запись сна' : 'Новая запись сна', { onBack: leave }));
   if (id && !existing) {
     screen.appendChild(el('<div class="empty">Запись сна не найдена — возможно, она удалена.</div>'));
     return screen;
@@ -2046,7 +2049,7 @@ async function SleepFormScreen(id, presetDate = null) {
       body: `<p class="dialog__muted">Одна дата пробуждения — одна запись: ${esc(formatSleepDuration(dup.durationMinutes))}, ${esc(sleepTimes(dup))}. Откройте её, чтобы изменить, или выберите другую дату.</p>`,
       actions: [{ label: 'Отмена', value: false }, { label: 'Открыть запись', value: true, kind: 'primary' }],
     });
-    if (go) { sleepDraft = null; location.replace(`#/sleep/${encodeURIComponent(dup.id)}`); }
+    if (go) { sleepDraft = null; replaceRoute(`sleep/${encodeURIComponent(dup.id)}`); }
   }
 
   let saving = false;
@@ -2079,7 +2082,7 @@ async function SleepFormScreen(id, presetDate = null) {
     }
     sleepDraft = null;
     flash('Сохранено ✓');
-    location.replace('#/sleep');
+    goBackTo('sleep');
   });
 
   const del = $('.sleep-delete', form);
@@ -2093,7 +2096,7 @@ async function SleepFormScreen(id, presetDate = null) {
     try { await Storage.removeSleepEntry(existing.id); } catch { flash('Не удалось удалить'); return; }
     sleepDraft = null;
     flash('Удалено');
-    location.replace('#/sleep');
+    goBackTo('sleep');
   });
 
   screen.appendChild(form);
@@ -2105,8 +2108,8 @@ async function SleepFormScreen(id, presetDate = null) {
 async function SleepSettingsScreen() {
   const s = await Storage.getSleepSettings();
   const screen = el('<div class="med-form sleep-form"></div>');
-  const leave = () => goBackOr('sleep');
-  screen.appendChild(backHeader('Настройки сна', { label: 'Назад', onBack: leave }));
+  const leave = () => goBack('sleep');
+  screen.appendChild(backHeader('Настройки сна', { onBack: leave }));
   let goal = s.goalMinutes;
   const form = el(`
     <form class="med-form__form" novalidate>
@@ -2147,7 +2150,7 @@ async function SleepSettingsScreen() {
     if (!/^\d{2}:\d{2}$/.test(bedtime) || !/^\d{2}:\d{2}$/.test(wakeTime)) { flash('Укажите время сна и подъёма'); return; }
     try { await Storage.updateSleepSettings({ goalMinutes: goal, bedtime, wakeTime }); } catch { flash('Не удалось сохранить'); return; }
     flash('Сохранено ✓');
-    location.replace('#/sleep');
+    goBackTo('sleep');
   });
   screen.appendChild(form);
   paintGoal();
@@ -2347,7 +2350,6 @@ async function TestsScreen() {
   }
 
   await paint();
-  screen.restoreScroll = true;
   return screen;
 }
 
@@ -2356,12 +2358,11 @@ async function TestDetailScreen(id) {
   const screen = el('<div class="tv"></div>');
   const tests = await Storage.getTests();
   const t = tests.find((x) => x.id === id);
-  const back = () => goBackOr('tests');
   if (!t) {
-    screen.appendChild(backHeader('Анализ', { label: 'Назад', onBack: back }));
+    screen.appendChild(backHeader('Анализ', { fallback: 'tests' }));
     screen.appendChild(el('<div class="empty">Анализ не найден — возможно, он был удалён.</div>'));
     const b = el('<button class="btn-ghost" type="button">К списку анализов</button>');
-    b.addEventListener('click', () => { location.replace('#/tests'); });
+    b.addEventListener('click', () => { goBackTo('tests'); });
     screen.appendChild(b);
     return screen;
   }
@@ -2369,7 +2370,7 @@ async function TestDetailScreen(id) {
   const sections = testSections(t);
   const count = sections.reduce((n, s) => n + s.rows.length, 0);
 
-  screen.appendChild(backHeader(`Анализ от ${fmtTestDate(t.date)}`, { label: 'Назад', onBack: back }));
+  screen.appendChild(backHeader(`Анализ от ${fmtTestDate(t.date)}`, { fallback: 'tests' }));
   const sub = [sameDay > 1 ? `Анализ № ${no} из ${sameDay} за этот день` : '', count ? indicatorsWord(count) : ''].filter(Boolean).join(' · ');
   if (sub) screen.appendChild(el(`<p class="tv-sub">${esc(sub)}</p>`));
   if (t.note) screen.appendChild(el(`<p class="tv-note">${esc(t.note)}</p>`));
@@ -2436,11 +2437,10 @@ async function TestDetailScreen(id) {
       await alertDialog('Не удалось удалить', `<p>${esc((err && err.message) || 'Попробуйте ещё раз.')}</p>`);
       return;
     }
-    goBackOr('tests');
+    goBack('tests');
     flash('Анализ удалён');
   });
   screen.appendChild(actions);
-  screen.restoreScroll = true;
   return screen;
 }
 
@@ -2448,7 +2448,7 @@ async function TestDetailScreen(id) {
 async function TestHistoryScreen(key) {
   const screen = el('<div></div>');
   const h = indicatorHistory(await Storage.getTests(), key);
-  screen.appendChild(backHeader(h.title, { label: 'Назад', onBack: () => goBackOr('tests') }));
+  screen.appendChild(backHeader(h.title, { fallback: 'tests' }));
   if (!h.entries.length) { screen.appendChild(el('<div class="empty">Нет записей этого показателя</div>')); return screen; }
   screen.appendChild(el(`<p class="tv-sub">${h.entries.length} ${plural(h.entries.length, 'значение', 'значения', 'значений')}${h.unit ? ` · ${esc(h.unit)}` : ''}</p>`));
 
@@ -2498,8 +2498,8 @@ async function TestHistoryScreen(key) {
 async function TestFormScreen(id) {
   const screen = el('<div></div>');
   const existing = id ? await Storage.getTest(id) : null;
-  const done = () => goBackOr(existing ? `test/${encodeURIComponent(existing.id)}` : 'tests');
-  screen.appendChild(backHeader(existing ? 'Изменить анализ' : 'Новый анализ', { label: 'Отмена', onBack: done }));
+  const done = () => goBack(existing ? `test/${encodeURIComponent(existing.id)}` : 'tests');
+  screen.appendChild(backHeader(existing ? 'Изменить анализ' : 'Новый анализ', { onBack: done }));
   if (id && !existing) {
     screen.appendChild(el('<div class="empty">Анализ не найден — возможно, он был удалён.</div>'));
     return screen;
@@ -2588,7 +2588,7 @@ async function TestFormScreen(id) {
     try {
       if (existing) {
         const upd = await Storage.updateTest(existing.id, { date, note: $('#f-note', form).value.trim(), ...values });
-        if (!upd) { await alertDialog('Анализ не найден', '<p>Запись была удалена. Ничего не изменено.</p>'); location.replace('#/tests'); return; }
+        if (!upd) { await alertDialog('Анализ не найден', '<p>Запись была удалена. Ничего не изменено.</p>'); replaceRoute('tests'); return; }
       } else {
         const entry = { date, note: $('#f-note', form).value.trim() };
         Object.entries(values).forEach(([k, v]) => { if (v !== undefined) entry[k] = v; });
@@ -2623,7 +2623,7 @@ async function ProfileScreen() {
   async function paint() {
     const p = await Storage.getProfile();
     screen.innerHTML = '';
-    screen.appendChild(backHeader('Профиль', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(backHeader('Профиль'));
     const avatar = p.photo ? `<img class="profile-avatar" src="${esc(p.photo)}" alt="">` : `<div class="profile-avatar profile-avatar--ph">👤</div>`;
     const card = el(`
       <div class="input-card" style="text-align:center">
@@ -2703,7 +2703,7 @@ async function saveBackupFile(content, fileName) {
 
 async function ExportScreen() {
   const screen = el('<div></div>');
-  screen.appendChild(backHeader('Резервная копия', { label: 'Назад', onBack: goBack }));
+  screen.appendChild(backHeader('Резервная копия'));
 
   const lastCard = el('<div class="input-card"><p class="backup-last"></p></div>');
   async function paintLast() {
@@ -2969,7 +2969,7 @@ async function backupBeforeImport(cancelled = 'Импорт отменён') {
 
 async function WaterImportScreen() {
   const screen = el('<div></div>');
-  screen.appendChild(backHeader('Импорт истории воды', { label: 'Назад', onBack: goBack }));
+  screen.appendChild(backHeader('Импорт истории воды', { fallback: 'settings' }));
 
   screen.appendChild(el(`
     <div class="input-card">
@@ -3178,7 +3178,7 @@ async function WaterLogScreen(param) {
   const go = (m, d = null) => {
     month = m;
     focusDay = d;
-    history.replaceState(null, '', `#/water-log/${d || m}`);
+    replaceUrl(`water-log/${d || m}`);
     paint();
   };
 
@@ -3188,7 +3188,7 @@ async function WaterLogScreen(param) {
     const monthEntries = days.reduce((s, d) => s + (log[d].entries || []).length, 0);
     const monthTotal = days.reduce((s, d) => s + (log[d].total || 0), 0);
     screen.innerHTML = '';
-    screen.appendChild(backHeader('Журнал воды', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(backHeader('Журнал воды', { fallback: 'metric/water' }));
 
     const ctrl = el(`
       <div class="input-card">
@@ -3367,7 +3367,7 @@ async function ThemeScreen() {
   function paint() {
     const t = getTheme();
     screen.innerHTML = '';
-    screen.appendChild(backHeader('Тема оформления', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(backHeader('Тема оформления'));
     const list = el('<section class="section" style="margin-top:8px"><div class="list-card"></div></section>');
     const box = $('.list-card', list);
     [['dark', '🌙 Тёмная'], ['light', '☀️ Светлая']].forEach(([val, label]) => {
@@ -3383,7 +3383,7 @@ async function ThemeScreen() {
 
 async function SettingsScreen() {
   const screen = el('<div></div>');
-  screen.appendChild(backHeader('Настройки', { label: 'Назад', onBack: goBack }));
+  screen.appendChild(backHeader('Настройки'));
   const list = el('<section class="section" style="margin-top:8px"><div class="list-card"></div></section>');
   const box = $('.list-card', list);
   [
@@ -3462,7 +3462,7 @@ async function ActivityScreen() {
     const cur = today || {};
     intensity = cur.bikeIntensity || intensity;
     screen.innerHTML = '';
-    screen.appendChild(backHeader('Активность', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(backHeader('Активность'));
     const stats = el(`
       <div class="stat-row">
         <div class="stat"><div class="stat__num">${streak} 🔥</div><div class="stat__label">дней подряд</div></div>
@@ -3511,7 +3511,7 @@ async function ActivityScreen() {
 async function VisitsScreen() {
   const visits = await Storage.getVisits();
   const screen = el('<div></div>');
-  screen.appendChild(backHeader('Врачи и визиты', { label: 'Назад', onBack: goBack }));
+  screen.appendChild(backHeader('Врачи и визиты'));
 
   const add = el('<button class="btn-ghost" type="button" style="margin:8px 0 4px">+ Добавить визит</button>');
   add.addEventListener('click', () => { location.hash = '#/visit/new'; });
@@ -3549,8 +3549,8 @@ async function VisitsScreen() {
 async function VisitDetailScreen(id) {
   const [visit, tests, meds] = await Promise.all([Storage.getVisit(id), Storage.getTests(), Storage.getMeds({ includeDeleted: true })]);
   const screen = el('<div></div>');
-  if (!visit) { screen.appendChild(backHeader('Визит', { label: 'Визиты', onBack: () => { location.hash = '#/visits'; } })); screen.appendChild(el('<div class="empty">Визит не найден</div>')); return screen; }
-  screen.appendChild(backHeader('Визит', { label: 'Визиты', onBack: () => { location.hash = '#/visits'; } }));
+  if (!visit) { screen.appendChild(backHeader('Визит', { fallback: 'visits' })); screen.appendChild(el('<div class="empty">Визит не найден</div>')); return screen; }
+  screen.appendChild(backHeader('Визит', { fallback: 'visits' }));
 
   const statusChip = visit.status === 'planned'
     ? '<span class="vchip vchip--planned">запланирован</span>'
@@ -3603,7 +3603,7 @@ async function VisitDetailScreen(id) {
   const edit = el('<button class="btn-ghost" type="button" style="margin:0">Редактировать</button>');
   edit.addEventListener('click', () => { location.hash = `#/visit/${id}/edit`; });
   const del = el('<button class="btn-ghost" type="button" style="margin:0; color:var(--red)">Удалить</button>');
-  del.addEventListener('click', async () => { if (confirm('Удалить визит?')) { await Storage.removeVisit(id); location.hash = '#/visits'; } });
+  del.addEventListener('click', async () => { if (confirm('Удалить визит?')) { await Storage.removeVisit(id); goBackTo('visits'); } });
   actions.append(edit, del);
   screen.appendChild(actions);
   return screen;
@@ -3615,7 +3615,7 @@ async function VisitFormScreen(id) {
   const meds = allMeds.filter((m) => !m.deletedAt || (existing?.links?.medIds || []).includes(m.id));
   const v = existing || { date: dateKey(), status: 'done', links: { testIds: [], medIds: [], reminderIds: [] }, attachments: [] };
   const screen = el('<div></div>');
-  screen.appendChild(backHeader(id ? 'Редактировать визит' : 'Новый визит', { label: 'Назад', onBack: goBack }));
+  screen.appendChild(backHeader(id ? 'Редактировать визит' : 'Новый визит', { fallback: id ? `visit/${id}` : 'visits' }));
   const form = el('<div class="input-card"></div>');
   const fld = (label, html) => `<div class="field"><label class="field__label">${esc(label)}</label>${html}</div>`;
   form.innerHTML = `
@@ -3660,8 +3660,9 @@ async function VisitFormScreen(id) {
       status: $('#f-status', form).value,
       links: { testIds: getTestIds(), medIds: getMedIds(), reminderIds: v.links?.reminderIds || [] },
     };
-    if (id) { await Storage.updateVisit(id, data); location.hash = `#/visit/${id}`; }
-    else { const created = await Storage.addVisit(data); location.hash = `#/visit/${created.id}`; }
+    /* правка — на карточку визита (она перечитает данные); новый визит — карточка вместо формы; без дублей в истории */
+    if (id) { await Storage.updateVisit(id, data); goBackTo(`visit/${id}`); }
+    else { const created = await Storage.addVisit(data); replaceRoute(`visit/${created.id}`); }
     flash('Сохранено ✓');
   });
   screen.appendChild(save);
@@ -3802,7 +3803,7 @@ async function NotificationsScreen() {
   async function paint() {
     const list = await Storage.getNotifications();
     screen.innerHTML = '';
-    screen.appendChild(backHeader('Уведомления', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(backHeader('Уведомления'));
 
     screen.appendChild(await statusPanel());
 
@@ -4024,10 +4025,18 @@ async function CalendarScreen() {
   let mode = 'month';
   let cursor = new Date(); cursor.setHours(0, 0, 0, 0);
   let selected = dateKey(cursor);
+  /* вид, период и выбранный день — из записи истории («Назад» с карточки визита) */
+  const ui = readEntryUi('calendar');
+  if (ui && ['month', 'week', 'list'].includes(ui.mode) && /^\d{4}-\d{2}-\d{2}$/.test(ui.cursor) && /^\d{4}-\d{2}-\d{2}$/.test(ui.selected)) {
+    mode = ui.mode;
+    cursor = new Date(`${ui.cursor}T00:00:00`);
+    selected = ui.selected;
+  }
 
   async function paint() {
+    saveEntryUi('calendar', { mode, cursor: dateKey(cursor), selected });
     screen.innerHTML = '';
-    screen.appendChild(backHeader('Календарь', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(backHeader('Календарь'));
 
     const seg = el(`
       <div class="seg" style="margin-top:8px">
@@ -4214,7 +4223,7 @@ async function StatsScreen() {
   function paint() {
     const m = engine.forPeriod(period);
     screen.innerHTML = '';
-    screen.appendChild(backHeader('Статистика', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(backHeader('Статистика'));
     screen.appendChild(el(`
       <div class="st-period" role="tablist" aria-label="Период">
         ${PERIODS.map((p) => `<button class="st-period__btn ${p.key === period ? 'is-active' : ''}" type="button" role="tab" aria-selected="${p.key === period}" data-period="${p.key}" title="${esc(p.title)}">${esc(p.label)}</button>`).join('')}
@@ -4657,7 +4666,7 @@ async function StatsScreen() {
 /* заглушка */
 function Stub(emoji, title) {
   const screen = el('<div></div>');
-  screen.appendChild(backHeader(title, { label: 'Назад', onBack: goBack }));
+  screen.appendChild(backHeader(title));
   screen.appendChild(el(`<div class="placeholder"><div class="placeholder__emoji">${emoji}</div><h2>${esc(title)}</h2><p>Раздел в разработке — скоро.</p></div>`));
   return screen;
 }
@@ -4667,12 +4676,13 @@ function onRouteClick(e) {
   const nav = e.target.closest('[data-route]');
   if (nav) location.hash = `#/${nav.getAttribute('data-route')}`;
 }
-function backHeader(title, { label = 'Назад', onBack } = {}) {
-  const h = el(`<header class="header"><button class="back-btn" type="button">‹ ${esc(label)}</button><h1 class="header__title">${esc(title)}</h1></header>`);
-  $('.back-btn', h).addEventListener('click', onBack || goBack);
+/* Шапка внутреннего экрана: круглая кнопка «Назад» (js/ui/backNav.js) + заголовок.
+   fallback — куда вернуться, если экран открыт напрямую (нет истории LexLife) */
+function backHeader(title, { fallback = 'home', onBack } = {}) {
+  const h = el(`<header class="header header--nav"><h1 class="header__title">${esc(title)}</h1></header>`);
+  h.prepend(BackButton({ fallback, onBack }));
   return h;
 }
-function goBack() { if (history.length > 1) history.back(); else location.hash = '#/home'; }
 
 /* Модальный диалог: body — готовый HTML (данные экранируются вызывающим через esc).
    actions: [{ label, value, kind: 'primary'|'danger', onClick }] — onClick вызывается
@@ -4723,7 +4733,7 @@ function flash(text) {
 async function MoveScreen() {
   const screen = el('<div></div>');
   const mode = migrationMode();
-  screen.appendChild(backHeader(mode === 'export' ? 'Перенос LexLife' : mode === 'import' ? 'Перенос из старой версии' : 'Перенос', { label: 'Назад', onBack: goBack }));
+  screen.appendChild(backHeader(mode === 'export' ? 'Перенос LexLife' : mode === 'import' ? 'Перенос из старой версии' : 'Перенос'));
   if (!mode) { screen.appendChild(el('<div class="empty">Перенос сейчас не требуется</div>')); return screen; }
   const url = esc(NEW_HOME_URL);
   const steps = mode === 'export' ? [
@@ -4913,18 +4923,13 @@ function resolve() {
 const safeDecode = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
 
 /* Место прокрутки хранится в записи истории браузера (history.state.y): «Назад» возвращает
-   экран туда, где он был, новый переход открывает экран сверху. Применяется к экранам
-   с node.restoreScroll = true (журнал анализов, полный анализ). */
+   экран туда, где он был, новый переход открывает экран сверху. Для всех экранов
+   (вкладки/период/дата экрана — там же, history.state.ui, см. js/ui/backNav.js). */
 let scrollSaveTimer = 0;
 function saveScrollState() {
   clearTimeout(scrollSaveTimer);
   const y = lockedScrollY ?? window.scrollY;
   try { history.replaceState({ ...(history.state || {}), y }, ''); } catch { /* Safari: лимит частоты replaceState */ }
-}
-/* Вернуться на предыдущий экран; открыт напрямую (истории нет) — на route */
-function goBackOr(route) {
-  if (history.length > 1) history.back();
-  else location.replace(`#/${route}`);
 }
 
 let renderToken = 0;
@@ -4946,7 +4951,7 @@ async function render() {
   mount.innerHTML = '';
   mount.appendChild(node);
   mount.scrollTop = 0;
-  if (routeChanged && node.restoreScroll) {
+  if (routeChanged) {
     const y = history.state && typeof history.state.y === 'number' ? history.state.y : 0;
     window.scrollTo(0, y);
   }
@@ -4976,6 +4981,7 @@ async function boot() {
   initChrome();
   initBottomNav($('#tab-bar'));
   await buildDrawer();
+  initNavHistory(); // до роутера: глубина записи истории должна быть известна к render()
   window.addEventListener('hashchange', render);
   window.addEventListener('scroll', () => { clearTimeout(scrollSaveTimer); scrollSaveTimer = setTimeout(saveScrollState, 250); }, { passive: true });
   document.addEventListener('click', saveScrollState, true); // до перехода по ссылке/кнопке

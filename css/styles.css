@@ -776,18 +776,56 @@ button.tv-doc:active { background: var(--surface-2); }
 .row__chevron { color: var(--text2); font-size: 22px; line-height: 1; flex-shrink: 0; }
 [role="button"].row { cursor: pointer; }
 
-/* Кнопка «назад» на под-экранах */
-.back-btn {
-  background: none;
-  border: 0;
-  color: var(--blue);
-  font-size: 15px;
-  font-weight: 700;
-  padding: 2px 0 4px;
-  display: inline-flex;
-  align-items: center;
+/* Кнопка «Назад» — единая для всех внутренних экранов (BackButton, js/ui/backNav.js).
+   Круг 54px (как аватар; 52px на невысоких экранах) — зона касания ≥ 44×44; светлый фон,
+   тонкая тёмная обводка, шеврон «chevron.left» без подписи. В потоке шапки (не fixed) —
+   прокручивается вместе со страницей. Левый край — по краю контента (16px); центр —
+   safe-top + 38px, как у аватара справа (экран: safe-top + 12px, шапка .header--nav без
+   верхнего отступа, −1px ниже). Тёмная тема — те же формы, тёмная заливка и светлый контур. */
+:root {
+  --back-bg: #1c232c;
+  --back-border: rgba(255, 255, 255, 0.2);
+  --back-ink: #f2f4f7;
+  --back-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
 }
-.back-btn:active { opacity: 0.6; }
+[data-theme="light"] {
+  --back-bg: #ffffff;
+  --back-border: rgba(28, 28, 30, 0.22);
+  --back-ink: #111113;
+  --back-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+.header--nav { padding-top: 0; }
+.back-btn {
+  --back-size: 54px;
+  width: var(--back-size);
+  height: var(--back-size);
+  margin: -1px 0 10px;
+  padding: 0;
+  border: 1px solid var(--back-border);
+  border-radius: 50%;
+  background: var(--back-bg);
+  box-shadow: var(--back-shadow);
+  color: var(--back-ink);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 0.12s ease, opacity 0.12s ease;
+}
+.back-btn__icon {
+  width: 28px;
+  height: 28px;
+  margin-left: -2px; /* оптически по центру: «вес» шеврона — у острия */
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.back-btn:active { transform: scale(0.94); opacity: 0.7; }
+.back-btn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--blue); }
+@media (max-height: 700px) { .back-btn { --back-size: 52px; margin-top: 0; } }
 
 /* ---------- Блок «Сегодня» (4 компактные карточки) ---------- */
 
