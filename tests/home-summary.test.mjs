@@ -13,7 +13,7 @@
    ========================================================= */
 
 import assert from 'node:assert/strict';
-import { HOME_WATER_QUICK_ADD, waterProgress, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed, nextDose } from '../js/services/homeSummary.js';
+import { HOME_WATER_QUICK_ADD, WATER_PLAN_TOLERANCE, waterProgress, waterDayStatus, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed, nextDose } from '../js/services/homeSummary.js';
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -238,19 +238,40 @@ test('активность: нет данных — null (секция скры�
 
 /* ================= hero: план дня, лекарства на сегодня, ближайший визит ================= */
 
-test('hero: вода по плану, отставание, цель выполнена, цели нет', () => {
-  assert.deepEqual(waterDayStatus(1200, 2600, 1100), { state: 'onTrack', behind: 0, over: 0 });
-  assert.deepEqual(waterDayStatus(1200, 2600, 1200), { state: 'onTrack', behind: 0, over: 0 });
-  assert.deepEqual(waterDayStatus(900, 2600, 1250), { state: 'behind', behind: 350, over: 0 });
-  assert.deepEqual(waterDayStatus(2900, 2600, 2600), { state: 'done', behind: 0, over: 300 });
-  assert.deepEqual(waterDayStatus(500, 0, 0), { state: 'none', behind: 0, over: 0 });
+test('hero: вода по плану, отставание, опережение, цель выполнена, цели нет', () => {
+  assert.deepEqual(waterDayStatus(1200, 2600, 1100), { state: 'onTrack', behind: 0, ahead: 0, over: 0 });
+  assert.deepEqual(waterDayStatus(1200, 2600, 1200), { state: 'onTrack', behind: 0, ahead: 0, over: 0 });
+  assert.deepEqual(waterDayStatus(900, 2600, 1250), { state: 'behind', behind: 350, ahead: 0, over: 0 });
+  assert.deepEqual(waterDayStatus(1450, 2600, 1250), { state: 'ahead', behind: 0, ahead: 200, over: 0 });
+  assert.deepEqual(waterDayStatus(2600, 2600, 2000), { state: 'done', behind: 0, ahead: 0, over: 0 });
+  assert.deepEqual(waterDayStatus(2900, 2600, 2600), { state: 'done', behind: 0, ahead: 0, over: 300 });
+  assert.deepEqual(waterDayStatus(500, 0, 0), { state: 'none', behind: 0, ahead: 0, over: 0 });
 });
 
-test('hero: план до подъёма (0) и мусор — «по плану», отставание не больше цели', () => {
-  assert.equal(waterDayStatus(0, 2600, 0).state, 'onTrack');
-  assert.equal(waterDayStatus(0, 2600, undefined).state, 'onTrack');
-  assert.equal(waterDayStatus(NaN, 2600, -50).state, 'onTrack');
-  assert.equal(waterDayStatus(100, 2600, 99999).behind, 2500);
+/* plannedMl ниже — как считает app.js plannedByNow для режима по умолчанию 07:00–23:00 и цели 2600:
+   до подъёма 0; 07:30 → 81; 08:00 → 163; 09:00 → 325 (линейно, 2600 мл за 960 мин) */
+test('hero: начало дня — 0 мл и план ещё не больше допуска → «день только начался»', () => {
+  assert.equal(WATER_PLAN_TOLERANCE, 150);
+  assert.deepEqual(waterDayStatus(0, 2600, 0), { state: 'start', behind: 0, ahead: 0, over: 0 }); // 00:18
+  assert.equal(waterDayStatus(0, 2600, 81).state, 'start'); // 07:30
+  assert.equal(waterDayStatus(0, 2600, 150).state, 'start'); // граница допуска
+  assert.equal(waterDayStatus(0, 2600, undefined).state, 'start'); // режим дня не задан
+});
+
+test('hero: утро, 0 мл, план уже заметный → «отстаёте»; выпито рядом с планом → «по плану»', () => {
+  assert.deepEqual(waterDayStatus(0, 2600, 163), { state: 'behind', behind: 163, ahead: 0, over: 0 }); // 08:00
+  assert.deepEqual(waterDayStatus(0, 2600, 325), { state: 'behind', behind: 325, ahead: 0, over: 0 }); // 09:00
+  assert.equal(waterDayStatus(200, 2600, 325).state, 'onTrack'); // −125 в пределах допуска
+  assert.equal(waterDayStatus(450, 2600, 325).state, 'onTrack'); // +125 в пределах допуска
+  assert.equal(waterDayStatus(174, 2600, 325).state, 'behind'); // −151
+  assert.equal(waterDayStatus(476, 2600, 325).ahead, 151);
+});
+
+test('hero: выпито ночью до подъёма — опережение, а не «начало дня»; мусор и границы', () => {
+  assert.deepEqual(waterDayStatus(300, 2600, 0), { state: 'ahead', behind: 0, ahead: 300, over: 0 });
+  assert.equal(waterDayStatus(100, 2600, 0).state, 'onTrack'); // выпито, но в пределах допуска
+  assert.equal(waterDayStatus(NaN, 2600, -50).state, 'start');
+  assert.equal(waterDayStatus(100, 2600, 99999).behind, 2500); // план не больше цели
 });
 
 test('лекарства на сегодня: активные, отмеченные — по имени; неактивные и закончившиеся не считаются', () => {

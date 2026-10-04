@@ -221,9 +221,13 @@ function renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, metric
       ? `${homeIcon('check')}Цель выполнена${s.over ? ` · +${esc(fmtMl(s.over))} мл` : ''}`
       : s.state === 'behind'
         ? `<span class="hh__dot"></span>Отстаёте от плана на ${esc(fmtMl(s.behind))} мл`
-        : s.state === 'onTrack'
-          ? '<span class="hh__dot"></span>Всё идёт по плану'
-          : 'Цель не задана';
+        : s.state === 'ahead'
+          ? `<span class="hh__dot"></span>Опережение на ${esc(fmtMl(s.ahead))} мл`
+          : s.state === 'start'
+            ? '<span class="hh__dot"></span>День только начался'
+            : s.state === 'onTrack'
+              ? '<span class="hh__dot"></span>Всё идёт по плану'
+              : 'Цель не задана';
     $('.hh__value', hero).setAttribute('aria-label', `Вода сегодня: ${fmtMl(p.current)}${p.goal ? ` из ${fmtMl(p.goal)}` : ''} мл. Открыть модуль воды`);
   };
   paint(water);

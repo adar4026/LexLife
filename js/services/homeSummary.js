@@ -37,16 +37,23 @@ export function waterProgress(current, goal) {
 /* Быстрое действие hero «+ N мл»: одна запись воды этим объёмом (Storage.addWaterEntry) */
 export const HOME_WATER_QUICK_ADD = 300;
 
-/* Состояние дня по воде относительно плана гидратации — та же оценка, что на экране «Вода»
-   (выпито − план к текущему моменту < 0 → «отстаёте»). plannedMl считает app.js (plannedByNow).
-   → { state: 'none' (цели нет) | 'done' | 'onTrack' | 'behind', behind (мл, ≥ 0), over (мл сверх цели) } */
+/* Допуск плана воды, мл: отклонение в его пределах — «по плану»; пока план к текущему моменту
+   не больше допуска и ничего не выпито — «день только начался» (до подъёма план = 0) */
+export const WATER_PLAN_TOLERANCE = 150;
+
+/* Состояние дня по воде относительно плана гидратации — по тому же плану, что на экране «Вода»
+   (выпито − план к текущему моменту), но с допуском WATER_PLAN_TOLERANCE. plannedMl считает app.js (plannedByNow).
+   → { state: 'none' (цели нет) | 'done' | 'start' | 'onTrack' | 'ahead' | 'behind',
+       behind (мл, ≥ 0), ahead (мл опережения, ≥ 0), over (мл сверх цели) } */
 export function waterDayStatus(current, goal, plannedMl) {
   const p = waterProgress(current, goal);
-  if (!p.goal) return { state: 'none', behind: 0, over: 0 };
-  if (p.reached) return { state: 'done', behind: 0, over: p.over };
+  if (!p.goal) return { state: 'none', behind: 0, ahead: 0, over: 0 };
+  if (p.reached) return { state: 'done', behind: 0, ahead: 0, over: p.over };
   const planned = isNum(plannedMl) ? Math.min(Math.max(plannedMl, 0), p.goal) : 0;
-  const behind = Math.max(Math.round(planned - p.current), 0);
-  return { state: behind > 0 ? 'behind' : 'onTrack', behind, over: 0 };
+  const diff = Math.round(p.current - planned);
+  if (diff < -WATER_PLAN_TOLERANCE) return { state: 'behind', behind: -diff, ahead: 0, over: 0 };
+  if (diff > WATER_PLAN_TOLERANCE) return { state: 'ahead', behind: 0, ahead: diff, over: 0 };
+  return { state: p.current === 0 ? 'start' : 'onTrack', behind: 0, ahead: 0, over: 0 };
 }
 
 /* ---------- «Требует внимания» ---------- */
