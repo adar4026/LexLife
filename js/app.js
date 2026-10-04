@@ -14,7 +14,7 @@ import { AttachmentService, IdbAttachmentStore, AttachmentError, ATTACHMENT_ACCE
 import { createFullBackup, prepareFullRestore, applyFullRestore, isZipFile, countDocsLostOnRestore } from './services/fullBackup.js';
 import { parsePreparedTest, importPreparedTest, PreparedImportError } from './services/preparedImport.js';
 import { parseMedicalHistory, buildHistoryImportPlan, applyHistoryImportPlan, HistoryImportError } from './services/historyImport.js';
-import { visitIcon, visitTitle, visitSub, visitTime, visitKindLabel, visitStatusChip } from './services/visitKinds.js';
+import { visitIcon, visitTitle, visitSub, visitTime, visitKindLabel, visitStatusChip, visitMatchesQuery, relativeVisitLabel } from './services/visitKinds.js';
 import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
 import { openDocViewer as showDocViewer } from './ui/docViewer.js';
 import { setActiveTab, initBottomNav } from './ui/bottomNav.js';
@@ -3684,25 +3684,37 @@ async function VisitsScreen() {
   const screen = el('<div></div>');
   screen.appendChild(backHeader('Врачи и визиты'));
 
+  const search = el(`
+    <div class="search-box">
+      <span class="search-box__icon" aria-hidden="true">🔍</span>
+      <input class="search-box__input" type="text" inputmode="search" enterkeyhint="search" placeholder="Поиск" aria-label="Поиск по визитам и врачам">
+      <button class="search-box__clear" type="button" aria-label="Очистить поиск" hidden>✕</button>
+    </div>
+  `);
+  const searchInput = $('.search-box__input', search);
+  const clearBtn = $('.search-box__clear', search);
+  screen.appendChild(search);
+
   const add = el('<button class="btn-ghost" type="button" style="margin:8px 0 4px">+ Добавить визит</button>');
   add.addEventListener('click', () => { location.hash = '#/visit/new'; });
   screen.appendChild(add);
 
-  const planned = visits.filter((v) => v.status === 'planned').sort((a, b) => a.date.localeCompare(b.date) || (visitTime(a) || '').localeCompare(visitTime(b) || ''));
-  /* прошедшие — новые сверху; в один день — позднее время выше */
-  const done = visits.filter((v) => v.status !== 'planned').sort((a, b) => b.date.localeCompare(a.date) || (visitTime(b) || '').localeCompare(visitTime(a) || ''));
+  const list = el('<div></div>');
+  screen.appendChild(list);
 
   const group = (title, arr) => {
     if (!arr.length) return;
     const sec = el(`<section class="section" style="margin-top:14px"><div class="section__head"><h2 class="section__title">${esc(title)}</h2></div><div class="list-card"></div></section>`);
     const box = $('.list-card', sec);
     arr.forEach((v) => {
+      const rel = relativeVisitLabel(v.date);
       const row = el(`
         <div class="row" role="button" data-id="${esc(v.id)}" style="align-items:flex-start">
           <span class="row__icon">${visitIcon(v)}</span>
           <div class="row__body">
             <p class="row__title">${esc(visitTitle(v))}</p>
             <p class="row__sub">${esc(visitSub(v) || v.conclusion || '')}</p>
+            ${rel ? `<p class="row__meta">${esc(rel)}</p>` : ''}
           </div>
           <span class="row__trailing">${esc(fmtDate(v.date))}<br><span class="row__chevron">›</span></span>
         </div>
@@ -3710,13 +3722,34 @@ async function VisitsScreen() {
       box.appendChild(row);
     });
     sec.addEventListener('click', (e) => { const r = e.target.closest('[data-id]'); if (r) location.hash = `#/visit/${r.dataset.id}`; });
-    screen.appendChild(sec);
+    list.appendChild(sec);
   };
-  group('Запланированные', planned);
-  /* прошедшие — по годам: после импорта истории список длинный */
-  const years = [...new Set(done.map((v) => v.date.slice(0, 4)))];
-  years.forEach((y) => group(years.length > 1 ? `Прошедшие · ${y}` : 'Прошедшие', done.filter((v) => v.date.startsWith(y))));
-  if (!visits.length) screen.appendChild(el('<div class="empty">Пока нет визитов</div>'));
+
+  function render(query) {
+    list.innerHTML = '';
+    const filtered = query ? visits.filter((v) => visitMatchesQuery(v, query)) : visits;
+    const planned = filtered.filter((v) => v.status === 'planned').sort((a, b) => a.date.localeCompare(b.date) || (visitTime(a) || '').localeCompare(visitTime(b) || ''));
+    /* прошедшие — новые сверху; в один день — позднее время выше */
+    const done = filtered.filter((v) => v.status !== 'planned').sort((a, b) => b.date.localeCompare(a.date) || (visitTime(b) || '').localeCompare(visitTime(a) || ''));
+    group('Запланированные', planned);
+    /* прошедшие — по годам: после импорта истории список длинный */
+    const years = [...new Set(done.map((v) => v.date.slice(0, 4)))];
+    years.forEach((y) => group(years.length > 1 ? `Прошедшие · ${y}` : 'Прошедшие', done.filter((v) => v.date.startsWith(y))));
+    if (!filtered.length) list.appendChild(el(`<div class="empty">${query ? 'Ничего не найдено' : 'Пока нет визитов'}</div>`));
+  }
+
+  searchInput.addEventListener('input', () => {
+    clearBtn.hidden = !searchInput.value;
+    render(searchInput.value);
+  });
+  clearBtn.addEventListener('click', () => {
+    searchInput.value = '';
+    clearBtn.hidden = true;
+    render('');
+    searchInput.focus();
+  });
+
+  render('');
   return screen;
 }
 

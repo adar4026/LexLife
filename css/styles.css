@@ -243,7 +243,46 @@ h1, h2, h3 {
 .row__body { flex: 1; min-width: 0; }
 .row__title { font-size: 15px; font-weight: 700; margin: 0; }
 .row__sub { font-size: 13px; color: var(--text2); margin: 2px 0 0; }
+.row__meta { font-size: 12px; color: var(--text2); opacity: 0.75; margin: 2px 0 0; }
 .row__trailing { font-size: 13px; color: var(--text2); text-align: right; flex-shrink: 0; }
+
+/* ---------- Строка поиска (напр. «Врачи и визиты») ---------- */
+.search-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  margin: 10px 0 4px;
+}
+.search-box__icon { font-size: 14px; color: var(--text2); flex-shrink: 0; }
+.search-box__input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: none;
+  outline: none;
+  color: var(--text);
+  font-size: 16px;
+  padding: 0;
+}
+.search-box__input::placeholder { color: var(--text2); }
+.search-box__clear {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: none;
+  background: var(--surface-2);
+  color: var(--text2);
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
 
 /* Чекбокс «принял» */
 .check {
