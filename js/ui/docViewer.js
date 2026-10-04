@@ -88,7 +88,7 @@ let current = null; // открытый просмотр (одновременн
 /* Открыть просмотр. file — File (имя, тип, данные).
    opts: { lockScroll, unlockScroll } — блокировка прокрутки страницы под просмотром.
    → { session, close, ready } (ready — Promise: PDF/фото показаны или показан запасной вариант) */
-export function openDocViewer(file, { lockScroll = () => {}, unlockScroll = () => {} } = {}) {
+export function openDocViewer(file, { lockScroll = () => {}, unlockScroll = () => {}, title = 'Документ анализа' } = {}) {
   if (current) current.close();
   const session = new DocSession();
   const kind = kindOf(file.type);
@@ -97,11 +97,11 @@ export function openDocViewer(file, { lockScroll = () => {}, unlockScroll = () =
   const opener = document.activeElement;
 
   const root = h(`
-    <div class="docv" role="dialog" aria-modal="true" aria-label="Документ анализа">
+    <div class="docv" role="dialog" aria-modal="true" aria-label="${esc(title)}">
       <div class="docv__bar">
         <button class="docv__btn" type="button" data-act="close">‹ Закрыть</button>
         <div class="docv__head">
-          <span class="docv__eyebrow">Документ анализа</span>
+          <span class="docv__eyebrow">${esc(title)}</span>
           <span class="docv__title"></span>
         </div>
         <span class="docv__pages" aria-live="polite"></span>

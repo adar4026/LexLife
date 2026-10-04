@@ -2176,6 +2176,18 @@ body:has(.home) { background: var(--hm-bg); }
 .med-history__day + .med-history__day { border-top: 1px solid var(--border); }
 .med-history__date { width: 92px; flex-shrink: 0; color: var(--text2); }
 .med-history__items { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+/* завершённые курсы — свёрнутый блок под списком */
+.med-ended .med-card { opacity: 0.85; }
+
+/* импорт медицинской истории: списки предпросмотра */
+.hist-group { margin-top: 10px; }
+.hist-list { list-style: none; margin: 0; padding: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+.hist-item { display: grid; grid-template-columns: 112px 1fr; gap: 2px 10px; padding: 10px 14px; font-size: 14px; }
+.hist-item + .hist-item { border-top: 1px solid var(--border); }
+.hist-item__when { color: var(--text2); }
+.hist-item__title { min-width: 0; overflow-wrap: anywhere; }
+.hist-item__why { grid-column: 2; color: var(--text2); font-size: 12.5px; overflow-wrap: anywhere; }
+@media (max-width: 380px) { .hist-item { grid-template-columns: 1fr; } .hist-item__why { grid-column: 1; } }
 
 /* форма */
 .med-form__set { border: 0; margin: 0 0 14px; padding: 0; min-width: 0; }
@@ -2380,3 +2392,20 @@ a.sleep-last:active { background: var(--surface-2); }
 .hrow__status--ok { color: var(--hm-ink); display: inline-flex; align-items: center; gap: 4px; }
 .hrow__ok { width: 16px; height: 16px; stroke-width: 2.6; color: var(--green); }
 .hrow__status--add { color: var(--hm-accent); }
+
+/* «Документы» медицинской записи */
+.vdocs__add { display: block; width: 100%; box-sizing: border-box; margin-top: 10px; text-align: center; }
+.vdocs__hint { margin: 6px 2px 0; font-size: 12.5px; color: var(--text2); }
+.vdoc { align-items: center; cursor: pointer; }
+.vdoc__thumb {
+  width: 44px; height: 44px; flex-shrink: 0; border-radius: 10px; overflow: hidden;
+  display: grid; place-items: center; background: var(--surface2, var(--border)); font-size: 20px;
+}
+.vdoc__thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.vdoc__thumb--pdf { background: #c8372d; color: #fff; }
+.vdoc__thumb--pdf b { font-size: 11px; letter-spacing: 0.04em; }
+.vdoc__name { overflow-wrap: anywhere; }
+.vdoc__more {
+  width: 44px; height: 44px; flex-shrink: 0; display: grid; place-items: center;
+  border: 0; background: none; color: var(--text2); border-radius: 50%; cursor: pointer;
+}

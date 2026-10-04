@@ -54,6 +54,8 @@ LexLife/
 │   ├── services/testsJournal.js # Журнал анализов: порядок, годы, разделы, история показателя (§8.8)
 │   ├── services/homeSummary.js  # Данные Главной: прогресс воды, «Ближайшее», «Требует внимания», «Последняя активность»
 │   ├── services/sleep.js        # «Сон»: модель записи, валидация, настройки, аналитика (чистые функции, §8.9)
+│   ├── services/visitKinds.js   # Вид записи «Врачи и визиты»: иконка, название, подпись, время
+│   ├── services/historyImport.js # Импорт медицинской истории (JSON): проверка, dry-run, только добавление
 │   ├── ui/charts.js             # Лёгкие интерактивные SVG-графики (линия/столбцы)
 │   ├── ui/docViewer.js          # «Документ анализа»: PDF все страницы / фото с масштабом (§8.8)
 │   └── vendor/pdfjs/            # Локальная копия pdf.js 4.10.38 (Apache-2.0), без CDN
@@ -212,6 +214,8 @@ fallback → home
 ]
 ```
 `links` — задел под связи между модулями: визит ссылается на записи `health_tests`/`health_meds` по `id`; резолвится запросом, без дублирования. `nextDate` — источник строки «Следующий визит» в детали и точки в Календаре.
+
+Аддитивные поля (схема v8 не менялась): `kind` (вид события: visit · procedure · surgery · imaging · dental · lab · illness · injury · emergency · referral · appointment · vision — иконка и подпись, `services/visitKinds.js`), `title` (название события; в форме — «Название»), `time` («ЧЧ:ММ»), `importId`/`importedAt`/`source` (импорт медицинской истории, `services/historyImport.js`). `attachments` — метаданные документов `{ attachmentId, name, type, size, addedAt }`, файлы — в IndexedDB `lexlife-visit-files` (docs/FULL_BACKUP.md §4).
 
 ### 5.7 `notifications` — центр уведомлений (добавлено в v8)
 ```jsonc
@@ -389,7 +393,8 @@ fallback → home
 Заменил read-only «Архив». Список (группы **Запланированные**/**Прошедшие**, «+ Добавить визит») → деталь (`visit/<id>`) → форма (`visit/new`, `visit/<id>/edit`).
 - Деталь показывает все поля визита (§5.6), статус-чип, «Следующий визит» (если задан), **связанные анализы и лекарства** (резолвятся по `links.testIds/medIds` в `health_tests`/`health_meds`), вложения (метаданные), Редактировать/Удалить.
 - Форма — все поля + мультивыбор связей (чипы, тумблер `is-on`).
-- Вложения — только метаданные (имя/тип/размер); реальные файлы — после `IndexedDbDriver`.
+- «Документы»: несколько PDF/фото на запись, миниатюры, просмотр `ui/docViewer.js`, удаление по одному (docs/FULL_BACKUP.md §4); входят в полную копию (ZIP).
+- Прошедшие записи сгруппированы по годам; импорт истории — Настройки → «Импорт медицинской истории» (docs/FULL_BACKUP.md §5).
 
 ### 8.5 Центр уведомлений (`notifications`)
 6 типов из `NOTIF_ORDER = ['meds','water','pressure','weight','tests','visits']`, по одному правилу на тип (модель — §5.7). Экран: **панель реального статуса** (поддержка API, разрешение, режим PWA, Service Worker, push-подписка, способ доставки, кнопки «Отправить тестовое уведомление» / «Через 10 с»), карточка на тип с тумблером, сводкой периодичности, текстом и «следующим срабатыванием»; тап по телу карточки раскрывает инлайн-редактор (текст, периодичность — Ежедневно/Будни/Еженедельно(дни)/Каждые N часов(окно, можно через полночь)/Разово(дата), время).
@@ -443,7 +448,7 @@ fallback → home
 ## 9. Тема, профиль, офлайн
 - **Тема** — `app_theme` в `localStorage`, `applyTheme()` ставит `data-theme` на `<html>`; светлая палитра в `[data-theme="light"]`.
 - **Профиль** — имя + аватар (фото сжимается в 200×200 JPEG, хранится data-URL).
-- **Service Worker** `lexlife-v35` — предкэш оболочки (запросы предкэша с `cache: 'reload'`, мимо HTTP-кэша) (HTML/CSS/JS/manifest/иконка) + кэш Google Fonts (stale-while-revalidate) + обработчики `notificationclick` (открытие нужного экрана) и `push` (Web Push сервера LexLife, журнал occurrence `lexlife-occ-v1`). Запросы `<scope>api/*` не кэшируются. Обновление ассетов — инкремент `CACHE_VERSION`.
+- **Service Worker** `lexlife-v53` — предкэш оболочки (запросы предкэша с `cache: 'reload'`, мимо HTTP-кэша) (HTML/CSS/JS/manifest/иконка) + кэш Google Fonts (stale-while-revalidate) + обработчики `notificationclick` (открытие нужного экрана) и `push` (Web Push сервера LexLife, журнал occurrence `lexlife-occ-v1`). Запросы `<scope>api/*` не кэшируются. Обновление ассетов — инкремент `CACHE_VERSION`.
 
 ---
 

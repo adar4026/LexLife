@@ -5,13 +5,17 @@
      backup.json                обычная резервная копия LexLife (тот же JSON, что
                                 «Создать резервную копию» — его можно извлечь из
                                 архива и восстановить даже старой версией LexLife)
-     attachments/<id>.<ext>     сами PDF / фото без изменений
+     attachments/<id>.<ext>     сами PDF / фото анализов без изменений
+     visit-attachments/<id>.<ext>  документы медицинских записей («Врачи и визиты»);
+                                в манифесте — отдельный список visitAttachments (аддитивно:
+                                формат 1 не меняется, старые версии LexLife этот список не читают,
+                                старые копии без него восстанавливаются как раньше)
    Архив без сжатия (STORE), см. services/zip.js. Ничего не отправляется в сеть.
    ========================================================= */
 
 import { parseBackup, backupFileName, BackupError } from './storage.js';
 import { createZip, readZip, ZipError } from './zip.js';
-import { ATTACHMENT_TYPES, MAX_ATTACHMENT_BYTES, AttachmentService, sniffBytes, cleanFileName } from './attachments.js';
+import { ATTACHMENT_TYPES, MAX_ATTACHMENT_BYTES, AttachmentService, VisitAttachmentService, visitDocsOf, sniffBytes, cleanFileName } from './attachments.js';
 
 export const FULL_BACKUP_KIND = 'lexlife-full-backup';
 export const FULL_BACKUP_FORMAT_VERSION = 1;
@@ -30,8 +34,9 @@ export async function isZipFile(file) {
   return b.length === 4 && b[0] === 0x50 && b[1] === 0x4b && ((b[2] === 3 && b[3] === 4) || (b[2] === 5 && b[3] === 6));
 }
 
-/* Создать полную копию → { blob, fileName, createdAt, attachments, missing, verified } */
-export async function createFullBackup(storage, store) {
+/* Создать полную копию → { blob, fileName, createdAt, attachments, visitAttachments, missing, verified }
+   visitStore — хранилище документов медицинских записей (без него — только документы анализов) */
+export async function createFullBackup(storage, store, { visitStore = null } = {}) {
   const backup = await storage.exportBackup();
   const json = JSON.stringify(backup, null, 2);
   const tests = Array.isArray(backup.data[storage.KEYS.tests]) ? backup.data[storage.KEYS.tests] : [];
@@ -50,6 +55,21 @@ export async function createFullBackup(storage, store) {
       list.push({ attachmentId: a.attachmentId, testId: t.id ?? null, name: a.name || rec.name || '', type, size: rec.data.byteLength, addedAt: a.addedAt || rec.addedAt || null, file });
     }
   }
+  const visitList = [];
+  if (visitStore) {
+    const visits = Array.isArray(backup.data[storage.KEYS.visits]) ? backup.data[storage.KEYS.visits] : [];
+    for (const v of visits) {
+      for (const a of visitDocsOf(v)) {
+        if (!SAFE_ID.test(a.attachmentId)) continue;
+        const rec = await visitStore.get(a.attachmentId);
+        const type = rec && ATTACHMENT_TYPES[rec.type] ? rec.type : null;
+        if (!rec || !rec.data || !type) { missing += 1; continue; }
+        const file = `visit-attachments/${a.attachmentId}.${ATTACHMENT_TYPES[type].ext}`;
+        files.push({ name: file, data: new Uint8Array(rec.data) });
+        visitList.push({ attachmentId: a.attachmentId, visitId: v.id ?? null, name: a.name || rec.name || '', type, size: rec.data.byteLength, addedAt: a.addedAt || rec.addedAt || null, file });
+      }
+    }
+  }
   const manifest = {
     app: 'lexlife',
     kind: FULL_BACKUP_KIND,
@@ -58,6 +78,7 @@ export async function createFullBackup(storage, store) {
     appVersion: backup.appVersion,
     backup: BACKUP_JSON,
     attachments: list,
+    visitAttachments: visitList,
   };
   const blob = createZip([
     { name: MANIFEST, data: enc.encode(JSON.stringify(manifest, null, 2)) },
@@ -69,9 +90,9 @@ export async function createFullBackup(storage, store) {
   let verified = true;
   try {
     const check = await prepareFullRestore(storage, blob);
-    if (check.attachments.length !== list.length) verified = false;
+    if (check.attachments.length !== list.length || check.visitAttachments.length !== visitList.length) verified = false;
   } catch { verified = false; }
-  return { blob, fileName: fullBackupFileName(new Date(backup.createdAt)), createdAt: backup.createdAt, attachments: list.length, missing, bytes: blob.size, verified };
+  return { blob, fileName: fullBackupFileName(new Date(backup.createdAt)), createdAt: backup.createdAt, attachments: list.length, visitAttachments: visitList.length, missing, bytes: blob.size, verified };
 }
 
 /* Проверка полной копии БЕЗ записи: архив, манифест, данные (через prepareRestore
@@ -106,33 +127,45 @@ export async function prepareFullRestore(storage, file) {
   const prepared = await storage.prepareRestore(parseBackup(text));
 
   const raw = Array.isArray(manifest.attachments) ? manifest.attachments : null;
-  if (!raw || raw.length > 5000) throw new BackupError('CORRUPT', 'Полная резервная копия повреждена: некорректный список документов.');
-  const seen = new Set();
-  const attachments = raw.map((a) => {
-    const t = a && ATTACHMENT_TYPES[a.type];
-    const ok = a && typeof a === 'object' && typeof a.attachmentId === 'string' && SAFE_ID.test(a.attachmentId) && t
-      && a.file === `attachments/${a.attachmentId}.${t.ext}` && Number.isInteger(a.size) && a.size > 0 && a.size <= MAX_ATTACHMENT_BYTES
-      && zip.has(a.file) && zip.size(a.file) === a.size && !seen.has(a.attachmentId);
-    if (!ok) throw new BackupError('CORRUPT', 'Полная резервная копия повреждена: документ в архиве не совпадает с описанием.');
-    seen.add(a.attachmentId);
-    return {
-      attachmentId: a.attachmentId,
-      testId: typeof a.testId === 'string' || typeof a.testId === 'number' ? a.testId : null,
-      name: cleanFileName(a.name, a.type),
-      type: a.type,
-      size: a.size,
-      addedAt: typeof a.addedAt === 'string' ? a.addedAt : null,
-      file: a.file,
-    };
-  });
-  /* восстанавливаются только документы, на которые ссылаются анализы из копии */
+  /* visitAttachments — необязательный (копии до документов медицинских записей его не содержат) */
+  const rawVisit = manifest.visitAttachments == null ? [] : manifest.visitAttachments;
+  if (!raw || raw.length > 5000 || !Array.isArray(rawVisit) || rawVisit.length > 5000) throw new BackupError('CORRUPT', 'Полная резервная копия повреждена: некорректный список документов.');
+  const parseList = (items, dir, owner) => {
+    const seen = new Set();
+    const out = items.map((a) => {
+      const t = a && ATTACHMENT_TYPES[a.type];
+      const ok = a && typeof a === 'object' && typeof a.attachmentId === 'string' && SAFE_ID.test(a.attachmentId) && t
+        && a.file === `${dir}/${a.attachmentId}.${t.ext}` && Number.isInteger(a.size) && a.size > 0 && a.size <= MAX_ATTACHMENT_BYTES
+        && zip.has(a.file) && zip.size(a.file) === a.size && !seen.has(a.attachmentId);
+      if (!ok) throw new BackupError('CORRUPT', 'Полная резервная копия повреждена: документ в архиве не совпадает с описанием.');
+      seen.add(a.attachmentId);
+      return {
+        attachmentId: a.attachmentId,
+        [owner]: typeof a[owner] === 'string' || typeof a[owner] === 'number' ? a[owner] : null,
+        name: cleanFileName(a.name, a.type),
+        type: a.type,
+        size: a.size,
+        addedAt: typeof a.addedAt === 'string' ? a.addedAt : null,
+        file: a.file,
+      };
+    });
+    return { out, seen };
+  };
+  const tests = parseList(raw, 'attachments', 'testId');
+  const visits = parseList(rawVisit, 'visit-attachments', 'visitId');
+  const attachments = tests.out;
+  const seen = tests.seen;
+  /* восстанавливаются только документы, на которые ссылаются анализы / записи из копии */
   const referenced = AttachmentService.referencedIds(prepared.data[storage.KEYS.tests]);
   const linked = attachments.filter((a) => referenced.has(a.attachmentId));
+  const referencedVisit = VisitAttachmentService.referencedIds(prepared.data[storage.KEYS.visits]);
+  const linkedVisit = visits.out.filter((a) => referencedVisit.has(a.attachmentId));
   return {
     prepared,
     attachments: linked,
-    unlinked: attachments.length - linked.length,
-    missingInArchive: [...referenced].filter((id) => !seen.has(id)).length,
+    visitAttachments: linkedVisit,
+    unlinked: attachments.length - linked.length + visits.out.length - linkedVisit.length,
+    missingInArchive: [...referenced].filter((id) => !seen.has(id)).length + [...referencedVisit].filter((id) => !visits.seen.has(id)).length,
     zip,
     info: { ...prepared.info, full: true, createdAt: prepared.info.createdAt || (typeof manifest.createdAt === 'string' ? manifest.createdAt : null) },
   };
@@ -144,19 +177,23 @@ export async function prepareFullRestore(storage, file) {
    2) атомарное восстановление данных (storage.restoreBackup, с откатом);
       ошибка → добавленные документы удаляются;
    3) удаляются документы, не привязанные к восстановленным анализам. */
-export async function applyFullRestore(storage, service, full, { now = new Date() } = {}) {
-  const store = service.store;
-  const before = new Set(await store.keys());
-  const added = [];
-  const rollbackFiles = async () => { for (const id of added) await store.delete(id).catch(() => {}); };
-  try {
-    for (const a of full.attachments) {
+export async function applyFullRestore(storage, service, full, { now = new Date(), visitService = null } = {}) {
+  const added = []; // [store, id] — файлы, которых до восстановления не было
+  const rollbackFiles = async () => { for (const [st, id] of added) await st.delete(id).catch(() => {}); };
+  const writeFiles = async (store, list, owner) => {
+    const before = new Set(await store.keys());
+    for (const a of list) {
       const bytes = await full.zip.read(a.file);
       if (sniffBytes(bytes.subarray(0, 16)) == null) throw new BackupError('CORRUPT', `Документ «${a.name}» в копии повреждён. Текущие данные не изменены.`);
       const data = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength ? bytes.buffer : bytes.slice().buffer;
-      await store.put({ id: a.attachmentId, testId: a.testId, name: a.name, type: a.type, size: a.size, addedAt: a.addedAt || now.toISOString(), data });
-      if (!before.has(a.attachmentId)) added.push(a.attachmentId);
+      await store.put({ id: a.attachmentId, [owner]: a[owner], name: a.name, type: a.type, size: a.size, addedAt: a.addedAt || now.toISOString(), data });
+      if (!before.has(a.attachmentId)) added.push([store, a.attachmentId]);
     }
+  };
+  const visitFiles = visitService ? full.visitAttachments || [] : [];
+  try {
+    await writeFiles(service.store, full.attachments, 'testId');
+    if (visitFiles.length) await writeFiles(visitService.store, visitFiles, 'visitId');
   } catch (err) {
     await rollbackFiles();
     if (err instanceof BackupError) throw err;
@@ -172,7 +209,9 @@ export async function applyFullRestore(storage, service, full, { now = new Date(
   }
   let cleanup = { removed: 0 };
   try { cleanup = await service.cleanupOrphans({ now, graceMs: 0 }); } catch { /* повторится при следующем запуске */ }
-  return { summary, restoredAttachments: full.attachments.length, removedAttachments: cleanup.removed };
+  let visitCleanup = { removed: 0 };
+  if (visitService) { try { visitCleanup = await visitService.cleanupOrphans({ now, graceMs: 0 }); } catch { /* повторится при следующем запуске */ } }
+  return { summary, restoredAttachments: full.attachments.length, restoredVisitAttachments: visitFiles.length, removedAttachments: cleanup.removed + visitCleanup.removed };
 }
 
 /* Сколько документов на устройстве пропадёт после восстановления: те, на которые
@@ -180,5 +219,7 @@ export async function applyFullRestore(storage, service, full, { now = new Date(
 export async function countDocsLostOnRestore(storage, prepared) {
   const current = AttachmentService.referencedIds(await storage.getTests());
   const next = AttachmentService.referencedIds(prepared.data[storage.KEYS.tests]);
-  return [...current].filter((id) => !next.has(id)).length;
+  const curVisit = VisitAttachmentService.referencedIds(await storage.getVisits());
+  const nextVisit = VisitAttachmentService.referencedIds(prepared.data[storage.KEYS.visits]);
+  return [...current].filter((id) => !next.has(id)).length + [...curVisit].filter((id) => !nextVisit.has(id)).length;
 }

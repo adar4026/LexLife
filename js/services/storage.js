@@ -334,6 +334,9 @@ function defaultNotifications() {
   ];
 }
 
+/* Аддитивные поля визита: вид события, название, время, метка импорта истории */
+const VISIT_EXTRA_FIELDS = ['kind', 'title', 'time', 'importId', 'importedAt', 'source'];
+
 /* Приводит визит к полной модели v7 (общий код для seed и миграции).
    Старый формат: doctor = "Врач · Специальность", desc = заключение. */
 function normalizeVisit(v) {
@@ -351,6 +354,8 @@ function normalizeVisit(v) {
     status: v.status || 'done',
     attachments: v.attachments || [],
     links: v.links || { testIds: [], medIds: [], reminderIds: [] },
+    /* аддитивные поля (services/visitKinds.js, services/historyImport.js) — только если заданы */
+    ...Object.fromEntries(VISIT_EXTRA_FIELDS.filter((k) => v[k] != null).map((k) => [k, v[k]])),
   };
 }
 
@@ -436,7 +441,7 @@ const KEY_VALIDATORS = {
     && MED_SCHEDULE_OK(m.schedule) && isStrOrNull(m.note) && isStrOrNull(m.deletedAt)),
   [KEYS.visits]: listOf((v) => isSafeId(v.id) && isDateStr(v.date) && isDateOrNull(v.nextDate)
     && ['doctor', 'specialty', 'clinic', 'reason', 'conclusion', 'recommendations', 'status'].every((f) => isStrOrNull(v[f]))
-    && (v.attachments == null || Array.isArray(v.attachments))
+    && (v.attachments == null || (Array.isArray(v.attachments) && v.attachments.every((a) => isPlainObj(a) && (a.attachmentId == null || isSafeId(a.attachmentId)))))
     && (v.links == null || (isPlainObj(v.links) && isIdList(v.links.testIds) && isIdList(v.links.medIds) && isIdList(v.links.reminderIds)))),
   [KEYS.metrics]: mapOf((c, m) => METRIC_KEYS.includes(m) && isPlainObj(c) && isStrOrNull(c.unit)
     && (m === 'pressure' ? c.goal == null || (isPlainObj(c.goal) && isNumOrNull(c.goal.systolic) && isNumOrNull(c.goal.diastolic)) : isNumOrNull(c.goal))),
@@ -1344,8 +1349,93 @@ export class StorageService {
     await this._write(KEYS.visits, list);
     return list[i];
   }
+  /* Импорт медицинской истории (services/historyImport.js) — только слияние (merge), только ДОБАВЛЕНИЕ.
+     Каждый раздел перечитывается непосредственно перед записью, новые записи дописываются
+     в конец текущего списка; существующие не удаляются, не заменяются и не изменяются.
+     Записи с уже существующим id/importId пропускаются (повторный импорт → 0).
+     После записи — проверка: каждая прежняя запись на месте байт-в-байт, их не стало меньше.
+     Сбой записи или проверки → из разделов убираются ТОЛЬКО добавленные этим импортом id
+     (тоже через перечитывание и слияние), и бросается ошибка. → { medsAdded, visitsAdded, before, after } */
+  async addImportedHistory({ meds = [], visits = [] } = {}) {
+    return this._serialMeds(async () => {
+      const has = (list, r) => list.some((x) => x.id === r.id || (r.importId && x.importId === r.importId));
+      const prevMeds = await this._read(KEYS.meds, []);
+      const prevVisits = await this._read(KEYS.visits, []);
+      if (!Array.isArray(prevMeds) || !Array.isArray(prevVisits)) throw new Error('Разделы «Лекарства» или «Визиты» повреждены — импорт отменён, данные не изменены.');
+      const newMeds = meds.filter((m) => !has(prevMeds, m));
+      const newVisits = visits.filter((v) => !has(prevVisits, v)).map(normalizeVisit);
+      const addedIds = new Set([...newMeds, ...newVisits].map((r) => r.id));
+      const append = async (key, items) => {
+        if (!items.length) return true;
+        const cur = await this._read(key, []); // перечитать прямо перед записью — слияние с актуальным списком
+        if (!Array.isArray(cur)) return false;
+        return this._write(key, [...cur, ...items.filter((r) => !has(cur, r))]);
+      };
+      const undo = async () => {
+        for (const key of [KEYS.visits, KEYS.meds]) {
+          const cur = await this._read(key, []);
+          if (Array.isArray(cur) && cur.some((r) => addedIds.has(r.id))) await this._write(key, cur.filter((r) => !addedIds.has(r.id)));
+        }
+      };
+      /* все прежние записи на месте и не изменены; количество не уменьшилось */
+      const kept = (prev, cur) => Array.isArray(cur) && cur.length >= prev.length
+        && JSON.stringify(cur.slice(0, prev.length)) === JSON.stringify(prev); // дописывание только в конец: прежние — неизменный префикс
+
+      let ok = (await append(KEYS.meds, newMeds)) && (await append(KEYS.visits, newVisits));
+      const curMeds = await this._read(KEYS.meds, []);
+      const curVisits = await this._read(KEYS.visits, []);
+      if (ok) ok = kept(prevMeds, curMeds) && kept(prevVisits, curVisits);
+      if (!ok) {
+        await undo();
+        throw new Error('Импорт не выполнен: запись или проверка сохранности не прошла. Добавленные записи убраны, прежние данные не изменены.');
+      }
+      return {
+        medsAdded: newMeds.length, visitsAdded: newVisits.length,
+        before: { meds: prevMeds.length, visits: prevVisits.length },
+        after: { meds: curMeds.length, visits: curVisits.length },
+      };
+    });
+  }
+  /* → удалённая запись | null (документы удаляет VisitAttachmentService.deleteVisit) */
   async removeVisit(id) {
-    await this._write(KEYS.visits, (await this._read(KEYS.visits, [])).filter((v) => v.id !== id));
+    const list = await this._read(KEYS.visits, []);
+    const rec = list.find((v) => v.id === id);
+    if (!rec) return null;
+    await this._write(KEYS.visits, list.filter((v) => v.id !== id));
+    return rec;
+  }
+  /* Документы записи (services/attachments.js, VisitAttachmentService): меняется только поле
+     attachments этой записи — новые метаданные ДОПИСЫВАЮТСЯ к уже прикреплённым. → запись | null */
+  async addVisitAttachments(id, metas) {
+    const list = await this._read(KEYS.visits, []);
+    const i = list.findIndex((v) => v.id === id);
+    if (i < 0) return null;
+    const cur = Array.isArray(list[i].attachments) ? list[i].attachments : [];
+    const fresh = metas.filter((m) => !cur.some((a) => a && a.attachmentId === m.attachmentId));
+    list[i] = { ...list[i], attachments: [...cur, ...fresh] };
+    if (!(await this._write(KEYS.visits, list))) throw new Error('Не удалось сохранить: недостаточно места на устройстве.');
+    return list[i];
+  }
+  /* Убрать один документ из записи (сама запись и другие документы остаются) → true | false */
+  async removeVisitAttachment(id, attachmentId) {
+    const list = await this._read(KEYS.visits, []);
+    const i = list.findIndex((v) => v.id === id);
+    if (i < 0 || !Array.isArray(list[i].attachments) || !list[i].attachments.some((a) => a && a.attachmentId === attachmentId)) return false;
+    list[i] = { ...list[i], attachments: list[i].attachments.filter((a) => !(a && a.attachmentId === attachmentId)) };
+    if (!(await this._write(KEYS.visits, list))) throw new Error('Не удалось сохранить: недостаточно места на устройстве.');
+    return true;
+  }
+  /* Строгое чтение визитов для очистки «висячих» документов (как readTestsStrict) */
+  async readVisitsStrict() {
+    try {
+      if ((await this.driver.get(ROLLBACK_KEY)) != null) return null;
+      const raw = await this.driver.get(KEYS.visits);
+      if (raw == null) return null;
+      const list = JSON.parse(raw);
+      return Array.isArray(list) ? list : null;
+    } catch {
+      return null;
+    }
   }
 
   /* ---- Активность ---- */

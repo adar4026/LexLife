@@ -10,15 +10,17 @@ import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CUR
 import { createStatsEngine, evaluateWaterPlan, waterGoalDays, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay, dayNum } from './services/analytics.js';
 import { parseWaterMinderCsv, assignImportKeys, buildWaterImportPlan, applyWaterImportPlan, applyTodayWaterImport, isWaterMinderKey } from './services/waterImport.js';
 import { lineChart, barChart as svgBarChart } from './ui/charts.js';
-import { AttachmentService, IdbAttachmentStore, AttachmentError, ATTACHMENT_ACCEPT, ATTACHMENT_TYPES, checkAttachmentFile, formatBytes, attachmentOf } from './services/attachments.js';
+import { AttachmentService, IdbAttachmentStore, AttachmentError, ATTACHMENT_ACCEPT, ATTACHMENT_TYPES, checkAttachmentFile, formatBytes, attachmentOf, VisitAttachmentService, VISIT_FILES_DB, visitDocsOf, MAX_FILES_PER_PICK } from './services/attachments.js';
 import { createFullBackup, prepareFullRestore, applyFullRestore, isZipFile, countDocsLostOnRestore } from './services/fullBackup.js';
 import { parsePreparedTest, importPreparedTest, PreparedImportError } from './services/preparedImport.js';
+import { parseMedicalHistory, buildHistoryImportPlan, applyHistoryImportPlan, HistoryImportError } from './services/historyImport.js';
+import { visitIcon, visitTitle, visitSub, visitTime, visitKindLabel, visitStatusChip } from './services/visitKinds.js';
 import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
 import { openDocViewer as showDocViewer } from './ui/docViewer.js';
 import { setActiveTab, initBottomNav } from './ui/bottomNav.js';
 import { BackButton, goBack, goBackTo, replaceRoute, replaceUrl, initNavHistory, readEntryUi, saveEntryUi } from './ui/backNav.js';
 import { HOME_WATER_QUICK_ADD, waterProgress, homeWaterStatus, waterPlanMarker, waterPlanDelta, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed } from './services/homeSummary.js';
-import { WEEKDAYS, MED_NAME_MAX, MED_DOSE_MAX, MED_NOTE_MAX, MED_TIMES_MAX, nextDose, medSchedule, medStatusOn, medDaySlots, isMedDueOn, nextDueDay, scheduleLabel, intakeSummary, normalizeMedInput, intakeHistory, medOccurrences } from './services/meds.js';
+import { WEEKDAYS, MED_NAME_MAX, MED_DOSE_MAX, MED_NOTE_MAX, MED_TIMES_MAX, nextDose, medSchedule, medStatusOn, medDaySlots, isMedDueOn, nextDueDay, scheduleLabel, intakeSummary, normalizeMedInput, intakeHistory, medOccurrences, endedCourseWord } from './services/meds.js';
 import {
   SLEEP_QUALITY, SLEEP_TAGS, SLEEP_GOAL_MIN, SLEEP_GOAL_MAX, SLEEP_GOAL_STEP, AWAKENINGS_MAX, NAP_MAX_MINUTES, SLEEP_NOTE_MAX, INSIGHT_MIN_DAYS,
   qualityInfo, tagInfo, formatSleepDuration, formatSleepDelta, normalizeSleepInput, inferBedDate, calculateDuration, makeStamp, stampDay, stampTime,
@@ -34,6 +36,8 @@ import { NEW_HOME_URL, PRIMARY_URL, migrationMode, deploymentRole, serverPushAll
 
 /* Документы анализов: файлы в IndexedDB (только на этом устройстве), метаданные — в health_tests */
 const Attachments = new AttachmentService(Storage, new IdbAttachmentStore());
+/* документы медицинских записей — отдельная база IndexedDB (services/attachments.js) */
+const VisitFiles = new VisitAttachmentService(Storage, new IdbAttachmentStore(VISIT_FILES_DB));
 
 /* ---------- DOM-помощники ---------- */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -1131,7 +1135,7 @@ async function MedsScreen() {
   function offLine(m) {
     const st = medStatusOn(m, today);
     if (st === 'inactive') return 'Приём выключен';
-    if (st === 'ended') return `Курс завершён ${fmtWhen(m.end, today)}`;
+    if (st === 'ended') return m.start ? `Курс ${fmtWhen(m.start, today)} – ${fmtWhen(m.end, today)} · ${endedCourseWord(m)}` : `Курс ${endedCourseWord(m)} ${fmtWhen(m.end, today)}`;
     const next = nextDueDay(m, today, 400);
     if (st === 'notStarted') return `Начало курса — ${medDayWord(m.start, today)}`;
     return next ? `Сегодня приёма нет · следующий — ${medDayWord(next, today)}` : 'Сегодня приёма нет';
@@ -1221,8 +1225,9 @@ async function MedsScreen() {
   }
 
   let historyOpen = false;
+  let endedOpen = false;
   async function paintHistory() {
-    const box = $('.med-history', screen);
+    const box = $('.med-history:not(.med-ended)', screen);
     if (!box) return;
     const [all, allIntakes, allLegacy] = await Promise.all([Storage.getMeds({ includeDeleted: true }), Storage.getAllMedIntakes(), Storage.getAllMedLog()]);
     const days = intakeHistory(all, allIntakes, allLegacy, { until: today, days: 14 });
@@ -1268,10 +1273,23 @@ async function MedsScreen() {
       $('.med-add', head).addEventListener('click', () => { location.hash = '#/med/new'; });
       screen.appendChild(head);
       const list = el('<div class="med-list"></div>');
-      meds.map((m, i) => ({ m, i, r: medRank(m, today) }))
+      /* завершённые курсы (дата окончания прошла) — отдельным свёрнутым блоком, новые сверху */
+      const ended = meds.filter((m) => medStatusOn(m, today) === 'ended').sort((a, b) => String(b.end).localeCompare(String(a.end)));
+      meds.filter((m) => !ended.includes(m)).map((m, i) => ({ m, i, r: medRank(m, today) }))
         .sort((a, b) => a.r[0] - b.r[0] || a.r[1].localeCompare(b.r[1]) || a.i - b.i)
         .forEach(({ m }) => list.appendChild(renderCard(m)));
       screen.appendChild(list);
+      if (ended.length) {
+        const box = el(`
+          <details class="med-history med-ended"${endedOpen ? ' open' : ''}>
+            <summary class="med-history__head">Завершённые курсы <small>${ended.length}</small></summary>
+            <div class="med-list"></div>
+          </details>
+        `);
+        box.addEventListener('toggle', () => { endedOpen = box.open; });
+        ended.forEach((m) => $('.med-list', box).appendChild(renderCard(m)));
+        screen.appendChild(box);
+      }
     }
 
     const hist = el(`
@@ -2185,8 +2203,8 @@ async function openTestDocument(meta) {
 }
 
 /* «Документ анализа» поверх приложения (js/ui/docViewer.js): PDF целиком, фото с масштабом */
-function openDocViewer(file) {
-  return showDocViewer(file, { lockScroll: lockPageScroll, unlockScroll: unlockPageScroll });
+function openDocViewer(file, title) {
+  return showDocViewer(file, { lockScroll: lockPageScroll, unlockScroll: unlockPageScroll, ...(title ? { title } : {}) });
 }
 
 /* Состояние журнала между переходами: фильтр года, подсветка только что добавленной записи */
@@ -2719,7 +2737,7 @@ async function ExportScreen() {
     <div class="input-card">
       <p class="backup-note">Резервная копия — один JSON-файл со всеми данными LexLife: показатели и их история, вода, лекарства, анализы, врачи и визиты, уведомления, цели, профиль и настройки.</p>
       <p class="backup-note">С помощью этого файла данные можно восстановить на этом или другом устройстве.</p>
-      <p class="backup-note"><b>PDF и фото анализов</b> входят только в «Полную резервную копию с документами» — один ZIP-файл с теми же данными и всеми документами. Восстанавливаются оба вида копий одной кнопкой «Восстановить из копии».</p>
+      <p class="backup-note"><b>PDF и фото анализов и медицинских записей</b> входят только в «Полную резервную копию с документами» — один ZIP-файл с теми же данными и всеми документами. Восстанавливаются оба вида копий одной кнопкой «Восстановить из копии».</p>
     </div>
   `));
   screen.appendChild(el(`
@@ -2777,7 +2795,7 @@ async function ExportScreen() {
     try {
       let b;
       try {
-        b = await createFullBackup(Storage, Attachments.store);
+        b = await createFullBackup(Storage, Attachments.store, { visitStore: VisitFiles.store });
       } catch (err) {
         await alertDialog('Не удалось создать копию', `<p>${esc(err instanceof AttachmentError ? err.message : 'Попробуйте ещё раз.')}</p>`);
         return;
@@ -2799,7 +2817,7 @@ async function ExportScreen() {
         res = await new Promise((resolve) => {
           showDialog({
             title: 'Полная копия готова',
-            body: `<p>${esc(b.fileName)}</p><p class="dialog__muted">${b.attachments} ${plural(b.attachments, 'документ', 'документа', 'документов')} · ${esc(formatBytes(b.bytes))}. Нажмите «Сохранить», затем «Сохранить в Файлы».</p>`,
+            body: `<p>${esc(b.fileName)}</p><p class="dialog__muted">${b.attachments + (b.visitAttachments || 0)} ${plural(b.attachments + (b.visitAttachments || 0), 'документ', 'документа', 'документов')} · ${esc(formatBytes(b.bytes))}. Нажмите «Сохранить», затем «Сохранить в Файлы».</p>`,
             actions: [
               { label: 'Отмена', value: 'cancelled' },
               { label: 'Сохранить', kind: 'primary', value: null, onClick: () => { saveBackupFile(b.blob, b.fileName).then(resolve); } },
@@ -2810,7 +2828,7 @@ async function ExportScreen() {
       if (res === 'shared' || res === 'downloaded') {
         await Storage.markBackupCreated(b.createdAt);
         await paintLast();
-        flash(`Полная копия создана ✓ (${b.attachments} док.)`);
+        flash(`Полная копия создана ✓ (${b.attachments + (b.visitAttachments || 0)} док.)`);
       }
     } finally {
       fullBtn.classList.remove('is-busy');
@@ -2872,7 +2890,7 @@ async function restoreFlow(file) {
     ['Дни активности', summary.activityDays],
     ['Сон', `${summary.sleep || 0} ${plural(summary.sleep || 0, 'запись', 'записи', 'записей')}`],
   ];
-  if (full) rows.push(['Документы анализов (PDF/фото)', full.attachments.length]);
+  if (full) rows.push(['Документы анализов (PDF/фото)', full.attachments.length], ['Документы врачей и визитов', (full.visitAttachments || []).length]);
   const schemaLine = info.migrated ? `${info.schemaVersion} → будет обновлена до ${CURRENT_SCHEMA_VERSION}` : String(info.schemaVersion);
   const skipped = prepared.ignoredKeys.length + prepared.strippedKeys;
   const body = `
@@ -2898,7 +2916,7 @@ async function restoreFlow(file) {
   if (!go) { flash('Восстановление отменено'); return; }
 
   try {
-    if (full) await applyFullRestore(Storage, Attachments, full);
+    if (full) await applyFullRestore(Storage, Attachments, full, { visitService: VisitFiles });
     else await Storage.restoreBackup(prepared);
   } catch (err) {
     await showDialog({
@@ -3141,6 +3159,158 @@ async function WaterImportScreen() {
     }
   });
 
+  return screen;
+}
+
+/* =========================================================
+   Импорт медицинской истории (#/history-import) — services/historyImport.js.
+   Файл JSON читается локально. Сначала проверка без записи (dry-run): сколько записей,
+   что уже есть, что будет добавлено, что пропускается как дубль или требует уточнения.
+   Затем — резервная копия текущих данных и только добавление новых записей
+   в «Врачи и визиты» и «Лекарства». Повторный импорт того же файла добавляет 0.
+   ========================================================= */
+async function HistoryImportScreen() {
+  const screen = el('<div></div>');
+  screen.appendChild(backHeader('Импорт медицинской истории', { fallback: 'settings' }));
+  screen.appendChild(el(`
+    <div class="input-card">
+      <p class="backup-note">Перенос прошлых визитов, процедур, обследований и курсов лекарств из подготовленного файла (JSON). Файл читается только на этом устройстве.</p>
+      <p class="backup-note">Сначала LexLife показывает, что будет добавлено, а что уже есть. Существующие записи не изменяются и не удаляются; результаты анализов этот импорт не добавляет. Перед переносом создаётся резервная копия. Повторный импорт того же файла не создаёт дублей.</p>
+    </div>
+  `));
+  const pickCard = el('<div class="input-card"></div>');
+  const pickLabel = el('<label class="btn-ghost">Выбрать файл истории (JSON)<input type="file" accept=".json,application/json" hidden></label>');
+  const fileInput = $('input', pickLabel);
+  pickCard.appendChild(pickLabel);
+  const fileNameEl = el('<p class="backup-note" style="margin-top:8px"></p>');
+  pickCard.appendChild(fileNameEl);
+  screen.appendChild(pickCard);
+  const previewHost = el('<div></div>');
+  screen.appendChild(previewHost);
+
+  const STATUS = [
+    ['add', 'Будут добавлены', true],
+    ['duplicate', 'Уже есть в LexLife — пропуск', false],
+    ['conflict', 'Требуют уточнения — пропуск', true],
+    ['imported', 'Импортированы ранее', false],
+  ];
+  let parsed = null;
+
+  const itemLine = (p, isMed) => {
+    const it = p.item;
+    const when = isMed ? `${fmtDate(it.start)}${it.end ? ` – ${fmtDate(it.end)}` : ''}` : `${fmtDate(it.date)}${it.time ? ` · ${it.time}` : ''}`;
+    const title = isMed ? `💊 ${it.name}` : `${visitIcon(it)} ${it.title}`;
+    return `<li class="hist-item"><span class="hist-item__when">${esc(when)}</span><span class="hist-item__title">${esc(title)}</span>${p.reason ? `<small class="hist-item__why">${esc(p.reason)}</small>` : ''}</li>`;
+  };
+
+  async function computePlan() {
+    const [visits, meds, tests] = await Promise.all([Storage.getVisits(), Storage.getMeds({ includeDeleted: true }), Storage.getTests()]);
+    return buildHistoryImportPlan(parsed, { visits, meds, tests });
+  }
+
+  function renderPreview(plan, { justImported = false } = {}) {
+    previewHost.innerHTML = '';
+    const c = plan.counts;
+    const card = el(`
+      <div class="input-card">
+        <ul class="dialog__list">
+          <li><span>Записей в файле</span><span>${plan.eventsTotal + plan.medsTotal}</span></li>
+          <li><span>— событий истории</span><span>${plan.eventsTotal}</span></li>
+          <li><span>— курсов лекарств</span><span>${plan.medsTotal}</span></li>
+          <li><span>Будет добавлено</span><span>${c.add}${c.add ? ` (${plan.eventsAdd} соб. · ${plan.medsAdd} курс.)` : ''}</span></li>
+          <li><span>Уже есть в LexLife (дубли)</span><span>${c.duplicate}</span></li>
+          <li><span>Требуют уточнения</span><span>${c.conflict}</span></li>
+          <li><span>Импортированы ранее</span><span>${c.imported}</span></li>
+          <li><span>Ошибки проверки</span><span>0</span></li>
+        </ul>
+        ${justImported ? `<p class="backup-note" style="margin-top:8px">Повторная проверка после импорта: к добавлению — <b>${c.add}</b>.</p>` : ''}
+      </div>
+    `);
+    previewHost.appendChild(card);
+    STATUS.forEach(([st, label, open]) => {
+      const evs = plan.events.filter((p) => p.status === st);
+      const ms = plan.meds.filter((p) => p.status === st);
+      if (!evs.length && !ms.length) return;
+      const det = el(`<details class="med-history hist-group"${open && evs.length + ms.length <= 60 ? ' open' : ''}><summary class="med-history__head">${esc(label)} <small>${evs.length + ms.length}</small></summary><ul class="hist-list">${ms.map((p) => itemLine(p, true)).join('')}${evs.map((p) => itemLine(p, false)).join('')}</ul></details>`);
+      previewHost.appendChild(det);
+    });
+
+    const actions = el('<div class="backup-actions"></div>');
+    const btn = el('<button class="btn-primary" type="button"></button>');
+    btn.textContent = c.add ? `Создать копию и импортировать (${c.add})` : 'Нечего импортировать';
+    btn.disabled = !c.add;
+    btn.addEventListener('click', async () => {
+      const go = await showDialog({
+        title: 'Импорт медицинской истории',
+        body: `
+          <p>Будет добавлено: <b>${plan.eventsAdd}</b> ${plural(plan.eventsAdd, 'событие', 'события', 'событий')} в «Врачи и визиты» и <b>${plan.medsAdd}</b> ${plural(plan.medsAdd, 'курс', 'курса', 'курсов')} в «Лекарства».</p>
+          ${c.duplicate + c.imported ? `<p class="dialog__muted">${c.duplicate + c.imported} ${plural(c.duplicate + c.imported, 'запись уже есть', 'записи уже есть', 'записей уже есть')} — будут пропущены.</p>` : ''}
+          ${c.conflict ? `<p class="dialog__warn">${c.conflict} ${plural(c.conflict, 'запись требует', 'записи требуют', 'записей требуют')} уточнения и не импортируются.</p>` : ''}
+          <p class="dialog__muted">Перед импортом будет создана резервная копия текущих данных.</p>
+        `,
+        actions: [{ label: 'Отмена', value: false }, { label: 'Создать копию и импортировать', value: true, kind: 'primary' }],
+      });
+      if (!go) return;
+      btn.classList.add('is-busy');
+      try {
+        if (!(await backupBeforeImport())) return;
+        const fresh = await computePlan(); // данные могли измениться, пока открыт диалог
+        const res = await applyHistoryImportPlan(Storage, fresh);
+        const again = await computePlan();
+        await showDialog({
+          title: 'Импорт завершён',
+          body: `
+            <ul class="dialog__list">
+              <li><span>Добавлено событий</span><span>${res.visitsAdded}</span></li>
+              <li><span>Добавлено курсов лекарств</span><span>${res.medsAdded}</span></li>
+              <li><span>Пропущено как дубли</span><span>${fresh.counts.duplicate + fresh.counts.imported}</span></li>
+              <li><span>Требуют уточнения</span><span>${fresh.counts.conflict}</span></li>
+              <li><span>Повторная проверка: к добавлению</span><span>${again.counts.add}</span></li>
+              <li><span>Визиты: было → стало</span><span>${res.before.visits} → ${res.after.visits}</span></li>
+              <li><span>Лекарства: было → стало</span><span>${res.before.meds} → ${res.after.meds}</span></li>
+            </ul>
+            <p class="dialog__muted">Все прежние записи проверены: на месте и не изменены.</p>
+          `,
+          actions: [{ label: 'Готово', value: true, kind: 'primary' }],
+        });
+        flash('Импорт завершён ✓');
+        renderPreview(again, { justImported: true });
+      } catch (err) {
+        await showDialog({ title: 'Не удалось импортировать', body: `<p>${esc((err && err.message) || 'Попробуйте ещё раз.')}</p><p class="dialog__muted">Существующие данные не изменены.</p>`, actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+      } finally {
+        btn.classList.remove('is-busy');
+      }
+    });
+    actions.appendChild(btn);
+    previewHost.appendChild(actions);
+    const link = el('<section class="section"><div class="list-card"><div class="row" role="button" data-route="visits"><span class="row__icon">🩺</span><div class="row__body"><p class="row__title">Врачи и визиты</p><p class="row__sub">Импортированные события — в разделе «Прошедшие»</p></div><span class="row__chevron">›</span></div></div></section>');
+    link.addEventListener('click', onRouteClick);
+    previewHost.appendChild(link);
+  }
+
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files && fileInput.files[0];
+    fileInput.value = '';
+    if (!file) return;
+    fileNameEl.textContent = file.name;
+    pickLabel.classList.add('is-busy');
+    previewHost.innerHTML = '';
+    try {
+      try {
+        parsed = parseMedicalHistory(await file.text());
+      } catch (err) {
+        parsed = null;
+        const list = err instanceof HistoryImportError && err.errors.length
+          ? `<ul class="dialog__list">${err.errors.slice(0, 8).map((x) => `<li><span>${esc(x)}</span></li>`).join('')}</ul>${err.errors.length > 8 ? `<p class="dialog__muted">…и ещё ${err.errors.length - 8}</p>` : ''}`
+          : '';
+        await showDialog({ title: 'Файл не принят', body: `<p>${esc(err instanceof HistoryImportError ? err.message : 'Не удалось прочитать файл.')}</p>${list}<p class="dialog__muted">Данные LexLife не изменены.</p>`, actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+        return;
+      }
+      renderPreview(await computePlan());
+    } finally {
+      pickLabel.classList.remove('is-busy');
+    }
+  });
   return screen;
 }
 
@@ -3390,6 +3560,7 @@ async function SettingsScreen() {
     { route: 'theme', icon: '🌙', title: 'Тема оформления' },
     { route: 'export', icon: '💾', title: 'Резервная копия' },
     { route: 'water-import', icon: '📥', title: 'Импорт истории воды' },
+    { route: 'history-import', icon: '🗂️', title: 'Импорт медицинской истории' },
     { route: 'security', icon: '🔒', title: 'Безопасность' },
   ].forEach((m) => {
     const row = el(`<div class="row" role="button" data-route="${m.route}"><span class="row__icon">${m.icon}</span><div class="row__body"><p class="row__title">${esc(m.title)}</p></div><span class="row__chevron">›</span></div>`);
@@ -3517,8 +3688,9 @@ async function VisitsScreen() {
   add.addEventListener('click', () => { location.hash = '#/visit/new'; });
   screen.appendChild(add);
 
-  const planned = visits.filter((v) => v.status === 'planned').sort((a, b) => a.date.localeCompare(b.date));
-  const done = visits.filter((v) => v.status !== 'planned');
+  const planned = visits.filter((v) => v.status === 'planned').sort((a, b) => a.date.localeCompare(b.date) || (visitTime(a) || '').localeCompare(visitTime(b) || ''));
+  /* прошедшие — новые сверху; в один день — позднее время выше */
+  const done = visits.filter((v) => v.status !== 'planned').sort((a, b) => b.date.localeCompare(a.date) || (visitTime(b) || '').localeCompare(visitTime(a) || ''));
 
   const group = (title, arr) => {
     if (!arr.length) return;
@@ -3527,10 +3699,10 @@ async function VisitsScreen() {
     arr.forEach((v) => {
       const row = el(`
         <div class="row" role="button" data-id="${esc(v.id)}" style="align-items:flex-start">
-          <span class="row__icon">🩺</span>
+          <span class="row__icon">${visitIcon(v)}</span>
           <div class="row__body">
-            <p class="row__title">${esc(v.doctor || 'Визит')}</p>
-            <p class="row__sub">${esc([v.specialty, v.clinic].filter(Boolean).join(' · ') || v.conclusion || '')}</p>
+            <p class="row__title">${esc(visitTitle(v))}</p>
+            <p class="row__sub">${esc(visitSub(v) || v.conclusion || '')}</p>
           </div>
           <span class="row__trailing">${esc(fmtDate(v.date))}<br><span class="row__chevron">›</span></span>
         </div>
@@ -3541,7 +3713,9 @@ async function VisitsScreen() {
     screen.appendChild(sec);
   };
   group('Запланированные', planned);
-  group('Прошедшие', done);
+  /* прошедшие — по годам: после импорта истории список длинный */
+  const years = [...new Set(done.map((v) => v.date.slice(0, 4)))];
+  years.forEach((y) => group(years.length > 1 ? `Прошедшие · ${y}` : 'Прошедшие', done.filter((v) => v.date.startsWith(y))));
   if (!visits.length) screen.appendChild(el('<div class="empty">Пока нет визитов</div>'));
   return screen;
 }
@@ -3552,16 +3726,15 @@ async function VisitDetailScreen(id) {
   if (!visit) { screen.appendChild(backHeader('Визит', { fallback: 'visits' })); screen.appendChild(el('<div class="empty">Визит не найден</div>')); return screen; }
   screen.appendChild(backHeader('Визит', { fallback: 'visits' }));
 
-  const statusChip = visit.status === 'planned'
-    ? '<span class="vchip vchip--planned">запланирован</span>'
-    : '<span class="vchip vchip--done">выполнен</span>';
+  const chip = visitStatusChip(visit);
+  const statusChip = chip ? `<span class="vchip vchip--${chip.cls}">${esc(chip.text)}</span>` : '';
   screen.appendChild(el(`
     <div class="visit-head">
-      <span class="visit-head__icon">🩺</span>
+      <span class="visit-head__icon">${visitIcon(visit)}</span>
       <div>
-        <div class="visit-head__name">${esc(visit.doctor || 'Визит')}</div>
-        <div class="visit-head__sub">${esc([visit.specialty, visit.clinic].filter(Boolean).join(' · '))}</div>
-        <div style="margin-top:6px"><span class="visit-head__date">${esc(fmtDate(visit.date))}</span> ${statusChip}</div>
+        <div class="visit-head__name">${esc(visitTitle(visit))}</div>
+        <div class="visit-head__sub">${esc(visitSub(visit) || (visit.kind ? visitKindLabel(visit) : ''))}</div>
+        <div style="margin-top:6px"><span class="visit-head__date">${esc(fmtDate(visit.date))}${visitTime(visit) ? ` · ${esc(visitTime(visit))}` : ''}</span> ${statusChip}</div>
       </div>
     </div>
   `));
@@ -3593,20 +3766,138 @@ async function VisitDetailScreen(id) {
   chips('Связанные анализы', linkedTests, (t) => `🧪 ${esc(fmtDate(t.date))}`);
   chips('Связанные лекарства', linkedMeds, (m) => `💊 ${esc(m.name)}`);
 
-  const att = el('<section class="section"><div class="section__head"><h2 class="section__title" style="font-size:15px">Вложения</h2></div><div class="list-card" id="attbox"></div></section>');
-  const abox = $('#attbox', att);
-  if (!(visit.attachments || []).length) abox.appendChild(el('<div class="empty">Нет вложений</div>'));
-  else visit.attachments.forEach((a) => abox.appendChild(el(`<div class="row"><span class="row__icon">${a.kind === 'pdf' ? '📄' : '🖼️'}</span><div class="row__body"><p class="row__title">${esc(a.name)}</p><p class="row__sub">${a.size ? Math.round(a.size / 1024) + ' КБ' : ''} · файл подключим позже</p></div></div>`)));
-  screen.appendChild(att);
+  screen.appendChild(await visitDocsSection(visit));
 
   const actions = el('<div style="display:flex; gap:10px; margin-top:16px"></div>');
   const edit = el('<button class="btn-ghost" type="button" style="margin:0">Редактировать</button>');
   edit.addEventListener('click', () => { location.hash = `#/visit/${id}/edit`; });
   const del = el('<button class="btn-ghost" type="button" style="margin:0; color:var(--red)">Удалить</button>');
-  del.addEventListener('click', async () => { if (confirm('Удалить визит?')) { await Storage.removeVisit(id); goBackTo('visits'); } });
+  del.addEventListener('click', async () => {
+    const n = visitDocsOf(visit).length;
+    if (!confirm(n ? `Удалить запись вместе с документами (${n})?` : 'Удалить визит?')) return;
+    try { await VisitFiles.deleteVisit(id); } catch { await Storage.removeVisit(id); }
+    goBackTo('visits');
+  });
   actions.append(edit, del);
   screen.appendChild(actions);
   return screen;
+}
+
+/* «Документы» медицинской записи: PDF и фото (несколько), миниатюры, просмотр тем же
+   просмотрщиком, что у анализов; удаление одного документа запись не удаляет. */
+const fmtAddedAt = (iso) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString(RU, { day: 'numeric', month: 'short', year: 'numeric' }).replace(/\s*г\.$/, ''); };
+let visitThumbUrls = [];
+function revokeVisitThumbs() { visitThumbUrls.splice(0).forEach((u) => URL.revokeObjectURL(u)); }
+window.addEventListener('hashchange', revokeVisitThumbs);
+
+async function openVisitDocument(meta) {
+  let file = null;
+  try { file = await VisitFiles.getFile(meta); } catch (err) {
+    await alertDialog('Документ недоступен', `<p>${esc(err instanceof AttachmentError ? err.message : 'Не удалось прочитать документ.')}</p>`);
+    return null;
+  }
+  if (!file) { await alertDialog('Документ не найден', '<p>Файла нет на этом устройстве.</p><p class="dialog__muted">Так бывает после восстановления из обычной резервной копии (она не содержит PDF и фото) или на другом устройстве. Запись сохранена; прикрепите файл заново или восстановите полную резервную копию с документами.</p>'); return null; }
+  return openDocViewer(file, 'Документ записи');
+}
+
+async function visitDocsSection(visit) {
+  const sec = el(`
+    <section class="section vdocs">
+      <div class="section__head"><h2 class="section__title" style="font-size:15px">Документы</h2></div>
+      <div class="list-card vdocs__list"></div>
+      <label class="btn-ghost vdocs__add">Добавить файл<input type="file" multiple accept="${esc(ATTACHMENT_ACCEPT)}" hidden></label>
+      <p class="vdocs__hint">PDF или фото (JPG, PNG, HEIC) — из «Файлов» или медиатеки, можно несколько сразу, до 15 МБ каждый.</p>
+    </section>
+  `);
+  const box = $('.vdocs__list', sec);
+  const label = $('.vdocs__add', sec);
+  const input = $('input', label);
+
+  async function paint() {
+    revokeVisitThumbs();
+    const cur = (await Storage.getVisit(visit.id)) || visit;
+    const docs = visitDocsOf(cur);
+    const legacy = (cur.attachments || []).filter((a) => a && !a.attachmentId); // каркас старых версий: только имя
+    box.innerHTML = '';
+    if (!docs.length && !legacy.length) box.appendChild(el('<div class="empty">Нет документов</div>'));
+    docs.forEach((a) => {
+      const kind = docKind(a.type);
+      const row = el(`
+        <div class="row vdoc" role="button" tabindex="0">
+          <span class="vdoc__thumb vdoc__thumb--${kind}" aria-hidden="true">${kind === 'pdf' ? '<b>PDF</b>' : DOC_ICON.image}</span>
+          <div class="row__body">
+            <p class="row__title vdoc__name"></p>
+            <p class="row__sub"></p>
+          </div>
+          <button class="vdoc__more" type="button">${MED_MORE_SVG}</button>
+        </div>
+      `);
+      $('.vdoc__name', row).textContent = a.name || 'Документ';
+      $('.row__sub', row).textContent = [docLabel(a.type), formatBytes(a.size), a.addedAt ? `добавлен ${fmtAddedAt(a.addedAt)}` : ''].filter(Boolean).join(' · ');
+      $('.vdoc__more', row).setAttribute('aria-label', `Действия: ${a.name || 'документ'}`);
+      row.setAttribute('aria-label', `Открыть ${a.name || 'документ'}`);
+      row.addEventListener('click', (e) => { if (!e.target.closest('.vdoc__more')) openVisitDocument(a); });
+      row.addEventListener('keydown', (e) => { if (e.key === 'Enter') openVisitDocument(a); });
+      $('.vdoc__more', row).addEventListener('click', () => docActions(a));
+      box.appendChild(row);
+      if (kind === 'image') {
+        VisitFiles.getFile(a).then((f) => {
+          if (!f) return;
+          const url = URL.createObjectURL(f);
+          visitThumbUrls.push(url);
+          const img = new Image();
+          img.alt = '';
+          img.onload = () => { const t = $('.vdoc__thumb', row); t.textContent = ''; t.appendChild(img); };
+          img.onerror = () => {}; // HEIC без поддержки в браузере — остаётся значок
+          img.src = url;
+        }).catch(() => {});
+      }
+    });
+    legacy.forEach((a) => box.appendChild(el(`<div class="row"><span class="row__icon">📎</span><div class="row__body"><p class="row__title">${esc(a.name || 'Вложение')}</p><p class="row__sub">файла нет на устройстве</p></div></div>`)));
+  }
+
+  async function docActions(a) {
+    const act = await showDialog({
+      title: a.name || 'Документ', stack: true, cancelValue: null,
+      actions: [
+        { label: 'Открыть', value: 'open' },
+        { label: 'Удалить документ', value: 'delete', kind: 'destructive' },
+        { label: 'Отмена', value: null },
+      ],
+    });
+    if (act === 'open') { openVisitDocument(a); return; }
+    if (act !== 'delete') return;
+    const ok = await showDialog({
+      title: 'Удалить документ?',
+      body: `<p>${esc(a.name || 'Документ')}</p><p class="dialog__muted">Удаляется только этот файл. Сама запись и другие документы остаются.</p>`,
+      actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+    });
+    if (!ok) return;
+    try { await VisitFiles.removeFromVisit(visit.id, a.attachmentId); } catch { flash('Не удалось удалить'); return; }
+    flash('Документ удалён');
+    await paint();
+  }
+
+  input.addEventListener('change', async () => {
+    const files = [...(input.files || [])];
+    input.value = ''; // тот же файл можно выбрать снова
+    if (!files.length) return;
+    label.classList.add('is-busy');
+    try {
+      const res = await VisitFiles.attachToVisit(visit.id, files);
+      if (res.errors.length) {
+        await alertDialog(res.added.length ? 'Часть файлов не добавлена' : 'Файлы не добавлены', `<ul class="dialog__list">${res.errors.map((x) => `<li><span>${esc(x.name)}</span></li><li><span class="dialog__muted">${esc(x.message)}</span></li>`).join('')}</ul>`);
+      }
+      if (res.added.length) flash(res.added.length === 1 ? 'Документ добавлен ✓' : `Добавлено документов: ${res.added.length} ✓`);
+    } catch (err) {
+      await alertDialog('Не удалось добавить', `<p>${esc(err instanceof AttachmentError ? err.message : 'Попробуйте ещё раз.')}</p>`);
+    } finally {
+      label.classList.remove('is-busy');
+      await paint();
+    }
+  });
+  await paint();
+  return sec;
 }
 
 async function VisitFormScreen(id) {
@@ -3620,6 +3911,7 @@ async function VisitFormScreen(id) {
   const fld = (label, html) => `<div class="field"><label class="field__label">${esc(label)}</label>${html}</div>`;
   form.innerHTML = `
     ${fld('Дата', `<input class="input" type="date" id="f-date" value="${esc(v.date)}">`)}
+    ${fld('Название (необязательно)', `<input class="input" type="text" id="f-title" value="${esc(v.title || '')}" placeholder="напр. УЗИ сосудов шеи">`)}
     ${fld('Врач', `<input class="input" type="text" id="f-doctor" value="${esc(v.doctor || '')}" placeholder="напр. Dr. Ivanov">`)}
     ${fld('Специальность', `<input class="input" type="text" id="f-spec" value="${esc(v.specialty || '')}" placeholder="напр. Кардиолог">`)}
     ${fld('Клиника', `<input class="input" type="text" id="f-clinic" value="${esc(v.clinic || '')}">`)}
@@ -3650,6 +3942,7 @@ async function VisitFormScreen(id) {
   save.addEventListener('click', async () => {
     const data = {
       date: $('#f-date', form).value || dateKey(),
+      title: $('#f-title', form).value.trim(),
       doctor: $('#f-doctor', form).value.trim(),
       specialty: $('#f-spec', form).value.trim(),
       clinic: $('#f-clinic', form).value.trim(),
@@ -3986,7 +4279,7 @@ async function loadCalendarData() {
 function dayPointEvents(dateStr, data) {
   const ev = [];
   data.visits.forEach((v) => {
-    if (v.date === dateStr) ev.push({ icon: '🩺', title: v.doctor || 'Визит', sub: [v.specialty, v.clinic].filter(Boolean).join(' · ') || 'Визит к врачу', time: null, route: `visit/${v.id}` });
+    if (v.date === dateStr) ev.push({ icon: visitIcon(v), title: visitTitle(v), sub: visitSub(v) || visitKindLabel(v), time: visitTime(v), route: `visit/${v.id}` });
     if (v.nextDate === dateStr) ev.push({ icon: '📅', title: 'Следующий визит', sub: v.doctor || '', time: null, route: `visit/${v.id}` });
   });
   data.tests.forEach((t) => { if (t.date === dateStr) ev.push({ icon: '🧪', title: 'Анализ крови', sub: t.note || 'Результаты внесены', time: null, route: `test/${encodeURIComponent(t.id)}` }); });
@@ -4882,7 +5175,7 @@ const TAB_ROUTES = ['home', 'metrics', 'meds', 'tests'];
 const SCREENS = {
   home: HomeScreen, metrics: MetricsScreen, meds: MedsScreen, tests: TestsScreen,
   profile: ProfileScreen, activity: ActivityScreen, visits: VisitsScreen,
-  settings: SettingsScreen, export: ExportScreen, 'water-import': WaterImportScreen, theme: ThemeScreen,
+  settings: SettingsScreen, export: ExportScreen, 'water-import': WaterImportScreen, 'history-import': HistoryImportScreen, theme: ThemeScreen,
   notifications: NotificationsScreen, goals: () => Stub('🎯', 'Цели'),
   calendar: CalendarScreen, stats: StatsScreen,
   security: () => Stub('🔒', 'Безопасность'),
@@ -4996,5 +5289,6 @@ async function boot() {
   if (occurrences) occurrences.prune().catch(() => {});
   /* «висячие» документы (анализ удалён/заменён при восстановлении) — фоном, безопасно */
   if (IdbAttachmentStore.available()) Attachments.cleanupOrphans().catch((err) => console.warn('[attachments] очистка пропущена', err && err.name));
+  if (IdbAttachmentStore.available()) VisitFiles.cleanupOrphans().catch((err) => console.warn('[visit files] очистка пропущена', err && err.name));
 }
 boot();

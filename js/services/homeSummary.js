@@ -198,7 +198,7 @@ export function upcomingVisit(visits, today = dateKey()) {
   const consider = (v, date, next) => {
     if (typeof date !== 'string' || date < today) return;
     if (!best || date < best.date) {
-      best = { visitId: v.id, date, title: [v.specialty, v.doctor].filter(Boolean).join(' · ') || 'Визит к врачу', next };
+      best = { visitId: v.id, date, title: (typeof v.title === 'string' && v.title.trim()) || [v.specialty, v.doctor].filter(Boolean).join(' · ') || 'Визит к врачу', next };
     }
   };
   (Array.isArray(visits) ? visits : []).forEach((v) => {
@@ -236,7 +236,7 @@ export function recentActivity({ tests = [], metricsLog = {}, visits = [], today
   const v = (Array.isArray(visits) ? visits : [])
     .filter((x) => x && past(x.date) && x.status !== 'planned')
     .sort((a, b) => b.date.localeCompare(a.date))[0];
-  if (v) candidates.push({ kind: 'visit', date: v.date, visitId: v.id, title: [v.specialty, v.doctor].filter(Boolean).join(' · ') || 'Визит к врачу' });
+  if (v) candidates.push({ kind: 'visit', date: v.date, visitId: v.id, title: (typeof v.title === 'string' && v.title.trim()) || [v.specialty, v.doctor].filter(Boolean).join(' · ') || 'Визит к врачу' });
 
   /* sort устойчивый: при равной дате сохраняется порядок анализ → измерение → визит */
   return candidates.sort((a, b) => b.date.localeCompare(a.date))[0] || null;

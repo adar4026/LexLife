@@ -54,15 +54,15 @@ export function medSchedule(med) {
   return { mode: 'daily', days: [], times: t };
 }
 
-/* Следующая доза курса «раз в N дней» (не раньше today; курс ещё не начался — его начало) или null */
+/* Следующая доза курса «раз в N дней» (не раньше today; курс ещё не начался — его начало)
+   или null — в т.ч. когда курс закончился (дата окончания end) */
 export function nextDose(med, today = dateKey()) {
   if (!med.every_days || !med.start) return null;
   const ms = 86400000;
   const start = new Date(med.start + 'T00:00:00');
   const day = new Date(today + 'T00:00:00');
-  if (start > day) return med.start;
-  const cycles = Math.ceil((day - start) / ms / med.every_days);
-  return dateKey(new Date(start.getTime() + cycles * med.every_days * ms));
+  const next = start > day ? med.start : dateKey(new Date(start.getTime() + Math.ceil((day - start) / ms / med.every_days) * med.every_days * ms));
+  return med.end && DAY_RE.test(med.end) && next > med.end ? null : next;
 }
 
 /* Лекарство в списке, но сейчас не принимается: удалено, выключено, курс не начался / закончился */
@@ -72,6 +72,14 @@ export function medStatusOn(med, day) {
   if (med.start && DAY_RE.test(med.start) && day < med.start) return 'notStarted';
   if (med.end && DAY_RE.test(med.end) && day > med.end) return 'ended';
   return 'active';
+}
+
+/* Подпись прошедшего курса по courseStatus (аддитивное поле, импорт истории) */
+export function endedCourseWord(med) {
+  const st = med && med.courseStatus;
+  if (st === 'stopped') return 'прекращён';
+  if (st === 'prescribed') return 'назначенный курс, приём не отмечался';
+  return 'завершён';
 }
 
 /* Есть ли приём по расписанию в этот день («по необходимости» — нет: отметка по факту) */

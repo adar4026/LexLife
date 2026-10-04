@@ -275,3 +275,82 @@ export class AttachmentService {
     } catch { /* не критично */ }
   }
 }
+
+/* ---------------- Документы медицинских записей («Врачи и визиты») ----------------
+   Те же проверки, тот же формат метаданных и тот же просмотр, что у анализов, но файлы —
+   в ОТДЕЛЬНОЙ базе IndexedDB (lexlife-visit-files): очистка «висячих» документов анализов
+   (в т.ч. в старых версиях LexLife) смотрит только на свою базу и не может удалить файлы визитов.
+   • В записи health_visits — только метаданные: attachments: [{ attachmentId, name, type, size, addedAt }]
+   • Запись IndexedDB: { id, visitId, name, type, size, addedAt, data: ArrayBuffer }
+   • К одной записи — несколько файлов; удаление файла запись не удаляет. */
+export const VISIT_FILES_DB = 'lexlife-visit-files';
+export const MAX_FILES_PER_PICK = 20;
+export const visitDocsOf = (visit) => (visit && Array.isArray(visit.attachments) ? visit.attachments.filter((a) => a && typeof a === 'object' && a.attachmentId) : []);
+
+export class VisitAttachmentService extends AttachmentService {
+  /* Прикрепить один или несколько файлов. Неподходящие файлы пропускаются с причиной,
+     остальные добавляются к уже прикреплённым (ничего не заменяется).
+     → { added: [meta], errors: [{ name, message }] } */
+  async attachToVisit(visitId, files, { now = new Date() } = {}) {
+    const list = [...(files || [])];
+    if (list.length > MAX_FILES_PER_PICK) throw new AttachmentError('TOO_MANY', `За один раз можно добавить до ${MAX_FILES_PER_PICK} файлов.`);
+    if (!(await this.storage.getVisit(visitId))) throw new AttachmentError('NO_VISIT', 'Запись не найдена.');
+    const metas = [];
+    const errors = [];
+    const rollback = async () => { for (const m of metas) await this.store.delete(m.attachmentId).catch(() => {}); };
+    try {
+      for (const file of list) {
+        const check = await checkAttachmentFile(file);
+        if (!check.ok) { errors.push({ name: cleanFileName(file && file.name, null), message: check.message }); continue; }
+        const data = await file.arrayBuffer();
+        const meta = { attachmentId: newAttachmentId(), name: cleanFileName(file.name, check.type), type: check.type, size: data.byteLength, addedAt: now.toISOString() };
+        await this.store.put({ id: meta.attachmentId, visitId, name: meta.name, type: meta.type, size: meta.size, addedAt: meta.addedAt, data });
+        metas.push(meta);
+      }
+      if (metas.length && !(await this.storage.addVisitAttachments(visitId, metas))) throw new AttachmentError('NO_VISIT', 'Запись не найдена.');
+    } catch (err) {
+      await rollback();
+      throw err;
+    }
+    if (metas.length) this._persist();
+    return { added: metas, errors };
+  }
+
+  /* Удалить один документ; запись остаётся. → true, если документ был */
+  async removeFromVisit(visitId, attachmentId) {
+    const ok = await this.storage.removeVisitAttachment(visitId, attachmentId);
+    if (ok) await this.store.delete(attachmentId).catch(() => {});
+    return ok;
+  }
+
+  /* Удалить запись вместе с её документами → удалённая запись | null */
+  async deleteVisit(visitId) {
+    const removed = await this.storage.removeVisit(visitId);
+    if (!removed) return null;
+    for (const a of visitDocsOf(removed)) await this.store.delete(a.attachmentId).catch(() => {});
+    return removed;
+  }
+
+  static referencedIds(visits) {
+    const set = new Set();
+    (visits || []).forEach((v) => visitDocsOf(v).forEach((a) => set.add(a.attachmentId)));
+    return set;
+  }
+
+  /* «Висячие» файлы визитов: записи читаются строго (нет/повреждены/идёт восстановление → ничего
+     не удаляется), свежие файлы не трогаются. */
+  async cleanupOrphans({ now = new Date(), graceMs = ORPHAN_GRACE_MS } = {}) {
+    const visits = await this.storage.readVisitsStrict();
+    if (!visits) return { removed: 0, skipped: true };
+    const keep = VisitAttachmentService.referencedIds(visits);
+    let removed = 0;
+    for (const r of await this.store.list()) {
+      if (keep.has(r.id)) continue;
+      const age = now - Date.parse(r.addedAt || '');
+      if (graceMs > 0 && !(age >= graceMs)) continue;
+      await this.store.delete(r.id);
+      removed += 1;
+    }
+    return { removed, skipped: false };
+  }
+}
