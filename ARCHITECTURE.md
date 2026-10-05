@@ -464,6 +464,9 @@ fallback → home
 - GitHub Pages (резервная копия) публикует `dist/` через `.github/workflows/pages.yml`, а не корень репозитория:
   `tests/`, `docs/`, `scripts/`, `worker/` наружу не попадают, `sw.js` получает тот же суффикс commit, что и на Cloudflare.
 - `.nojekyll` в корне остаётся для публикации корня «как есть» (Jekyll не нужен); артефакт Pages из `dist/` Jekyll не обрабатывает.
+- Ветки: `cloudflare-push` — из неё выпускается Cloudflare (`npm run deploy` вручную, автодеплоя из Git нет);
+  `main` — стабильная ветка, синхронизируется с `cloudflare-push` после релиза и служит источником GitHub Pages.
+  Push в GitHub сам по себе Cloudflare не деплоит. Подробности и чек-лист релиза — `docs/CLOUDFLARE.md`.
 - Новый пользователь (в т.ч. первый запуск на iPhone) получает пустую базу — см. §6, §12 «Приватность».
 
 ### Приватность и seed-данные

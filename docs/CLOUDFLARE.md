@@ -4,8 +4,11 @@
 |---|---|
 | **Primary production** | `https://lexlife.alexus4026.workers.dev/` — Worker `lexlife` (Static Assets + `/api` + D1 + Cron) |
 | **Legacy backup** | `https://adar4026.github.io/LexLife/` — GitHub Pages: production-сборка `dist/` из `main` (workflow `.github/workflows/pages.yml`), без серверного push, не отключается до отдельного решения |
-| **Source of truth** | GitHub `adar4026/LexLife`, ветка `main` |
-| **Автодеплой** | Cloudflare Workers Builds: push в `main` → `npm ci` → `npm test` → `npm run build` → `npx wrangler deploy` |
+| **Source of truth** | GitHub `adar4026/LexLife` |
+| **Ветка релизов Cloudflare** | `cloudflare-push` — из неё собирается и деплоится production |
+| **Стабильная ветка** | `main` — синхронизируется с `cloudflare-push` после релиза; источник GitHub Pages |
+| **Deploy Cloudflare** | **только вручную**: `npm run deploy` (= `npm run build && npx wrangler deploy`) с машины разработчика. Автодеплоя из Git нет |
+| **Deploy Pages** | автоматически: push в `main` → `.github/workflows/pages.yml` → `npm test` → `npm run build` → публикуется `dist/` |
 
 Медицинские данные живут только на устройстве (localStorage + IndexedDB) и в бэкапах пользователя.
 В D1 — только инфраструктура уведомлений. Перенос между адресами — только через файл полной резервной копии.
@@ -13,14 +16,17 @@
 ## Архитектура
 
 ```
-GitHub main ── source of truth
-   │  push
-   ├──► Cloudflare Workers Builds ──► Worker «lexlife»   https://lexlife.alexus4026.workers.dev/   PRIMARY
-   │       (test → build → deploy)       ├─ Static Assets (dist/)      PWA от корня /
-   │                                     ├─ /api/*                     Web Push backend (тот же origin)
-   │                                     ├─ D1 «lexlife» (DB)          только уведомления
-   │                                     └─ Cron «* * * * *»           due → Web Push → SW → iPhone
-   └──► GitHub Pages (из ветки main)     https://adar4026.github.io/LexLife/        LEGACY BACKUP (без /api)
+GitHub adar4026/LexLife
+   │
+   ├─ cloudflare-push ──► `npm run deploy` вручную ──► Worker «lexlife»   https://lexlife.alexus4026.workers.dev/   PRIMARY
+   │                      (build + wrangler deploy)       ├─ Static Assets (dist/)      PWA от корня /
+   │        │                                             ├─ /api/*                     Web Push backend (тот же origin)
+   │        │ merge после проверки релиза                 ├─ D1 «lexlife» (DB)          только уведомления
+   │        ▼                                             └─ Cron «* * * * *»           due → Web Push → SW → iPhone
+   └─ main ──► push ──► GitHub Actions (pages.yml) ──► GitHub Pages        https://adar4026.github.io/LexLife/   LEGACY BACKUP
+                        (test → build → publish dist/)                     без /api, резервная копия
+
+Push в любую ветку GitHub НЕ деплоит Cloudflare: Git-интеграции (Workers Builds) у этого Worker'а нет.
 ```
 
 Один код фронтенда обслуживает оба адреса: все пути относительные (`./…`), SW регистрируется как `sw.js`
@@ -141,25 +147,55 @@ Google Fonts (SW кэширует шрифты); `worker-src 'self' blob:`; `obj
 Повторить при необходимости: в старой копии Меню → «Перенести LexLife на новый адрес» (пошаговая инструкция:
 полная копия ZIP → «Файлы» → новое приложение с экрана «Домой» → «Восстановить из копии»).
 
-## Deploy (CI/CD) — Cloudflare Workers Builds
+## Deploy Cloudflare — только вручную
 
-Единственная система автодеплоя — Git-интеграция Cloudflare (GitHub Actions для деплоя не используются).
-API-токен Cloudflare не хранится в GitHub; секреты Worker не видны сборке и не попадают в логи.
+Автодеплоя нет. Production обновляется одной командой с машины разработчика, из ветки `cloudflare-push`:
 
-| Настройка (Dashboard → Workers & Pages → lexlife → Settings → Build) | Значение |
-|---|---|
-| Repository / Production branch | `adar4026/LexLife` / `main` |
-| Build command | `npm ci && npm test && npm run build` |
-| Deploy command | `npx wrangler deploy` |
-| Root directory | `/` |
-| Builds for non-production branches | выключено |
-| Build variables | `NODE_VERSION=24` |
+```bash
+npm test && npm run deploy      # build-assets → dist/ → npx wrangler deploy
+```
 
-Порядок: checkout → install → **tests** → build → deploy. Любой упавший тест → сборка красная → deploy не
-выполняется, production остаётся на предыдущей версии. Миграции D1 в pipeline **не** входят.
+Git-интеграции Cloudflare (Workers Builds) у этого Worker'а нет, GitHub Actions Cloudflare не деплоит
+(единственный workflow в репозитории — `pages.yml`, он публикует только GitHub Pages). API-токен Cloudflare
+в GitHub не хранится: деплой идёт через OAuth-сессию wrangler на машине разработчика.
 
-Ручной deploy (`npm run deploy`) — только для аварийных случаев, когда Workers Builds недоступен; после него
-следующий push в `main` всё равно задеплоит версию из Git.
+Следствия, которые важно не перепутать:
+
+- **Push в GitHub — не deploy.** Ни push в `cloudflare-push`, ни push в `main` не меняют production.
+  Пока не выполнен `npm run deploy`, на Cloudflare живёт предыдущая сборка.
+- **Merge `cloudflare-push` → `main` не требует повторного deploy.** Merge переносит уже выпущенный код
+  в стабильную ветку; код при этом не меняется, поэтому передеплоивать Cloudflare не нужно.
+- **`CACHE_VERSION` поднимается только при релизе веб-приложения** (изменились ассеты), а не при merge
+  в `main` и не ради синхронизации веток. Вместе с ним в том же коммите обновляется ожидаемое значение
+  в `tests/notifications.test.mjs` — тест сверяет точную строку.
+- **Тесты — ответственность разработчика перед deploy.** В pipeline их нет, потому что pipeline'а нет;
+  `npm test` гоняется локально (и ещё раз в Pages-workflow после merge, уже постфактум).
+- Миграции D1 в deploy не входят — применяются отдельно (`npm run db:migrate:remote`).
+
+Как проверить, чем именно задеплоена текущая версия:
+
+```bash
+npx wrangler deployments list        # Source: «Unknown (deployment)» = загрузка wrangler, не CI
+curl -s https://lexlife.alexus4026.workers.dev/build-info.json   # branch/sha/source сборки
+```
+
+`build-info.json` на production показывает `"branch": "cloudflare-push"`, `"source": "local"` — то есть
+сборка сделана локально из ветки релизов. У сборки из Workers Builds было бы `"source": "workers-builds"`.
+
+## Канонический порядок релиза
+
+```text
+разработка в cloudflare-push
+→ npm test (зелёный)
+→ если менялись ассеты: bump CACHE_VERSION в sw.js + то же число в tests/notifications.test.mjs
+→ commit в cloudflare-push
+→ push origin cloudflare-push
+→ npm run deploy                    (build + wrangler deploy — единственный шаг, который меняет production)
+→ production verification           (/api/status, SW, push на iPhone — см. Release checklist)
+→ merge cloudflare-push в main      (--no-ff, без повторного deploy)
+→ push origin main
+→ GitHub Actions автоматически публикует dist/ на GitHub Pages (резервная копия)
+```
 
 ### Версия сборки
 
@@ -201,8 +237,8 @@ npm run db:migrate:remote                            # применить
 | `VAPID_SUBJECT` | Cloudflare secret | `mailto:` оператора |
 | `VAPID_PUBLIC_KEY` | `wrangler.jsonc` vars | публичный |
 
-Проверка: `npx wrangler secret list` (только имена). Секреты привязаны к Worker, а не к сборке: Workers Builds их не
-видит. Смена пары VAPID = все подписки устройств станут недействительны (устройства переподпишутся при запуске).
+Проверка: `npx wrangler secret list` (только имена). Секреты привязаны к Worker, а не к сборке: `npm run build`
+их не видит, в `dist/` и в Git они не попадают. Смена пары VAPID = все подписки устройств станут недействительны (устройства переподпишутся при запуске).
 
 ## Cron и Web Push — эксплуатация
 
@@ -224,10 +260,11 @@ npm run db:migrate:remote                            # применить
 Сценарии:
 
 1. **Плохой deploy кода** (самое частое): `npx wrangler deployments list` → `npx wrangler rollback <version-id>`
-   (мгновенно, без сборки; секреты сохраняются). Затем исправить в Git — следующий push в `main` задеплоит исправление.
-   Важно: пока `main` не исправлен, любой новый push снова задеплоит проблемный код.
-2. **Откат на стабильный тег**: `git revert` проблемных коммитов в `main` (не force-push) → автодеплой;
-   либо аварийно `git checkout cf-stable-2026-10-03 && npm ci && npm run deploy`.
+   (мгновенно, без сборки; секреты сохраняются). Затем исправить в `cloudflare-push` и выпустить новый
+   `npm run deploy`. Откат живёт только на Cloudflare: Git после `rollback` не меняется, поэтому следующий
+   ручной deploy из невыправленной ветки вернёт проблемный код.
+2. **Откат на стабильный тег**: `git revert` проблемных коммитов в `cloudflare-push` (не force-push) →
+   `npm run deploy`; либо аварийно `git checkout cf-stable-2026-10-03 && npm run deploy`.
 3. **Повреждена D1** (только инфраструктура push): `npx wrangler d1 time-travel restore lexlife --bookmark=<bookmark>`
    (Free plan — 7 дней). Даже полная потеря D1 не затрагивает данные здоровья: устройство перерегистрируется,
    правила синхронизируются заново при следующем запуске приложения.
@@ -250,21 +287,23 @@ npm run db:migrate:remote                            # применить
 - Обновление старой копии: SW v34 → v36 проверено с `Cache-Control: max-age=600` (как у Pages): данные и PDF
   сохраняются, старый кэш удаляется, офлайн работает.
 
-## Release checklist (каждый релиз в `main`)
+## Release checklist (каждый релиз Cloudflare из `cloudflare-push`)
 
-1. `npm test` — зелёный (в т. ч. Node 24, как в Workers Builds).
-2. Секретов нет: `git diff origin/main..HEAD` без ключей/токенов/endpoint, без `private/` и бэкапов.
+1. `npm test` — зелёный локально (Pages-workflow позже прогонит те же тесты на Node 22).
+2. Секретов нет: `git diff origin/cloudflare-push..HEAD` без ключей/токенов/endpoint, без `private/` и бэкапов.
 3. D1: `npx wrangler d1 migrations list lexlife --remote` — новых миграций нет, или применены отдельно до релиза.
 4. Если менялись ассеты — поднят `CACHE_VERSION` в `sw.js`, и проверка версии в `tests/notifications.test.mjs`
    обновлена на то же число (она сверяет точное значение).
-5. Push в `main` → Workers Builds зелёный (Dashboard → lexlife → Deployments). Второй deploy вручную не делать.
-6. `GET /api/status` → `200`, `db: ok`, `push: configured`, `build.sha` = commit из `main`.
+5. `git push origin cloudflare-push`, затем `npm run deploy` — деплой выполняется только этой командой.
+6. `GET /api/status` → `200`, `db: ok`, `push: configured`, `build.sha` = задеплоенный commit из `cloudflare-push`.
 7. SW обновился: «Настройки → О приложении» показывает новый `build`, офлайн открывается.
 8. Push: «Проверить фоновый push» на iPhone приходит; число устройств/подписок в D1 не выросло.
 9. Cron: `npx wrangler tail lexlife` — вызовы раз в минуту без исключений; D1 без ошибок (`d1 info`).
 10. GitHub Pages: workflow «GitHub Pages (резервная копия)» зелёный; `https://adar4026.github.io/LexLife/` открывается,
     показывает «Резервная версия», к `/api` не обращается; `/tests/run-all.mjs` и `/package.json` отдают 404.
 11. Записать новую стабильную точку (тег + Worker version), если релиз подтверждён на iPhone.
+12. Merge `cloudflare-push` → `main` (`--no-ff`) и `git push origin main` — без повторного deploy Cloudflare;
+    Pages-workflow сам опубликует `dist/` резервной копии.
 
 ## Локальная разработка
 
