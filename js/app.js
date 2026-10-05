@@ -6,7 +6,7 @@
    Показатели — единая модель: каждый показатель = модуль #/metric/<key>.
    ========================================================= */
 
-import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup, SleepStoreError } from './services/storage.js';
+import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup, SleepStoreError, ActivityStoreError } from './services/storage.js';
 import { createStatsEngine, evaluateWaterPlan, waterGoalDays, getWaterStatsRange, WATER_PERIODS, formatLiters, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay, dayNum } from './services/analytics.js';
 import { parseWaterMinderCsv, assignImportKeys, buildWaterImportPlan, applyWaterImportPlan, applyTodayWaterImport, isWaterMinderKey } from './services/waterImport.js';
 import { lineChart, barChart as svgBarChart } from './ui/charts.js';
@@ -18,7 +18,7 @@ import { visitIcon, visitTitle, visitSub, visitTime, visitKindLabel, visitStatus
 import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
 import { openDocViewer as showDocViewer } from './ui/docViewer.js';
 import { setActiveTab, initBottomNav } from './ui/bottomNav.js';
-import { BackButton, goBack, goBackTo, replaceRoute, replaceUrl, initNavHistory, readEntryUi, saveEntryUi } from './ui/backNav.js';
+import { BackButton, goBack, goBackTo, replaceRoute, replaceUrl, initNavHistory, readEntryUi, saveEntryUi, prevRoute } from './ui/backNav.js';
 import { HOME_WATER_QUICK_ADD, waterProgress, homeWaterStatus, waterPlanMarker, waterPlanDelta, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed } from './services/homeSummary.js';
 import { WEEKDAYS, MED_NAME_MAX, MED_DOSE_MAX, MED_NOTE_MAX, MED_TIMES_MAX, nextDose, medSchedule, medStatusOn, medDaySlots, isMedDueOn, nextDueDay, scheduleLabel, intakeSummary, normalizeMedInput, intakeHistory, medOccurrences, endedCourseWord } from './services/meds.js';
 import {
@@ -28,6 +28,11 @@ import {
   aggregateByWeek, aggregateByMonth, aggregateByYear, comparePeriods, factorInsights, insightText, periodBounds, shiftPeriod, entriesInRange,
   napMinutes, totalDayMinutes, minutesToClock, clampSleepGoal, addDays as sleepAddDays,
 } from './services/sleep.js';
+import {
+  ACTIVITY_METRICS, ACTIVITY_KEYS, LEGACY_ACTIVITY_SOURCE, STEPS_MAX, WALK_KM_MAX, RIDE_KM_MAX, RIDE_MINUTES_MAX, ACTIVITY_NOTE_MAX,
+  normalizeDailyInput, normalizeRideInput, dayValues, ridesByDate, rideDayKm, latestValue, lastDays, activityPeriodStats, comparePrevPeriod,
+  fmtActivityValue, fmtActivity, activityUnit,
+} from './services/activity.js';
 import { nextFire } from './services/notifySchedule.js';
 import { createNotifier, describeNotifyState, armPatch, waterRulePatch, NOTIF_ROUTES, isSafeRoute } from './services/notifier.js';
 import { createPushClient, SYNC_FAIL_TEXT, SERVER_FALLBACK_MS } from './services/pushClient.js';
@@ -151,6 +156,9 @@ const HOME_ICONS = {
   check: '<path d="m5.5 12.5 4.2 4.2 8.8-9.2"/>',
   sleep: '<path d="M19.6 14.8A7.9 7.9 0 0 1 9.2 4.4a7.9 7.9 0 1 0 10.4 10.4z"/>',
   sliders: '<path d="M4 7.5h9M17.5 7.5H20M4 16.5h3M11.5 16.5H20"/><circle cx="15.2" cy="7.5" r="2.2"/><circle cx="9.2" cy="16.5" r="2.2"/>',
+  steps: '<path d="M8.6 3.8c1.7 0 2.6 1.7 2.6 3.8s-1.1 4-2.6 4-2.7-1.6-2.7-3.9.9-3.9 2.7-3.9z"/><path d="M6.3 14.1h4.6l-.3 2.1a2.2 2.2 0 0 1-4.3 0z"/><path d="M15.6 7.8c1.7 0 2.6 1.7 2.6 3.8s-1.1 4-2.6 4-2.7-1.6-2.7-3.9.9-3.9 2.7-3.9z"/><path d="M13.3 18.1h4.6l-.3 2.1a2.2 2.2 0 0 1-4.3 0z"/>',
+  walk: '<circle cx="13.2" cy="4.4" r="1.9"/><path d="M9.6 21l2.4-6.4 2.8 2.7V21"/><path d="M12 14.6l.9-5.8-3.5 1.9-1.3 3.1"/><path d="M12.9 8.8l2.2 3 2.9 1"/>',
+  bike: '<circle cx="6" cy="15.8" r="3.7"/><circle cx="18" cy="15.8" r="3.7"/><path d="M6 15.8l3.7-6.9h6.4L18 15.8"/><path d="M9.7 8.9l2.6 6.9H6"/><path d="M8.4 6.4h2.8"/><path d="M14.8 6h2.4l-1.1 2.9"/>',
 };
 HOME_ICONS.temperature = HOME_ICONS.pulse;
 HOME_ICONS.spo2 = HOME_ICONS.pulse;
@@ -182,10 +190,11 @@ function homeSection(title, route, label, more = 'Все') {
 async function HomeScreen() {
   const now = new Date();
   const today = dateKey(now);
-  const [water, goal, hyd, tests, metricsLog, visits, meds, takenToday, intakes, sleepEntries, sleepSettings] = await Promise.all([
+  const [water, goal, hyd, tests, metricsLog, visits, meds, takenToday, intakes, sleepEntries, sleepSettings, stepsLog, walkLog, bikeRides] = await Promise.all([
     Storage.getWater(today), Storage.getWaterGoal(), Storage.getHydration(), Storage.getTests(), Storage.getMetricsLog(),
     Storage.getVisits(), Storage.getMeds(), Storage.getMedLog(today), Storage.getMedIntakes(today),
     Storage.getSleepEntries(), Storage.getSleepSettings(),
+    Storage.getDailyActivityLog('steps'), Storage.getDailyActivityLog('walk'), Storage.getBikeRides(),
   ]);
   const screen = el('<div class="home"></div>');
   /* мягкое появление — только при первом открытии Главной за запуск (не на каждом переключении вкладки) */
@@ -194,6 +203,8 @@ async function HomeScreen() {
 
   screen.appendChild(renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, intakes, metricsLog, enter }));
   screen.appendChild(renderHomeSleep(getSleepForDate(sleepEntries, today), sleepSettings.goalMinutes));
+  const activityStores = { steps: stepsLog, walk: walkLog, bike: bikeRides };
+  ACTIVITY_KEYS.forEach((k) => screen.appendChild(renderHomeActivity(k, activityStores[k], today)));
   const upcoming = renderUpcoming({ meds, takenToday, intakes, visits, now });
   if (upcoming) screen.appendChild(upcoming);
   const attention = renderAttentionSection(tests);
@@ -354,6 +365,58 @@ function renderHomeSleep(e, goal) {
     status.textContent = 'Добавить';
     row.setAttribute('aria-label', 'Сон: сегодня нет записи. Открыть раздел «Сон», чтобы добавить');
   }
+  const list = el('<div class="hlist"></div>');
+  list.appendChild(row);
+  sec.appendChild(list);
+  return sec;
+}
+
+/* ---------- Шаги / Дистанция пешком / Велосипед: отдельная карточка каждого показателя ----------
+   Как карточка сна: значение за сегодня (или последнее записанное и его дата), справа — мини-график
+   последних 7 дней; нажатие — экран показателя. Значения — services/activity.js (dayValues). */
+const plRides = (n) => `${n} ${plural(n, 'поездка', 'поездки', 'поездок')}`;
+function activitySpark(values, today) {
+  const days = lastDays(values, 7, today);
+  if (!days.some((d) => d.value != null)) return '';
+  const max = Math.max(...days.map((d) => d.value || 0), 1);
+  const bars = days.map((d, i) => {
+    const x = i * 9;
+    if (d.value == null) return `<rect x="${x}" y="25" width="6" height="2" rx="1" class="hspark__none"/>`;
+    const h = Math.max(3, Math.round((d.value / max) * 26));
+    return `<rect x="${x}" y="${27 - h}" width="6" height="${h}" rx="2" class="${d.date === today ? 'hspark__today' : 'hspark__bar'}"/>`;
+  }).join('');
+  return `<svg class="hspark" viewBox="0 0 60 27" aria-hidden="true">${bars}</svg>`;
+}
+function renderHomeActivity(metric, store, today) {
+  const M = ACTIVITY_METRICS[metric];
+  const sec = homeSection(M.title, M.route, `Открыть раздел «${M.title}»`);
+  const values = dayValues(metric, store);
+  const last = latestValue(values, today);
+  const row = el(`
+    <a class="hrow hact" href="#/${M.route}" data-activity="${metric}">
+      <span class="hrow__icon hrow__icon--${metric}">${homeIcon(metric)}</span>
+      <span class="hrow__body"><span class="hrow__title"></span><span class="hrow__sub hrow__sub--one"></span></span>
+      ${last ? activitySpark(values, today) : '<span class="hrow__status hrow__status--add">Добавить</span>'}
+      ${homeIcon('chevron', 'hrow__chev')}
+    </a>
+  `);
+  let title, sub;
+  if (last) {
+    title = fmtActivity(metric, last.value);
+    sub = fmtWhen(last.date, today);
+    if (metric === 'bike') { const n = (ridesByDate(store).get(last.date) || []).length; sub = `${capFirst(sub)} · ${plRides(n)}`; }
+    else sub = capFirst(sub);
+  } else if (metric === 'bike' && Array.isArray(store) && store.length) {
+    /* только перенесённые записи велотренажёра — минуты без дистанции */
+    title = rideTitle({ ...store[0], time: null });
+    sub = `${NO_KM} · ${fmtWhen(store[0].date, today)}`;
+  } else {
+    title = 'Нет записей';
+    sub = 'Нажмите, чтобы добавить';
+  }
+  $('.hrow__title', row).textContent = title;
+  $('.hrow__sub', row).textContent = sub;
+  row.setAttribute('aria-label', `${M.title}: ${title}, ${sub}. Открыть раздел «${M.title}»`);
   const list = el('<div class="hlist"></div>');
   list.appendChild(row);
   sec.appendChild(list);
@@ -1020,7 +1083,7 @@ async function WaterScreen() {
 
   /* Журнал приёмов за сегодня (с удалением) */
   function journal(entries, day) {
-    const sec = el('<section class="section"><div class="section__head"><h2 class="section__title">Сегодня · приёмы</h2><button class="section__action" type="button" data-route="water-log">Все записи ›</button></div><div class="list-card" id="jbox"></div></section>');
+    const sec = el('<section class="section"><div class="section__head"><h2 class="section__title">Сегодня · приёмы</h2><button class="section__action" type="button" data-route="water-log">Журнал ›</button></div><div class="list-card" id="jbox"></div></section>');
     $('.section__action', sec).addEventListener('click', onRouteClick);
     const box = $('#jbox', sec);
     if (!entries.length) { box.appendChild(el('<div class="empty">Пока нет приёмов</div>')); return sec; }
@@ -1761,7 +1824,7 @@ async function SleepScreen() {
     const head = el(`
       <div class="section__head sleep-history__head">
         <h2 class="section__title" id="sl-hist-title">История</h2>
-        <a class="med-add" href="#/sleep/new" aria-label="Добавить запись сна">${homeIcon('plus')}<span>Добавить</span></a>
+        <span class="sleep-history__acts"><a class="section__action sleep-journal" href="#/sleep-log/${esc(ym)}">Журнал ›</a><a class="med-add" href="#/sleep/new" aria-label="Добавить запись сна">${homeIcon('plus')}<span>Добавить</span></a></span>
       </div>
     `);
     const nav = el(`
@@ -1852,7 +1915,10 @@ async function SleepFormScreen(id, presetDate = null) {
   const [existing, settings] = await Promise.all([id ? Storage.getSleepEntry(id) : null, Storage.getSleepSettings()]);
   const screen = el('<div class="med-form sleep-form"></div>');
   const route = location.hash;
-  const leave = () => { sleepDraft = null; goBack('sleep'); };
+  /* открыта из журнала сна — после сохранения / удаления возвращается в журнал, иначе — в «Сон» */
+  const from = prevRoute() || '';
+  const backTo = from.startsWith('#/sleep-log') ? from.slice(2) : 'sleep';
+  const leave = () => { sleepDraft = null; goBack(backTo); };
   screen.appendChild(backHeader(id ? 'Запись сна' : 'Новая запись сна', { onBack: leave }));
   if (id && !existing) {
     screen.appendChild(el('<div class="empty">Запись сна не найдена — возможно, она удалена.</div>'));
@@ -2088,7 +2154,7 @@ async function SleepFormScreen(id, presetDate = null) {
     }
     sleepDraft = null;
     flash('Сохранено ✓');
-    goBackTo('sleep');
+    goBackTo(backTo);
   });
 
   const del = $('.sleep-delete', form);
@@ -2102,7 +2168,7 @@ async function SleepFormScreen(id, presetDate = null) {
     try { await Storage.removeSleepEntry(existing.id); } catch { flash('Не удалось удалить'); return; }
     sleepDraft = null;
     flash('Удалено');
-    goBackTo('sleep');
+    goBackTo(backTo);
   });
 
   screen.appendChild(form);
@@ -2878,8 +2944,11 @@ async function restoreFlow(file) {
     ['Анализы', summary.tests],
     ['Визиты', summary.visits],
     ['Уведомления', summary.notifications],
-    ['Дни активности', summary.activityDays],
+    ['Архив прежней версии (планка и др.), дней', summary.activityDays],
     ['Сон', `${summary.sleep || 0} ${plural(summary.sleep || 0, 'запись', 'записи', 'записей')}`],
+    ['Шаги', `${summary.steps || 0} ${plural(summary.steps || 0, 'день', 'дня', 'дней')}`],
+    ['Дистанция пешком', `${summary.walk || 0} ${plural(summary.walk || 0, 'день', 'дня', 'дней')}`],
+    ['Велосипед', `${summary.bike || 0} ${plural(summary.bike || 0, 'поездка', 'поездки', 'поездок')}`],
   ];
   if (full) rows.push(['Документы анализов (PDF/фото)', full.attachments.length], ['Документы врачей и визитов', (full.visitAttachments || []).length]);
   const schemaLine = info.migrated ? `${info.schemaVersion} → будет обновлена до ${CURRENT_SCHEMA_VERSION}` : String(info.schemaVersion);
@@ -3315,22 +3384,98 @@ async function HistoryImportScreen() {
 const WL_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const WL_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 
+/* =========================================================
+   Единый журнал показателя — вода, сон, шаги, дистанция пешком, велосипед.
+   Один сценарий: показатель → «Журнал» → любая дата → добавить / изменить / удалить.
+   Месяц ‹ › и «Сегодня», поля «Месяц» и «Перейти к дате», итог месяца, «+ Добавить запись»;
+   ниже — дни месяца (новые сверху) с итогом дня и записями ✎ / ✕. Выбранная дата
+   подсвечивается и прокручивается к себе; адрес журнала (#/<журнал>/ГГГГ-ММ[-ДД]) хранит
+   месяц и дату — «Назад» из формы и перезапуск возвращают туда же.
+   ========================================================= */
+const JR_CAP = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+const jrMonthTitle = (m) => { const [y, mo] = m.split('-').map(Number); return JR_CAP(new Date(y, mo - 1, 1).toLocaleDateString(RU, { month: 'long', year: 'numeric' })); };
+const jrDayTitle = (d) => JR_CAP(new Date(`${d}T00:00:00`).toLocaleDateString(RU, { weekday: 'short', day: 'numeric', month: 'long' }));
+function jrShiftMonth(m, delta) {
+  const [y, mo] = m.split('-').map(Number);
+  const d = new Date(y, mo - 1 + delta, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+/* Разбор адреса журнала: «ГГГГ-ММ-ДД» → выбранная дата и её месяц, «ГГГГ-ММ» → месяц; не позже сегодня */
+function journalState(param, today) {
+  const curMonth = today.slice(0, 7);
+  const focusDay = WL_DATE_RE.test(param || '') && param <= today ? param : null;
+  let month = focusDay ? focusDay.slice(0, 7) : (/^\d{4}-\d{2}$/.test(param || '') ? param : curMonth);
+  if (month > curMonth) month = curMonth;
+  return { month, focusDay };
+}
+/* Панель журнала. prefix — id полей (вода — «wl»); onGo(month, day|null); onAdd() */
+function journalControls({ prefix, month, focusDay, today, summary, onGo, onAdd, addLabel = '+ Добавить запись' }) {
+  const curMonth = today.slice(0, 7);
+  const atToday = month === curMonth && focusDay === today;
+  const ctrl = el(`
+    <div class="input-card jctrl">
+      <div class="jctrl__nav">
+        <button class="btn-ghost jctrl__arrow" type="button" data-nav="-1" aria-label="Предыдущий месяц">‹</button>
+        <b class="jctrl__title">${esc(jrMonthTitle(month))}</b>
+        <button class="sleep-today jctrl__today" type="button" data-today ${atToday ? 'disabled' : ''}>Сегодня</button>
+        <button class="btn-ghost jctrl__arrow" type="button" data-nav="1" aria-label="Следующий месяц" ${month >= curMonth ? 'disabled' : ''}>›</button>
+      </div>
+      <div class="jctrl__fields">
+        <label><span class="field__label">Месяц</span><input class="input" type="month" id="${prefix}-month" value="${esc(month)}" max="${esc(curMonth)}"></label>
+        <label><span class="field__label">Перейти к дате</span><input class="input" type="date" id="${prefix}-goto" max="${esc(today)}" value="${esc(focusDay || '')}"></label>
+      </div>
+      <p class="backup-note jctrl__sum">${summary}</p>
+      <button class="btn-primary" type="button" id="${prefix}-add">${esc(addLabel)}</button>
+    </div>
+  `);
+  ctrl.querySelectorAll('[data-nav]').forEach((b) => b.addEventListener('click', () => {
+    const m = jrShiftMonth(month, Number(b.dataset.nav));
+    if (m <= curMonth) onGo(m);
+  }));
+  $('[data-today]', ctrl).addEventListener('click', () => onGo(curMonth, today));
+  $(`#${prefix}-month`, ctrl).addEventListener('change', (ev) => { const v = ev.target.value; if (/^\d{4}-\d{2}$/.test(v) && v <= curMonth) onGo(v); });
+  $(`#${prefix}-goto`, ctrl).addEventListener('change', (ev) => { const v = ev.target.value; if (WL_DATE_RE.test(v) && v <= today) onGo(v.slice(0, 7), v); });
+  $(`#${prefix}-add`, ctrl).addEventListener('click', onAdd);
+  return ctrl;
+}
+/* День журнала: заголовок (дата · итог дня [· доп. кнопка]) и записи */
+function journalDay({ prefix, date, focus, totalHtml, extraHead = '', emptyText = '' }) {
+  const sec = el(`
+    <section class="section jday" id="${prefix}-${date}">
+      <div class="section__head">
+        <h2 class="section__title" style="font-size:16px">${esc(jrDayTitle(date))}</h2>
+        <span style="display:flex; align-items:center; gap:6px"><b class="jday__total">${totalHtml}</b>${extraHead}</span>
+      </div>
+      <div class="list-card"></div>
+    </section>
+  `);
+  if (focus) sec.classList.add('jday--focus');
+  if (emptyText) $('.list-card', sec).appendChild(el(`<div class="empty">${esc(emptyText)}</div>`));
+  return sec;
+}
+/* Запись дня: заголовок, подпись, ✎ и ✕ (подписи для экранного диктора — label) */
+function journalRow({ titleHtml, subHtml = '', label, onEdit, onDelete }) {
+  const row = el(`
+    <div class="row jrow">
+      <div class="row__body"><p class="row__title">${titleHtml}</p>${subHtml ? `<p class="row__sub">${subHtml}</p>` : ''}</div>
+      <button class="wdel" type="button" data-act="edit" aria-label="Редактировать запись ${esc(label)}">✎</button>
+      <button class="wdel" type="button" data-act="del" aria-label="Удалить запись ${esc(label)}">✕</button>
+    </div>
+  `);
+  $('[data-act="edit"]', row).addEventListener('click', onEdit);
+  $('[data-act="del"]', row).addEventListener('click', onDelete);
+  return row;
+}
+/* Выбранная дата без записей — подсказка; прокрутка к дню после отрисовки */
+function journalFocus(screen, prefix, focusDay, hasDay) {
+  if (focusDay && !hasDay) screen.appendChild(el(`<p class="empty jempty">${esc(fmtDate(focusDay))}: записей нет. «+ Добавить запись» добавит запись на эту дату.</p>`));
+  if (focusDay) setTimeout(() => { const n = document.getElementById(`${prefix}-${focusDay}`); if (n) n.scrollIntoView({ block: 'start' }); }, 60);
+}
+
 async function WaterLogScreen(param) {
   const screen = el('<div></div>');
   const today = dateKey();
-  const curMonth = today.slice(0, 7);
-  let focusDay = WL_DATE_RE.test(param || '') ? param : null;
-  let month = focusDay ? focusDay.slice(0, 7) : (/^\d{4}-\d{2}$/.test(param || '') ? param : curMonth);
-  if (month > curMonth) month = curMonth;
-
-  const shiftMonth = (m, delta) => {
-    const [y, mo] = m.split('-').map(Number);
-    const d = new Date(y, mo - 1 + delta, 1);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-  };
-  const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
-  const monthTitle = (m) => { const [y, mo] = m.split('-').map(Number); return cap(new Date(y, mo - 1, 1).toLocaleDateString(RU, { month: 'long', year: 'numeric' })); };
-  const dayTitle = (d) => cap(new Date(`${d}T00:00:00`).toLocaleDateString(RU, { weekday: 'short', day: 'numeric', month: 'long' }));
+  let { month, focusDay } = journalState(param, today);
   const hasWater = (o) => !!o && (((o.entries || []).length > 0) || (o.total || 0) > 0);
   const srcLabel = (e) => {
     const drink = e.drink && e.drink !== 'Вода' ? ` · ${esc(e.drink)}${e.hydrationMl ? ` (${fmtMl(e.hydrationMl)} мл напитка)` : ''}` : '';
@@ -3350,70 +3495,32 @@ async function WaterLogScreen(param) {
     const monthTotal = days.reduce((s, d) => s + (log[d].total || 0), 0);
     screen.innerHTML = '';
     screen.appendChild(backHeader('Журнал воды', { fallback: 'metric/water' }));
-
-    const ctrl = el(`
-      <div class="input-card">
-        <div style="display:flex; align-items:center; justify-content:space-between; gap:8px">
-          <button class="btn-ghost" type="button" data-nav="-1" style="width:auto; margin:0; padding:8px 14px" aria-label="Предыдущий месяц">‹</button>
-          <b style="font-size:17px">${esc(monthTitle(month))}</b>
-          <button class="btn-ghost" type="button" data-nav="1" style="width:auto; margin:0; padding:8px 14px" aria-label="Следующий месяц" ${month >= curMonth ? 'disabled' : ''}>›</button>
-        </div>
-        <div style="display:flex; gap:8px; margin-top:10px">
-          <label style="flex:1; min-width:0"><span class="field__label">Месяц</span><input class="input" type="month" id="wl-month" style="width:100%; min-width:0; box-sizing:border-box" value="${esc(month)}" max="${esc(curMonth)}"></label>
-          <label style="flex:1; min-width:0"><span class="field__label">Перейти к дате</span><input class="input" type="date" id="wl-goto" style="width:100%; min-width:0; box-sizing:border-box" max="${esc(today)}" value="${esc(focusDay || '')}"></label>
-        </div>
-        <p class="backup-note" style="margin-top:10px">За месяц: ${monthEntries} ${plural(monthEntries, 'запись', 'записи', 'записей')} · ${days.length} ${plural(days.length, 'день', 'дня', 'дней')} с водой · ${fmtMl(monthTotal)} мл</p>
-        <button class="btn-primary" type="button" id="wl-add" style="margin-top:6px">+ Добавить запись</button>
-      </div>
-    `);
-    ctrl.querySelectorAll('[data-nav]').forEach((b) => b.addEventListener('click', () => {
-      const m = shiftMonth(month, Number(b.dataset.nav));
-      if (m <= curMonth) go(m);
+    screen.appendChild(journalControls({
+      prefix: 'wl', month, focusDay, today, onGo: go, onAdd: addEntry,
+      summary: `За месяц: ${monthEntries} ${plural(monthEntries, 'запись', 'записи', 'записей')} · ${days.length} ${plural(days.length, 'день', 'дня', 'дней')} с водой · ${fmtMl(monthTotal)} мл`,
     }));
-    $('#wl-month', ctrl).addEventListener('change', (ev) => { const v = ev.target.value; if (/^\d{4}-\d{2}$/.test(v) && v <= curMonth) go(v); });
-    $('#wl-goto', ctrl).addEventListener('change', (ev) => { const v = ev.target.value; if (WL_DATE_RE.test(v) && v <= today) go(v.slice(0, 7), v); });
-    $('#wl-add', ctrl).addEventListener('click', addEntry);
-    screen.appendChild(ctrl);
 
-    if (focusDay && !days.includes(focusDay)) {
-      screen.appendChild(el(`<p class="empty">${esc(fmtDate(focusDay))}: записей нет.</p>`));
-    }
     if (!days.length) screen.appendChild(el('<p class="empty">В этом месяце записей воды нет.</p>'));
+    journalFocus(screen, 'wl', focusDay, days.includes(focusDay));
 
     days.forEach((d) => {
       const o = log[d];
       const entries = (o.entries || []).map((e, i) => ({ e, i }));
       const importedCount = entries.filter(({ e }) => isWaterMinderKey(e.key)).length;
-      const sec = el(`
-        <section class="section" id="wl-${d}">
-          <div class="section__head">
-            <h2 class="section__title" style="font-size:16px">${esc(dayTitle(d))}</h2>
-            <span style="display:flex; align-items:center; gap:6px"><b>${fmtMl(o.total || 0)} мл</b>${importedCount ? '<button class="section__action" type="button" data-bulk aria-label="Исправить ошибочную серию">⋯</button>' : ''}</span>
-          </div>
-          <div class="list-card"></div>
-        </section>
-      `);
-      if (d === focusDay) sec.style.outline = '2px solid var(--blue)';
-      const box = $('.list-card', sec);
-      if (!entries.length) box.appendChild(el('<div class="empty">Итог без разбивки по приёмам</div>'));
-      entries.forEach(({ e, i }) => {
-        const row = el(`
-          <div class="row">
-            <div class="row__body"><p class="row__title">${esc(e.t)} · +${fmtMl(e.ml)} мл</p><p class="row__sub">${srcLabel(e)}</p></div>
-            <button class="wdel" type="button" data-act="edit" aria-label="Редактировать запись ${esc(e.t)}">✎</button>
-            <button class="wdel" type="button" data-act="del" aria-label="Удалить запись ${esc(e.t)}">✕</button>
-          </div>
-        `);
-        $('[data-act="edit"]', row).addEventListener('click', () => editEntry(d, e, i));
-        $('[data-act="del"]', row).addEventListener('click', () => deleteEntry(d, e, i, o.total || 0));
-        box.appendChild(row);
+      const sec = journalDay({
+        prefix: 'wl', date: d, focus: d === focusDay, totalHtml: `${fmtMl(o.total || 0)} мл`,
+        extraHead: importedCount ? '<button class="section__action" type="button" data-bulk aria-label="Исправить ошибочную серию">⋯</button>' : '',
+        emptyText: entries.length ? '' : 'Итог без разбивки по приёмам',
       });
+      const box = $('.list-card', sec);
+      entries.forEach(({ e, i }) => box.appendChild(journalRow({
+        titleHtml: `${esc(e.t)} · +${fmtMl(e.ml)} мл`, subHtml: srcLabel(e), label: e.t,
+        onEdit: () => editEntry(d, e, i), onDelete: () => deleteEntry(d, e, i, o.total || 0),
+      })));
       const bulk = $('[data-bulk]', sec);
       if (bulk) bulk.addEventListener('click', () => bulkRemoveImported(d, o));
       screen.appendChild(sec);
     });
-
-    if (focusDay) setTimeout(() => { const n = document.getElementById(`wl-${focusDay}`); if (n) n.scrollIntoView({ block: 'start' }); }, 60);
   }
 
   /* Форма записи: дату, фактическое время и объём задаёт пользователь */
@@ -3523,6 +3630,443 @@ async function WaterLogScreen(param) {
   return screen;
 }
 
+/* =========================================================
+   Шаги (#/steps) · Дистанция пешком (#/walk) · Велосипед (#/bike) — самостоятельные показатели
+   по образцу «Сна»: значение за выбранный день · статистика Неделя / Месяц / Год (календарные
+   периоды с ‹ ›) · последние записи · «Журнал» (#/steps-log, #/walk-log, #/bike-log — единый журнал).
+   Модель и расчёты — services/activity.js, хранение — Storage (steps_log, walk_log, bike_log).
+   Выбранные период и день живут в записи истории (saveEntryUi): «Назад» из журнала — туда же.
+   ========================================================= */
+const ACT_PERIOD_KINDS = SLEEP_KINDS.map(([k]) => k);
+const ACT_SOURCE = { manual: 'вручную', [LEGACY_ACTIVITY_SOURCE]: 'перенесено из прежней версии' };
+const actSourceText = (e) => ACT_SOURCE[(e && e.source) || 'manual'] || esc(e.source);
+const ACT_JOURNAL_TITLE = { steps: 'Журнал шагов', walk: 'Журнал дистанции пешком', bike: 'Журнал поездок' };
+const hhmmNow = () => { const d = new Date(); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+/* Поездка без километров (перенесённый велотренажёр — только минуты) — никогда не «0 км»:
+   «Велотренажёр · 35 мин» и подпись «Дистанция не указана»; в километры не входит. */
+const TRAINER_RE = /^Велотренажёр(?: · )?/;
+const isTrainerRide = (r) => r.source === LEGACY_ACTIVITY_SOURCE || TRAINER_RE.test(r.note || '');
+/* «08:30 · 7,4 км · 25 мин»; без времени — «без времени»; без км — «Велотренажёр · 35 мин» */
+function rideTitle(r) {
+  if (r.km == null) return [r.time, isTrainerRide(r) ? 'Велотренажёр' : 'Поездка', r.minutes != null ? `${r.minutes} мин` : ''].filter(Boolean).join(' · ');
+  const parts = [r.time || 'без времени', `${fmtActivityValue('bike', r.km)} км`];
+  if (r.minutes != null) parts.push(`${r.minutes} мин`);
+  return parts.join(' · ');
+}
+function rideSub(r) {
+  const note = r.km == null && isTrainerRide(r) ? (r.note || '').replace(TRAINER_RE, '') : r.note || '';
+  return [r.km == null ? 'Дистанция не указана' : '', actSourceText(r), note ? esc(note) : ''].filter(Boolean).join(' · ');
+}
+const NO_KM = 'Дистанция не указана';
+const dailySub = (e) => [actSourceText(e), e.note ? esc(e.note) : ''].filter(Boolean).join(' · ');
+/* число для поля ввода: 8450 / «6,4» */
+const actInputValue = (metric, v) => (v == null ? '' : metric === 'steps' ? String(v) : String(v).replace('.', ','));
+const actErrorsHtml = (errors) => `<p>${Object.values(errors).map((t) => esc(t)).join('<br>')}</p>`;
+
+/* Дневной итог (шаги / дистанция пешком): добавить или изменить, в т.ч. перенести на другую дату.
+   from — дата редактируемой записи (null — новая). Дата уже занята → «Заменить?» (у дня один итог,
+   дубля не бывает). Ошибка ввода → форма снова с введёнными значениями. → сохранённая дата | null */
+async function editDailyActivity(metric, { date, from = null, existing = null } = {}) {
+  const M = ACTIVITY_METRICS[metric];
+  const isSteps = metric === 'steps';
+  let v = { date, value: existing ? actInputValue(metric, existing[M.field]) : '', note: existing ? existing.note || '' : '' };
+  for (;;) {
+    let raw = null;
+    const ok = await showDialog({
+      title: from ? 'Изменить запись' : 'Новая запись',
+      body: `
+        <label class="field__label" for="jr-d">Дата</label>
+        <input class="input" type="date" id="jr-d" value="${esc(v.date)}" max="${esc(dateKey())}">
+        <label class="field__label" for="jr-v" style="margin-top:10px">${isSteps ? 'Шаги за день' : 'Дистанция за день, км'}</label>
+        <input class="input" type="text" id="jr-v" inputmode="${isSteps ? 'numeric' : 'decimal'}" autocomplete="off" value="${esc(v.value)}" placeholder="${isSteps ? '8 450' : '6,4'}">
+        ${isSteps ? '<p class="dialog__muted" style="margin:6px 0 0">Шаги на беговой дорожке — тоже сюда: они входят в общий итог дня.</p>' : ''}
+        <label class="field__label" for="jr-note" style="margin-top:10px">Заметка (необязательно)</label>
+        <input class="input" type="text" id="jr-note" maxlength="${ACTIVITY_NOTE_MAX}" value="${esc(v.note)}">
+      `,
+      actions: [
+        { label: 'Отмена', value: false },
+        { label: from ? 'Сохранить' : 'Добавить', value: true, kind: 'primary', onClick: () => { raw = { date: $('#jr-d').value, value: $('#jr-v').value, note: $('#jr-note').value }; } },
+      ],
+    });
+    if (!ok || !raw) return null;
+    const n = normalizeDailyInput(metric, raw, { today: dateKey() });
+    if (!n.ok) { await alertDialog('Запись не сохранена', actErrorsHtml(n.errors)); v = raw; continue; }
+    try {
+      await Storage.saveDailyActivity(metric, n.value, { from });
+    } catch (err) {
+      if (!(err instanceof ActivityStoreError)) throw err;
+      if (err.code === 'DUPLICATE_DATE') {
+        const old = err.existing || {};
+        const replace = await showDialog({
+          title: 'За эту дату уже есть запись',
+          body: `<p>${esc(fmtDate(n.value.date))}: <b>${esc(fmtActivity(metric, old[M.field]))}</b>.</p><p>Заменить на <b>${esc(fmtActivity(metric, n.value[M.field]))}</b>?</p><p class="dialog__muted">У дня один итог — второй записи за ту же дату не будет.</p>`,
+          actions: [{ label: 'Отмена', value: false }, { label: 'Заменить', value: true, kind: 'primary' }],
+        });
+        if (!replace) return null;
+        try { await Storage.saveDailyActivity(metric, n.value, { from, overwrite: true }); } catch (e2) { await alertDialog('Запись не сохранена', `<p>${esc(e2.message)}</p>`); return null; }
+      } else {
+        await alertDialog(err.code === 'NOT_FOUND' ? 'Запись не найдена' : 'Запись не сохранена', `<p>${esc(err.message)}</p>`);
+        return null;
+      }
+    }
+    flash(from && from !== n.value.date ? `Перенесено на ${fmtDate(n.value.date)}` : from ? 'Сохранено ✓' : `${fmtActivity(metric, n.value[M.field])} · ${fmtDate(n.value.date)}`);
+    return n.value.date;
+  }
+}
+async function deleteDailyActivity(metric, date, entry) {
+  const M = ACTIVITY_METRICS[metric];
+  const ok = await showDialog({
+    title: 'Удалить запись?',
+    body: `<p>${esc(fmtDate(date))}: <b>${esc(fmtActivity(metric, entry[M.field]))}</b>.</p><p class="dialog__muted">Будет удалён итог только этого дня.</p>`,
+    actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+  });
+  if (!ok) return false;
+  if (!(await Storage.removeDailyActivity(metric, date))) { await alertDialog('Запись не найдена', '<p>Данные изменились. Ничего не удалено.</p>'); return false; }
+  flash('Удалено');
+  return true;
+}
+/* Поездка: добавить (presetDate) или изменить ride — время, км, минуты, заметка, дата (перенос). → дата | null */
+async function editRide(ride, presetDate = dateKey()) {
+  const today = dateKey();
+  let v = ride
+    ? { date: ride.date, time: ride.time || '', km: actInputValue('bike', ride.km), minutes: ride.minutes ?? '', note: ride.note || '' }
+    : { date: presetDate, time: presetDate === today ? hhmmNow() : '', km: '', minutes: '', note: '' };
+  for (;;) {
+    let raw = null;
+    const ok = await showDialog({
+      title: ride ? 'Изменить поездку' : 'Новая поездка',
+      body: `
+        <label class="field__label" for="jr-d">Дата</label>
+        <input class="input" type="date" id="jr-d" value="${esc(v.date)}" max="${esc(today)}">
+        <label class="field__label" for="jr-t" style="margin-top:10px">Время (необязательно)</label>
+        <input class="input" type="time" id="jr-t" value="${esc(v.time)}">
+        <label class="field__label" for="jr-km" style="margin-top:10px">Дистанция, км</label>
+        <input class="input" type="text" id="jr-km" inputmode="decimal" autocomplete="off" value="${esc(v.km)}" placeholder="7,4">
+        <label class="field__label" for="jr-min" style="margin-top:10px">Время в пути, мин (необязательно)</label>
+        <input class="input" type="text" id="jr-min" inputmode="numeric" autocomplete="off" value="${esc(v.minutes)}">
+        <label class="field__label" for="jr-note" style="margin-top:10px">Заметка (необязательно)</label>
+        <input class="input" type="text" id="jr-note" maxlength="${ACTIVITY_NOTE_MAX}" value="${esc(v.note)}">
+      `,
+      actions: [
+        { label: 'Отмена', value: false },
+        { label: ride ? 'Сохранить' : 'Добавить', value: true, kind: 'primary', onClick: () => { raw = { date: $('#jr-d').value, time: $('#jr-t').value, km: $('#jr-km').value, minutes: $('#jr-min').value, note: $('#jr-note').value }; } },
+      ],
+    });
+    if (!ok || !raw) return null;
+    const n = normalizeRideInput(raw, { today });
+    if (!n.ok) { await alertDialog('Поездка не сохранена', actErrorsHtml(n.errors)); v = raw; continue; }
+    try {
+      if (ride) {
+        if (!(await Storage.updateBikeRide(ride.id, n.value))) { await alertDialog('Поездка не найдена', '<p>Данные изменились, пока была открыта форма. Ничего не изменено.</p>'); return null; }
+      } else {
+        await Storage.addBikeRide(n.value);
+      }
+    } catch (err) {
+      if (!(err instanceof ActivityStoreError)) throw err;
+      await alertDialog('Поездка не сохранена', `<p>${esc(err.message)}</p>`);
+      return null;
+    }
+    flash(ride && ride.date !== n.value.date ? `Перенесено на ${fmtDate(n.value.date)}` : ride ? 'Сохранено ✓' : `${n.value.km != null ? `+${fmtActivityValue('bike', n.value.km)} км` : 'Поездка добавлена'} · ${fmtDate(n.value.date)}`);
+    return n.value.date;
+  }
+}
+async function deleteRide(ride) {
+  const ok = await showDialog({
+    title: 'Удалить поездку?',
+    body: `<p>${esc(fmtDate(ride.date))}, <b>${esc(rideTitle(ride))}</b>.</p><p class="dialog__muted">Будет удалена только эта поездка; итог дня пересчитается.</p>`,
+    actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+  });
+  if (!ok) return false;
+  if (!(await Storage.removeBikeRide(ride.id))) { await alertDialog('Поездка не найдена', '<p>Данные изменились. Ничего не удалено.</p>'); return false; }
+  flash('Удалено');
+  return true;
+}
+
+async function ActivityMetricScreen(metric) {
+  const M = ACTIVITY_METRICS[metric];
+  const today = dateKey();
+  const saved = readEntryUi(`act-${metric}`) || {};
+  const okDay = (d) => typeof d === 'string' && WL_DATE_RE.test(d) && d <= today;
+  const ui = {
+    kind: ACT_PERIOD_KINDS.includes(saved.kind) ? saved.kind : 'week',
+    anchor: okDay(saved.anchor) ? saved.anchor : today,
+    day: okDay(saved.day) ? saved.day : today,
+  };
+  const screen = el(`<div class="act act--${metric}"></div>`);
+  const daySlot = el('<div></div>'), statsSlot = el('<section class="section act-stats" aria-labelledby="act-st-title"></section>'), recentSlot = el('<section class="section act-recent"></section>');
+  screen.append(backHeader(M.title, { fallback: 'home' }), daySlot, statsSlot, recentSlot);
+  let store, values, byDate;
+
+  async function reload() {
+    store = await Storage.getActivityStore(metric);
+    values = dayValues(metric, store);
+    byDate = metric === 'bike' ? ridesByDate(store) : null;
+    paintAll();
+  }
+  function paintAll() { paintDay(); paintStats(); paintRecent(); }
+  const remember = () => saveEntryUi(`act-${metric}`, { ...ui });
+
+  /* 1. Выбранный день: значение, переход по дням, «Сегодня», добавить / изменить, журнал */
+  function paintDay() {
+    remember();
+    const d = ui.day;
+    const v = values[d] ?? null;
+    const entry = metric === 'bike' ? null : store[d] || null;
+    const rides = metric === 'bike' ? byDate.get(d) || [] : [];
+    const val = v != null ? `${esc(fmtActivityValue(metric, v))} <small>${esc(activityUnit(metric, v))}</small>` : rides.length ? NO_KM : 'Нет записи';
+    let sub = '';
+    if (entry) sub = dailySub(entry);
+    else if (rides.length) sub = `${plRides(rides.length)}: ${rides.map((r) => esc(rideTitle(r))).join(', ')}`;
+    const action = entry ? 'Изменить' : 'Добавить'; // у велосипеда — всегда новая поездка (правка — в журнале)
+    const card = el(`
+      <section class="card sleep-last act-day" aria-label="${esc(M.title)}: выбранный день">
+        <div class="act-day__nav">
+          <button class="cal-nav__btn sleep-nav__btn" type="button" data-dd="-1" aria-label="Предыдущий день">‹</button>
+          <span class="act-day__when" aria-live="polite">${esc(sleepDayWord(d, today))}</span>
+          ${d !== today ? '<button class="sleep-today" type="button" data-dtoday>Сегодня</button>' : ''}
+          <button class="cal-nav__btn sleep-nav__btn" type="button" data-dd="1" aria-label="Следующий день" ${d >= today ? 'disabled' : ''}>›</button>
+        </div>
+        <p class="sleep-last__dur act-day__val">${val}</p>
+        ${sub ? `<p class="sleep-last__meta act-day__sub">${sub}</p>` : ''}
+        <div class="act-day__actions">
+          <button class="btn-primary btn-primary--brand act-day__edit" type="button">${entry ? '' : homeIcon('plus')}<span>${action}</span></button>
+          <a class="btn-ghost act-day__log" href="#/${M.logRoute}/${d}">Журнал</a>
+        </div>
+      </section>
+    `);
+    card.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-dd], [data-dtoday]');
+      if (!b || b.disabled) return;
+      ui.day = b.hasAttribute('data-dtoday') ? today : sleepAddDays(d, Number(b.dataset.dd));
+      if (ui.day > today) ui.day = today;
+      paintDay();
+    });
+    $('.act-day__edit', card).addEventListener('click', async () => {
+      const saved = metric === 'bike' ? await editRide(null, d) : await editDailyActivity(metric, { date: d, from: entry ? d : null, existing: entry });
+      if (saved) { ui.day = saved; await reload(); }
+    });
+    daySlot.replaceChildren(card);
+  }
+
+  /* 2. Статистика выбранного периода: среднее, график, лучший день, минимум, дни с данными, сумма.
+     Всё — из одного activityPeriodStats, поэтому смена периода пересчитывает все цифры сразу. */
+  function paintStats() {
+    remember();
+    const b = periodBounds(ui.kind, ui.anchor);
+    const next = shiftPeriod(b, 1);
+    const st = activityPeriodStats(values, ui.kind, ui.anchor, today);
+    const cmp = comparePrevPeriod(values, ui.kind, ui.anchor, today);
+    const unitOf = (v) => activityUnit(metric, v);
+    statsSlot.innerHTML = '';
+    statsSlot.appendChild(el('<div class="section__head"><h2 class="section__title" id="act-st-title">Статистика</h2></div>'));
+    const seg = el(`<div class="st-period" role="group" aria-label="Период статистики">${SLEEP_KINDS.map(([k, t]) => `<button class="st-period__btn${k === ui.kind ? ' is-active' : ''}" type="button" data-k="${k}" aria-pressed="${k === ui.kind}">${t}</button>`).join('')}</div>`);
+    seg.addEventListener('click', (e) => { const x = e.target.closest('[data-k]'); if (x && x.dataset.k !== ui.kind) { ui.kind = x.dataset.k; ui.anchor = today; paintStats(); } });
+    const nav = el(`
+      <div class="sleep-nav">
+        <button class="cal-nav__btn sleep-nav__btn" type="button" data-d="-1" aria-label="Предыдущий период">‹</button>
+        <span class="sleep-nav__title" aria-live="polite">${esc(sleepPeriodTitle(b))}</span>
+        <button class="cal-nav__btn sleep-nav__btn" type="button" data-d="1" aria-label="Следующий период"${next.start > today ? ' disabled' : ''}>›</button>
+      </div>
+    `);
+    nav.addEventListener('click', (e) => { const x = e.target.closest('[data-d]'); if (x && !x.disabled) { ui.anchor = shiftPeriod(b, Number(x.dataset.d)).start; paintStats(); } });
+    statsSlot.append(seg, nav);
+
+    if (!st.daysWithData) {
+      statsSlot.appendChild(el(`
+        <div class="card st-empty sleep-wait act-empty">
+          <p class="st-empty__title">За этот период записей нет</p>
+          <p class="st-empty__sub">Выберите другой период или добавьте запись — в журнале можно внести данные за любую прошлую дату.</p>
+        </div>
+      `));
+      return;
+    }
+    const PREV = { week: 'прошлой неделей', month: 'прошлым месяцем', year: 'прошлым годом' };
+    const card = el(`
+      <div class="card st-card sleep-card act-card">
+        <p class="sleep-kpi__label">В среднем за день</p>
+        <p class="sleep-kpi__val act-avg">${esc(fmtActivityValue(metric, st.average))} <small>${esc(unitOf(st.average))}</small></p>
+        <p class="sleep-kpi__sub">по ${st.daysWithData} ${daysDat(st.daysWithData)} с записями из ${st.elapsedDays}${cmp ? ` · ${cmp.delta >= 0 ? '+' : '−'}${esc(fmtActivity(metric, Math.abs(cmp.delta)))} по сравнению с ${PREV[ui.kind]}` : ''}</p>
+      </div>
+    `);
+    const bars = st.bars.map((x) => ({ start: dayNum(x.start), end: dayNum(x.end), value: x.value, src: x }));
+    const xLabels = ui.kind === 'year'
+      ? bars.map((x, i) => ({ day: x.start + 14, label: SLEEP_MONTHS[i] }))
+      : ui.kind === 'week'
+        ? bars.map((x, i) => ({ day: x.start, label: SLEEP_WD[i] }))
+        : bars.filter((x) => [1, 5, 10, 15, 20, 25, 30].includes(Number(x.src.start.slice(8)))).map((x) => ({ day: x.start, label: String(Number(x.src.start.slice(8))) }));
+    card.appendChild(svgBarChart({
+      range: { start: dayNum(st.start), end: dayNum(st.end) }, bars, fit: false, xLabels,
+      minSpan: metric === 'steps' ? 2000 : 2,
+      color: 'var(--viz-1)',
+      ariaLabel: `${M.title}, ${sleepPeriodTitle(b)}: в среднем ${fmtActivity(metric, st.average)} за день. Выберите столбец, чтобы увидеть значение.`,
+      readout: (x) => {
+        const s = x.src;
+        if (s.kind === 'month') {
+          const name = capFirst(new Date(`${s.start}T00:00:00`).toLocaleDateString(RU, { month: 'long' }));
+          if (s.value == null) return `<span class="chart__rv chart__rv--muted">нет записей</span><span class="chart__rd">${esc(name)}</span>`;
+          return `<span class="chart__rv">${esc(fmtActivity(metric, s.value))} <small>в среднем</small></span><span class="chart__rd">${esc(name)} · ${s.days} ${daysWord(s.days)} с записями · всего ${esc(fmtActivity(metric, s.total))}</span>`;
+        }
+        const dayTxt = capFirst(new Date(`${s.date}T00:00:00`).toLocaleDateString(RU, { weekday: 'short', day: 'numeric', month: 'short' }));
+        if (s.value == null) return `<span class="chart__rv chart__rv--muted">нет записи</span><span class="chart__rd">${esc(dayTxt)}</span>`;
+        const n = metric === 'bike' ? (byDate.get(s.date) || []).length : 0;
+        return `<span class="chart__rv">${esc(fmtActivity(metric, s.value))}</span><span class="chart__rd">${esc(dayTxt)}${n ? ` · ${plRides(n)}` : ''}</span>`;
+      },
+    }));
+    const best = st.max, min = st.min;
+    card.appendChild(el(`
+      <div class="sgrid sleep-grid act-grid">
+        <div class="sgrid__item"><div class="sgrid__label">Лучший день</div><div class="sgrid__val act-best">${esc(fmtActivity(metric, best.value))}</div><div class="sgrid__sub">${esc(sleepDayMonth(best.date, today))}</div></div>
+        <div class="sgrid__item"><div class="sgrid__label">Минимум</div><div class="sgrid__val act-min">${esc(fmtActivity(metric, min.value))}</div><div class="sgrid__sub">${esc(sleepDayMonth(min.date, today))}</div></div>
+        <div class="sgrid__item"><div class="sgrid__label">Дней с данными</div><div class="sgrid__val act-days">${st.daysWithData} из ${st.elapsedDays}</div><div class="sgrid__sub">${esc(sleepPeriodTitle(b))}</div></div>
+        <div class="sgrid__item"><div class="sgrid__label">Всего за период</div><div class="sgrid__val act-total">${esc(fmtActivity(metric, st.total))}</div><div class="sgrid__sub">сумма записанных дней</div></div>
+      </div>
+    `));
+    card.appendChild(el(`<p class="st-note">Среднее, минимум и лучший день — только по дням с записями: пропущенный день не считается нулём.${ui.kind === 'year' ? ' Год показан по месяцам (среднее за день с записями); записи каждого дня сохраняются как есть.' : ''}${metric === 'bike' ? ' Итог дня — сумма дистанций всех поездок; поездки без дистанции в километры не входят.' : ''}</p>`));
+    statsSlot.appendChild(card);
+  }
+
+  /* 3. Последние записи → журнал на дату записи */
+  function paintRecent() {
+    recentSlot.innerHTML = '';
+    const head = el(`<div class="section__head"><h2 class="section__title">Последние записи</h2><a class="section__action" href="#/${M.logRoute}">Журнал ›</a></div>`);
+    const box = el('<div class="list-card"></div>');
+    let items;
+    if (metric === 'bike') {
+      items = store.filter((r) => r.date <= today).slice(0, 5).map((r) => ({ date: r.date, title: rideTitle(r), trailing: '' }));
+    } else {
+      items = Object.keys(store).filter((d) => d <= today).sort().reverse().slice(0, 5).map((d) => ({ date: d, title: fmtActivity(metric, store[d][M.field]), trailing: '' }));
+    }
+    if (!items.length) box.appendChild(el(`<div class="empty">Записей пока нет. Добавьте первую — за сегодня или любую прошлую дату.</div>`));
+    items.forEach((x) => {
+      box.appendChild(el(`
+        <a class="row act-row" href="#/${M.logRoute}/${x.date}">
+          <div class="row__body"><p class="row__title">${esc(x.title)}</p><p class="row__sub">${esc(capFirst(sleepDayMonth(x.date, today)))}</p></div>
+          <span class="row__chevron" aria-hidden="true">›</span>
+        </a>
+      `));
+    });
+    recentSlot.append(head, box);
+  }
+
+  await reload();
+  return screen;
+}
+
+/* Журнал шагов / дистанции пешком / поездок — тот же журнал, что у воды */
+async function ActivityLogScreen(metric, param) {
+  const M = ACTIVITY_METRICS[metric];
+  const screen = el(`<div class="act-log act-log--${metric}"></div>`);
+  const today = dateKey();
+  let { month, focusDay } = journalState(param, today);
+  const go = (m, d = null) => { month = m; focusDay = d; replaceUrl(`${M.logRoute}/${d || m}`); paint(); };
+  const after = async (saved) => { if (saved) go(saved.slice(0, 7), saved); };
+
+  async function paint() {
+    const store = await Storage.getActivityStore(metric);
+    screen.innerHTML = '';
+    screen.appendChild(backHeader(ACT_JOURNAL_TITLE[metric], { fallback: M.route }));
+    let days, summary;
+    const byDate = metric === 'bike' ? ridesByDate(store) : null;
+    if (metric === 'bike') {
+      days = [...byDate.keys()].filter((d) => d.startsWith(`${month}-`)).sort().reverse();
+      const rides = days.reduce((s, d) => s + byDate.get(d).length, 0);
+      const kmDays = days.map((d) => rideDayKm(byDate.get(d))).filter((x) => x != null);
+      const km = kmDays.reduce((s, x) => s + x, 0);
+      summary = `За месяц: ${plRides(rides)} · ${days.length} ${plural(days.length, 'день', 'дня', 'дней')} · ${kmDays.length ? esc(fmtActivity('bike', km)) : NO_KM.toLowerCase()}`;
+    } else {
+      days = Object.keys(store).filter((d) => d.startsWith(`${month}-`)).sort().reverse();
+      const total = days.reduce((s, d) => s + store[d][M.field], 0);
+      summary = `За месяц: ${days.length} ${plural(days.length, 'день', 'дня', 'дней')} с записями${days.length ? ` · всего ${esc(fmtActivity(metric, total))} · в среднем ${esc(fmtActivity(metric, total / days.length))} за день` : ''}`;
+    }
+    screen.appendChild(journalControls({
+      prefix: 'jr', month, focusDay, today, summary,
+      addLabel: metric === 'bike' ? '+ Добавить поездку' : '+ Добавить запись',
+      onGo: go,
+      onAdd: async () => after(metric === 'bike' ? await editRide(null, focusDay || today) : await editDailyActivity(metric, { date: focusDay || today })),
+    }));
+    if (!days.length) screen.appendChild(el(`<p class="empty">В этом месяце записей нет.</p>`));
+    journalFocus(screen, 'jr', focusDay, days.includes(focusDay));
+
+    days.forEach((d) => {
+      if (metric === 'bike') {
+        const list = byDate.get(d);
+        const km = rideDayKm(list);
+        const sec = journalDay({ prefix: 'jr', date: d, focus: d === focusDay, totalHtml: km != null ? esc(fmtActivity('bike', km)) : `<span class="jday__nokm">${NO_KM}</span>` });
+        list.forEach((r) => $('.list-card', sec).appendChild(journalRow({
+          titleHtml: esc(rideTitle(r)), subHtml: rideSub(r), label: rideTitle(r),
+          onEdit: async () => after(await editRide(r)),
+          onDelete: async () => { if (await deleteRide(r)) go(month, d); },
+        })));
+        screen.appendChild(sec);
+      } else {
+        const e = store[d];
+        const sec = journalDay({ prefix: 'jr', date: d, focus: d === focusDay, totalHtml: esc(fmtActivity(metric, e[M.field])) });
+        $('.list-card', sec).appendChild(journalRow({
+          titleHtml: esc(fmtActivity(metric, e[M.field])), subHtml: dailySub(e), label: fmtDate(d),
+          onEdit: async () => after(await editDailyActivity(metric, { date: d, from: d, existing: e })),
+          onDelete: async () => { if (await deleteDailyActivity(metric, d, e)) go(month, d); },
+        }));
+        screen.appendChild(sec);
+      }
+    });
+  }
+
+  await paint();
+  return screen;
+}
+
+/* Журнал сна (#/sleep-log[/ГГГГ-ММ | /ГГГГ-ММ-ДД]) — тот же журнал. День — дата пробуждения;
+   ✎ открывает форму записи (там же меняется дата), «+ Добавить» — форму на выбранную дату.
+   Форма после сохранения / удаления возвращается сюда (SleepFormScreen: backTo). */
+async function SleepLogScreen(param) {
+  const screen = el('<div class="sleep-log"></div>');
+  const today = dateKey();
+  let { month, focusDay } = journalState(param, today);
+  const go = (m, d = null) => { month = m; focusDay = d; replaceUrl(`sleep-log/${d || m}`); paint(); };
+
+  async function paint() {
+    const entries = await Storage.getSleepEntries();
+    const inMonth = entries.filter((e) => e.date.startsWith(`${month}-`));
+    const days = [...new Set(inMonth.map((e) => e.date))].sort().reverse();
+    const avg = inMonth.length ? averageSleep(inMonth) : null;
+    screen.innerHTML = '';
+    screen.appendChild(backHeader('Журнал сна', { fallback: 'sleep' }));
+    screen.appendChild(journalControls({
+      prefix: 'jr', month, focusDay, today, onGo: go,
+      summary: `За месяц: ${inMonth.length} ${plural(inMonth.length, 'запись', 'записи', 'записей')}${avg != null ? ` · в среднем ${esc(formatSleepDuration(avg))}` : ''}`,
+      onAdd: () => { location.hash = `#/sleep/new/${focusDay || today}`; },
+    }));
+    if (!days.length) screen.appendChild(el('<p class="empty">В этом месяце записей сна нет.</p>'));
+    journalFocus(screen, 'jr', focusDay, days.includes(focusDay));
+    days.forEach((d) => {
+      const list = inMonth.filter((e) => e.date === d);
+      const sec = journalDay({ prefix: 'jr', date: d, focus: d === focusDay, totalHtml: esc(formatSleepDuration(list[0].durationMinutes)) });
+      list.forEach((e) => {
+        const q = qualityInfo(e.quality);
+        const sub = [q ? `${q.emoji} ${esc(q.label)}` : '', esc(sleepMeta(e))].filter(Boolean).join(' · ');
+        $('.list-card', sec).appendChild(journalRow({
+          titleHtml: `${esc(formatSleepDuration(e.durationMinutes))} · ${esc(sleepTimes(e))}`, subHtml: sub, label: sleepTimes(e),
+          onEdit: () => { location.hash = `#/sleep/${encodeURIComponent(e.id)}`; },
+          onDelete: async () => {
+            const ok = await showDialog({
+              title: 'Удалить запись сна?',
+              body: `<p>${esc(fmtDate(d))}: <b>${esc(formatSleepDuration(e.durationMinutes))}</b>, ${esc(sleepTimes(e))}.</p><p class="dialog__muted">Будет удалена только эта запись.</p>`,
+              actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+            });
+            if (!ok) return;
+            try { if (!(await Storage.removeSleepEntry(e.id))) { await alertDialog('Запись не найдена', '<p>Данные изменились. Ничего не удалено.</p>'); } else flash('Удалено'); } catch { flash('Не удалось удалить'); }
+            go(month, d);
+          },
+        }));
+      });
+      screen.appendChild(sec);
+    });
+  }
+
+  await paint();
+  return screen;
+}
+
 async function ThemeScreen() {
   const screen = el('<div></div>');
   function paint() {
@@ -3612,58 +4156,6 @@ function legacyNotice() {
 /* Footer с версией (Настройки, Drawer): номер — из APP_VERSION, дата релиза — из APP_UPDATED */
 function appFooter() {
   return el(`<footer class="app-footer"><p class="app-footer__name">LexLife · v${esc(APP_VERSION)}</p><p class="app-footer__date">Обновлено: ${esc(APP_UPDATED)}</p></footer>`);
-}
-
-/* ---------- под-экран: Активность ---------- */
-async function ActivityScreen() {
-  const screen = el('<div></div>');
-  const goals = await Storage.getGoals();
-  let intensity = 'Средняя';
-  async function paint() {
-    const [today, streak, waterToday] = await Promise.all([Storage.getActivity(), Storage.getStreak(), Storage.getWater()]);
-    const cur = today || {};
-    intensity = cur.bikeIntensity || intensity;
-    screen.innerHTML = '';
-    screen.appendChild(backHeader('Активность'));
-    const stats = el(`
-      <div class="stat-row">
-        <div class="stat"><div class="stat__num">${streak} 🔥</div><div class="stat__label">дней подряд</div></div>
-        <div class="stat stat--link" data-route="metric/water"><div class="stat__num">${fmtMl(waterToday)} мл</div><div class="stat__label">вода сегодня ›</div></div>
-      </div>
-    `);
-    $('[data-route="metric/water"]', stats).addEventListener('click', () => { location.hash = '#/metric/water'; });
-    screen.appendChild(stats);
-
-    const bike = el(`
-      <div class="input-card">
-        <div class="input-card__head"><span class="input-card__emoji">🚴</span><span class="input-card__title">Велотренажёр</span></div>
-        <div class="field"><label class="field__label">Длительность (минуты), цель ${goals.bike_minutes}</label><input class="input" type="number" inputmode="numeric" id="a-bike" value="${esc(cur.bike ?? '')}" placeholder="0"></div>
-        <label class="field__label">Интенсивность</label><div class="seg" id="a-intensity"></div>
-      </div>
-    `);
-    const seg = $('#a-intensity', bike);
-    ['Лёгкая', 'Средняя', 'Интенсивная'].forEach((lvl) => {
-      const b = el(`<button class="seg__btn ${lvl === intensity ? 'is-active' : ''}" type="button">${lvl}</button>`);
-      b.addEventListener('click', () => { intensity = lvl; $$('.seg__btn', seg).forEach((x) => x.classList.toggle('is-active', x.textContent === lvl)); });
-      seg.appendChild(b);
-    });
-    screen.appendChild(bike);
-    screen.appendChild(el(`<div class="input-card"><div class="input-card__head"><span class="input-card__emoji">👟</span><span class="input-card__title">Шаги</span></div><div class="field" style="margin:0"><label class="field__label">Количество, цель ${goals.steps}</label><input class="input" type="number" inputmode="numeric" id="a-steps" value="${esc(cur.steps ?? '')}" placeholder="0"></div></div>`));
-    const plank = cur.plank || [];
-    screen.appendChild(el(`<div class="input-card"><div class="input-card__head"><span class="input-card__emoji">🧘</span><span class="input-card__title">Планка</span></div><div class="field"><label class="field__label">Подходов</label><input class="input" type="number" inputmode="numeric" id="a-plank-sets" value="${plank.length || ''}" placeholder="0"></div><div class="field" style="margin:0"><label class="field__label">Секунд в подходе, цель ${goals.plank_seconds}</label><input class="input" type="number" inputmode="numeric" id="a-plank-sec" value="${plank[0] ?? ''}" placeholder="0"></div></div>`));
-    screen.appendChild(el(`<div class="input-card"><div class="input-card__head"><span class="input-card__emoji">➕</span><span class="input-card__title">Другое упражнение</span></div><div class="field"><label class="field__label">Тип</label><input class="input" type="text" id="a-other-type" value="${esc(cur.otherType ?? '')}" placeholder="напр. плавание"></div><div class="field" style="margin:0"><label class="field__label">Длительность (минуты)</label><input class="input" type="number" inputmode="numeric" id="a-other-min" value="${esc(cur.otherMin ?? '')}" placeholder="0"></div></div>`));
-    const save = el('<button class="btn-primary" type="button">Сохранить день</button>');
-    save.addEventListener('click', onSave);
-    screen.appendChild(save);
-  }
-  async function onSave() {
-    const num = (id) => { const v = $(`#${id}`, screen).value; return v === '' ? null : Number(v); };
-    const sets = num('a-plank-sets') || 0, sec = num('a-plank-sec') || 0;
-    await Storage.saveActivity({ bike: num('a-bike'), bikeIntensity: intensity, steps: num('a-steps'), plank: sets > 0 ? Array(sets).fill(sec) : [], otherType: $('#a-other-type', screen).value.trim(), otherMin: num('a-other-min') });
-    await paint(); flash('День сохранён ✓');
-  }
-  await paint();
-  return screen;
 }
 
 /* ---------- под-экран: Архив ---------- */
@@ -4491,8 +4983,9 @@ const ST = {
   spo2: { name: 'Сатурация', gen: 'сатурации', unit: '%', d: 0, minSpan: 4 },
   glucose: { name: 'Глюкоза', gen: 'глюкозы', unit: 'ммоль/л', d: 1, minSpan: 2 },
   water: { name: 'Потребление воды', gen: 'потребления воды', unit: 'мл', d: 0 },
-  activityMin: { name: 'Время активности', gen: 'времени активности', unit: 'мин', d: 0 },
   steps: { name: 'Количество шагов', gen: 'количества шагов', unit: 'шагов', d: 0 },
+  walk: { name: 'Дистанция пешком', gen: 'пешей дистанции', unit: 'км', d: 1 },
+  bike: { name: 'Дистанция на велосипеде', gen: 'дистанции на велосипеде', unit: 'км', d: 1 },
 };
 const POINT_KEYS = ['weight', 'pulse', 'temperature', 'spo2', 'glucose'];
 const EXTRA_KEYS = ['spo2', 'glucose', 'temperature'];
@@ -4520,14 +5013,14 @@ function lastLabel(point, today) {
 const pressureTxt = (s, d) => (s && d ? `${fmtN(s, 0)}/${fmtN(d, 0)}` : '—');
 
 async function StatsScreen() {
-  const [metricsLog, metricsConfig, activityDays, activityGoals, tests, medLog, meds, medIntakes] = await Promise.all([
-    Storage.getMetricsLog(), Storage.getMetricsConfig(), Storage.getAllActivity(), Storage.getGoals(),
+  const [metricsLog, metricsConfig, tests, medLog, meds, medIntakes, stepsLog, walkLog, bikeLog] = await Promise.all([
+    Storage.getMetricsLog(), Storage.getMetricsConfig(),
     Storage.getTests(), Storage.getAllMedLog(), Storage.getMeds(), Storage.getAllMedIntakes(),
+    Storage.getDailyActivityLog('steps'), Storage.getDailyActivityLog('walk'), Storage.getBikeRides(),
   ]);
-  const engine = createStatsEngine({ metricsLog, metricsConfig, activityDays, activityGoals, tests, medLog, medIntakes, meds, testFields: TEST_FIELDS }, dateKey());
+  const engine = createStatsEngine({ metricsLog, metricsConfig, tests, medLog, medIntakes, meds, stepsLog, walkLog, bikeLog, testFields: TEST_FIELDS }, dateKey());
   const screen = el('<div class="stats"></div>');
   let period = loadStatsPeriod();
-  let actMode = null;
 
   screen.addEventListener('click', (e) => {
     const sc = e.target.closest('[data-scroll]');
@@ -4559,7 +5052,9 @@ async function StatsScreen() {
             <button class="btn-ghost" type="button" data-route="metric/weight">⚖️ Вес</button>
             <button class="btn-ghost" type="button" data-route="metric/pressure">🩸 Давление</button>
             <button class="btn-ghost" type="button" data-route="metric/water">💧 Вода</button>
-            <button class="btn-ghost" type="button" data-route="activity">🏃 Активность</button>
+            <button class="btn-ghost" type="button" data-route="steps">👟 Шаги</button>
+            <button class="btn-ghost" type="button" data-route="walk">🚶 Пешком</button>
+            <button class="btn-ghost" type="button" data-route="bike">🚴 Велосипед</button>
           </div>
         </div>
       `));
@@ -4575,7 +5070,7 @@ async function StatsScreen() {
     screen.appendChild(pressureSection(m));
     screen.appendChild(pointSection(m, 'pulse', '❤️'));
     screen.appendChild(waterSection(m));
-    screen.appendChild(activitySection(m));
+    ACTIVITY_KEYS.forEach((k) => screen.appendChild(activityStatSection(m, k)));
     EXTRA_KEYS.forEach((k) => { if (m[k].points.length) screen.appendChild(pointSection(m, k, METRICS[k].emoji)); });
     if (m.tests.total) screen.appendChild(testsSection(m));
     screen.appendChild(dataSection(m));
@@ -4620,16 +5115,16 @@ async function StatsScreen() {
       sub: !wa.points.length ? (wa.totalDays ? 'нет записей за период' : 'Недостаточно данных')
         : gc ? `цель в ${fmtN(gc.pct * 100, 0)}% дней с записями` : `по ${wa.points.length} ${daysDat(wa.points.length)} с записями`,
     }));
-    const a = m.activity, am = a.minutes, as = a.steps;
-    const useSteps = !am.points.length && as.points.length;
-    const actGoal = useSteps ? as.goalCompletion : a.bike.goalCompletion;
-    cards.push(card({
-      id: 'st-activity', emoji: '🏃', name: 'Активность',
-      val: am.points.length ? fmtN(am.stats.avg, 0) : as.points.length ? fmtN(as.stats.avg, 0) : '—',
-      unit: useSteps ? 'шагов/день' : 'мин/день',
-      sub: !a.recordedDays ? (a.totalDays ? 'нет записей за период' : 'Недостаточно данных')
-        : `активных дней: ${a.activeDays}${actGoal && actGoal.daysWithData ? ` · цель ${useSteps ? 'шагов' : 'вело'}: ${fmtN(actGoal.pct * 100, 0)}%` : ''}`,
-    }));
+    ACTIVITY_KEYS.forEach((k) => {
+      const b = m[k], A = ACTIVITY_METRICS[k];
+      const noKm = k === 'bike' && !b.points.length && b.noKm.count;
+      cards.push(card({
+        id: `st-${k}`, emoji: A.emoji, name: A.title,
+        val: b.points.length ? fmtActivityValue(k, b.stats.avg) : '—', unit: k === 'steps' ? 'шагов/день' : 'км/день',
+        sub: b.points.length ? `по ${b.stats.days} ${daysDat(b.stats.days)} с записями`
+          : noKm ? `${plRides(b.noKm.count)} без дистанции` : (b.totalDays ? 'нет записей за период' : 'Недостаточно данных'),
+      }));
+    });
     EXTRA_KEYS.forEach((k) => {
       const b = m[k];
       if (!b.totalDays) return;
@@ -4681,8 +5176,9 @@ async function StatsScreen() {
     add('dia', m.pressure.dia);
     add('pulse', m.pulse);
     add('water', m.water, 'мл/день');
-    if (m.activity.minutes.points.length) add('activityMin', m.activity.minutes, 'мин/день');
-    else add('steps', m.activity.steps, 'шагов/день');
+    add('steps', m.steps, 'шагов/день');
+    add('walk', m.walk, 'км/день');
+    add('bike', m.bike, 'км/день');
     EXTRA_KEYS.forEach((k) => add(k, m[k]));
     /* регулярность измерений относительно предыдущего периода */
     [['веса', m.weight], ['давления', m.pressure.sys], ['пульса', m.pulse]].forEach(([gen, b]) => {
@@ -4730,12 +5226,13 @@ async function StatsScreen() {
       if (wc.deltaAvg != null) rows.push(['Среднее потребление воды', `${fmtN(wc.cur.avg)} против ${fmtN(wc.prev.avg)} мл/день · ${daysTxt}${goalTxt}`, `${fmtSigned(roundedDelta(wc.cur.avg, wc.prev.avg))} мл/день`]);
       else rows.push(['Среднее потребление воды', `${wc.cur.count ? 'в предыдущем периоде записей нет' : 'в этом периоде записей нет'} · ${daysTxt}`, wc.cur.count ? `${fmtN(wc.cur.avg)} мл/день` : '—']);
     }
-    const a = m.activity;
-    if (a.recordedDays || a.prevRecordedDays) {
-      const mc = a.minutes.compare;
-      const minTxt = mc.deltaAvg != null ? ` · в среднем ${fmtN(mc.cur.avg)} против ${fmtN(mc.prev.avg)} мин/день` : '';
-      rows.push(['Активных дней', `записи за ${a.recordedDays} против ${a.prevRecordedDays} дн.${minTxt}`, `${a.activeDays} против ${a.prevActiveDays}`]);
-    }
+    [['steps', 'Шаги в среднем', 'шагов/день'], ['walk', 'Пешком в среднем', 'км/день'], ['bike', 'Велосипед в среднем', 'км/день']].forEach(([k, title, unit]) => {
+      const c = m[k].compare, d = ST[k].d;
+      if (!c.cur.days && !c.prev.days) return;
+      const daysTxt = `записи за ${c.cur.days} против ${c.prev.days} дн.`;
+      if (c.deltaAvg != null) rows.push([title, `${fmtN(c.cur.avg, d)} против ${fmtN(c.prev.avg, d)} ${unit} · ${daysTxt}`, `${fmtSigned(roundedDelta(c.cur.avg, c.prev.avg, d), d)} ${unit}`]);
+      else rows.push([title, `${c.cur.days ? 'в предыдущем периоде записей нет' : 'в этом периоде записей нет'} · ${daysTxt}`, c.cur.days ? `${fmtN(c.cur.avg, d)} ${unit}` : '—']);
+    });
     if (m.tests.inPeriod || m.tests.prevInPeriod) rows.push(['Анализов', '', `${m.tests.inPeriod} против ${m.tests.prevInPeriod}`]);
     if (!rows.length) box.appendChild(el('<div class="empty">Нет записей ни в текущем, ни в предыдущем периоде</div>'));
     rows.forEach(([title, sub, trailing]) => box.appendChild(el(`<div class="row"><div class="row__body"><p class="row__title">${esc(title)}</p>${sub ? `<p class="row__sub">${esc(sub)}</p>` : ''}</div><span class="row__trailing st-delta">${esc(trailing)}</span></div>`)));
@@ -4847,14 +5344,14 @@ async function StatsScreen() {
   }
 
   /* ---------- Столбцы по дням / неделям: общий readout ---------- */
-  function bucketReadout(bar, unit, size, extra) {
+  function bucketReadout(bar, unit, size, extra, d = 0) {
     const range = size === 1 ? fmtDay(bar.start) : `${fmtDayShort(bar.start)} — ${fmtDayShort(bar.end)}`;
     if (bar.value == null) return `<span class="chart__rv chart__rv--muted">нет данных</span><span class="chart__rd">${esc(range)}</span>`;
     if (size === 1) {
       const zero = bar.value === 0 ? ' · записано' : '';
-      return `<span class="chart__rv">${esc(fmtN(bar.value))} <small>${esc(unit)}</small></span><span class="chart__rd">${esc(range)}${zero}${extra ? esc(extra(bar.value)) : ''}</span>`;
+      return `<span class="chart__rv">${esc(fmtN(bar.value, d))} <small>${esc(unit)}</small></span><span class="chart__rd">${esc(range)}${zero}${extra ? esc(extra(bar.value)) : ''}</span>`;
     }
-    return `<span class="chart__rv">${esc(fmtN(bar.value))} <small>${esc(unit)}/день</small></span><span class="chart__rd">среднее · ${esc(range)} · записи за ${bar.days} из ${bar.size} дн.</span>`;
+    return `<span class="chart__rv">${esc(fmtN(bar.value, d))} <small>${esc(unit)}/день</small></span><span class="chart__rd">среднее · ${esc(range)} · записи за ${bar.days} из ${bar.size} дн.</span>`;
   }
   const aggNote = (size) => (size === 1 ? '' : size === 7 ? 'Столбец — среднее за неделю по дням с записями.' : 'Столбец — среднее за 30 дней по дням с записями.');
 
@@ -4889,49 +5386,41 @@ async function StatsScreen() {
     return sec;
   }
 
-  /* ---------- Активность ---------- */
-  function activitySection(m) {
-    const a = m.activity;
-    const sec = sectionShell('st-activity', '🏃 Активность', 'activity');
-    const hasMin = a.minutes.points.length > 0, hasSteps = a.steps.points.length > 0;
-    if (!hasMin && !hasSteps) {
-      sec.appendChild(emptyState({ totalDays: a.totalDays, lastAll: a.lastAll }, 'activity', 'записей активности'));
+  /* ---------- Шаги / Дистанция пешком / Велосипед: у каждого свой блок, своё хранилище и свой экран ---------- */
+  function activityStatSection(m, k) {
+    const A = ACTIVITY_METRICS[k], b = m[k];
+    const unit = k === 'steps' ? 'шагов' : 'км';
+    const sec = sectionShell(`st-${k}`, `${A.emoji} ${A.title}`, A.route);
+    /* велотренажёр без дистанции — не 0 км: отдельной строкой, в километры не входит */
+    const noKmNote = k === 'bike' && b.noKm.count
+      ? el(`<p class="st-note st-nokm">Без дистанции: ${plRides(b.noKm.count)}${b.noKm.minutes ? ` · ${b.noKm.minutes} мин` : ''} — дистанция не указана, в километры не входит.</p>`) : null;
+    if (!b.points.length) {
+      sec.appendChild(emptyState({ totalDays: b.totalDays, lastAll: b.lastAll }, A.route, 'записей'));
+      if (noKmNote) sec.appendChild(noKmNote);
       return sec;
     }
-    if (!actMode || (actMode === 'min' && !hasMin) || (actMode === 'steps' && !hasSteps)) actMode = hasMin ? 'min' : 'steps';
     const cardEl = el('<div class="card st-card"></div>');
-    if (hasMin && hasSteps) {
-      const seg = el(`<div class="seg st-subseg"><button class="seg__btn ${actMode === 'min' ? 'is-active' : ''}" data-a="min" type="button">Минуты</button><button class="seg__btn ${actMode === 'steps' ? 'is-active' : ''}" data-a="steps" type="button">Шаги</button></div>`);
-      seg.addEventListener('click', (e) => { const btn = e.target.closest('[data-a]'); if (btn && btn.dataset.a !== actMode) { actMode = btn.dataset.a; sec.replaceWith(activitySection(m)); } });
-      cardEl.appendChild(seg);
-    }
-    const b = actMode === 'min' ? a.minutes : a.steps;
-    const unit = actMode === 'min' ? 'мин' : 'шагов';
-    const goal = actMode === 'steps' && a.steps.goal ? a.steps.goal : null;
     cardEl.appendChild(svgBarChart({
       range: m.range,
       bars: b.buckets,
-      goal: goal ? { value: goal, label: `цель ${fmtN(goal)}` } : null,
-      minSpan: actMode === 'min' ? 30 : 2000,
+      minSpan: k === 'steps' ? 2000 : 2,
       color: 'var(--viz-1)',
-      ariaLabel: `Активность за период: ${a.activeDays} активных дней`,
-      readout: (bar) => bucketReadout(bar, unit, m.bucketSize),
+      ariaLabel: `${A.title} за период: в среднем ${fmtActivity(k, b.stats.avg)} в день, записи за ${b.stats.days} из ${m.range.days} дней`,
+      readout: (bar) => bucketReadout(bar, unit, m.bucketSize, null, k === 'steps' ? 0 : 1),
     }));
-    if (actMode === 'min') cardEl.appendChild(el('<p class="st-note">Минуты = велотренажёр + другое упражнение + планка.</p>'));
     const note = aggNote(m.bucketSize);
     if (note) cardEl.appendChild(el(`<p class="st-note">${esc(note)}</p>`));
-    const items = [
-      ['Среднее', b.points.length ? `${fmtN(b.stats.avg)} ${unit}` : '—', `по ${b.stats.days} ${daysDat(b.stats.days)} с записями`],
-      ['Активных дней', String(a.activeDays), `записи за ${a.recordedDays} из ${m.range.days} дн.`],
-      ['Лучший день', b.best ? `${fmtN(b.best.value)} ${unit}` : '—', b.best ? fmtDayShort(b.best.day) : ''],
-    ];
-    const bg = a.bike.goalCompletion;
-    if (bg && bg.daysWithData) items.push([`Вело ≥ ${a.bike.goal} мин`, `${bg.daysMet} из ${bg.daysWithData}`, `${fmtN(bg.pct * 100)}% дней с записью`]);
-    const sg = a.steps.goalCompletion;
-    if (sg && sg.daysWithData) items.push([`Шаги ≥ ${fmtN(a.steps.goal)}`, `${sg.daysMet} из ${sg.daysWithData}`, `${fmtN(sg.pct * 100)}% дней с записью`]);
-    cardEl.appendChild(el(tiles(items)));
+    const total = b.points.reduce((s, p) => s + p.value, 0);
+    cardEl.appendChild(el(tiles([
+      ['Среднее в день', fmtActivity(k, b.stats.avg), `по ${b.stats.days} ${daysDat(b.stats.days)} с записями`],
+      ['Лучший день', b.best ? fmtActivity(k, b.best.value) : '—', b.best ? fmtDayShort(b.best.day) : ''],
+      ['Минимум', b.stats.min ? fmtActivity(k, b.stats.min.value) : '—', b.stats.min ? fmtDayShort(b.stats.min.day) : ''],
+      ['Дней с данными', `${b.stats.days} из ${m.range.days}`, `записей нет: ${m.range.days - b.stats.days} дн.`],
+      ['Всего за период', fmtActivity(k, total), 'сумма записанных дней'],
+    ])));
+    if (noKmNote) cardEl.appendChild(noKmNote);
     sec.appendChild(cardEl);
-    sec.appendChild(tableView(b.points.length, () => newestFirst(b.points).map((p) => [fmtDate(p.date), `${fmtN(p.value)} ${unit}`])));
+    sec.appendChild(tableView(b.points.length, () => newestFirst(b.points).map((p) => [fmtDate(p.date), fmtActivity(k, p.value)])));
     return sec;
   }
 
@@ -4966,8 +5455,10 @@ async function StatsScreen() {
     pointRow('Пульс', m.pulse, true);
     const w = m.water;
     rows.push(['Вода', w.totalDays ? `записи за ${w.stats.days} ${daysWord(w.stats.days)} из ${m.range.days} · последняя: ${lastLabel(w.lastAll, m.todayDay)}` : 'нет данных', w.totalDays ? `${w.stats.days} из ${m.range.days} дн.` : '']);
-    const a = m.activity;
-    rows.push(['Активность', a.totalDays ? `записи за ${a.recordedDays} ${daysWord(a.recordedDays)} из ${m.range.days} · последняя: ${lastLabel(a.lastAll, m.todayDay)}` : 'нет данных', a.totalDays ? `${a.recordedDays} из ${m.range.days} дн.` : '']);
+    ACTIVITY_KEYS.forEach((k) => {
+      const b = m[k];
+      rows.push([ACTIVITY_METRICS[k].title, b.totalDays ? `записи за ${b.stats.days} ${daysWord(b.stats.days)} из ${m.range.days} · последняя: ${lastLabel(b.lastAll, m.todayDay)}` : 'нет данных', b.totalDays ? `${b.stats.days} из ${m.range.days} дн.` : '']);
+    });
     EXTRA_KEYS.forEach((k) => pointRow(ST[k].name, m[k], false));
     if (m.tests.total) rows.push(['Анализы', `${m.tests.inPeriod} за период · последний: ${fmtDate(m.tests.latest.date)}`, '']);
     if (m.meds.count) rows.push(['Лекарства', `отметки приёма в ${m.meds.markedDays} ${plural(m.meds.markedDays, 'дне', 'днях', 'днях')} из ${m.range.days}`, '']);
@@ -5090,9 +5581,11 @@ const DRAWER_SECTIONS = [
     { route: 'stats', icon: '📈', title: 'Статистика' },
   ],
   [
-    { route: 'activity', icon: '🏃', title: 'Активность' },
     { route: 'sleep', icon: '😴', title: 'Сон' },
     { route: 'metric/water', icon: '💧', title: 'Вода' },
+    { route: 'steps', icon: '👟', title: 'Шаги' },
+    { route: 'walk', icon: '🚶', title: 'Дистанция пешком' },
+    { route: 'bike', icon: '🚴', title: 'Велосипед' },
     { route: 'visits', icon: '🩺', title: 'Врачи и визиты' },
   ],
   [
@@ -5198,7 +5691,7 @@ function guardDrawerTouch(head, scroller) {
 const TAB_ROUTES = ['home', 'metrics', 'meds', 'tests'];
 const SCREENS = {
   home: HomeScreen, metrics: MetricsScreen, meds: MedsScreen, tests: TestsScreen,
-  profile: ProfileScreen, activity: ActivityScreen, visits: VisitsScreen,
+  profile: ProfileScreen, visits: VisitsScreen,
   settings: SettingsScreen, export: ExportScreen, 'water-import': WaterImportScreen, 'history-import': HistoryImportScreen, theme: ThemeScreen,
   notifications: NotificationsScreen, goals: () => Stub('🎯', 'Цели'),
   calendar: CalendarScreen, stats: StatsScreen,
@@ -5215,6 +5708,12 @@ function resolve() {
     return { fn: () => VisitDetailScreen(rest), tab: null, main: false };
   }
   if (h === 'sleep') return { fn: SleepScreen, tab: null, main: false };
+  if (h === 'sleep-log' || h.startsWith('sleep-log/')) return { fn: () => SleepLogScreen(h.slice(10)), tab: null, main: false };
+  for (const k of ACTIVITY_KEYS) {
+    const M = ACTIVITY_METRICS[k];
+    if (h === M.route) return { fn: () => ActivityMetricScreen(k), tab: null, main: false };
+    if (h === M.logRoute || h.startsWith(`${M.logRoute}/`)) return { fn: () => ActivityLogScreen(k, h.slice(M.logRoute.length + 1)), tab: null, main: false };
+  }
   if (h === 'sleep/settings') return { fn: SleepSettingsScreen, tab: null, main: false };
   if (h === 'sleep/new' || h.startsWith('sleep/new/')) return { fn: () => SleepFormScreen(null, h.slice(10) || null), tab: null, main: false };
   if (h.startsWith('sleep/')) return { fn: () => SleepFormScreen(safeDecode(h.slice(6))), tab: null, main: false };

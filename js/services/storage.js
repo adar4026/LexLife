@@ -11,6 +11,10 @@
    ========================================================= */
 
 import { isValidSleepLog, isValidSleepSettings, isValidSleepEntry, normalizeSleepSettings, defaultSleepSettings, findSleepByExternalId, SLEEP_NOTE_MAX } from './sleep.js';
+import {
+  ACTIVITY_METRICS, ACTIVITY_NOTE_MAX, isValidStepsLog, isValidWalkLog, isValidBikeLog, isValidActivityMigration,
+  isValidStepsEntry, isValidWalkEntry, isValidRide, migrateLegacyActivity, sortRides,
+} from './activity.js';
 
 const APP_ID = 'lexlife';
 /* Старые бэкапы (экспортированные до ребрендинга) помечены прежним app id —
@@ -42,12 +46,17 @@ export const KEYS = {
   medIntakes: 'med_intakes',    // приёмы: { "ГГГГ-ММ-ДД": [{ medId, scheduledTime, takenAt }] }
   sleepLog: 'sleep_log',        // сон: [{ id, date (день пробуждения), sleepStart, sleepEnd, durationMinutes, … }] (services/sleep.js)
   sleepSettings: 'sleep_settings', // цель сна, желаемое время, модель будущих напоминаний
+  stepsLog: 'steps_log',        // шаги: { "ГГГГ-ММ-ДД": { steps, note, source, … } } — один итог за день (services/activity.js)
+  walkLog: 'walk_log',          // дистанция пешком: { "ГГГГ-ММ-ДД": { km, note, source, … } } — один итог за день
+  bikeLog: 'bike_log',          // велосипед: [{ id, date, time, km, minutes, note, source, … }] — поездки, итог дня = сумма km
+  activityMigration: 'activity_migration', // отметка однократного переноса из activity_days (входит в бэкап)
 };
 
 /* Ключи с пользовательскими данными (для бэкапа/очистки) — без служебного meta */
 const DATA_KEYS = [
   KEYS.alerts, KEYS.tests, KEYS.meds, KEYS.visits, KEYS.metrics, KEYS.metricsLog, KEYS.profile, KEYS.hydration, KEYS.notifications,
   KEYS.activityDays, KEYS.activityGoals, KEYS.medLog, KEYS.medIntakes, KEYS.sleepLog, KEYS.sleepSettings,
+  KEYS.stepsLog, KEYS.walkLog, KEYS.bikeLog, KEYS.activityMigration,
 ];
 
 /* UI-настройка темы: хранится строкой (не JSON), живёт вне DATA_KEYS, но входит в бэкап (settings.theme) */
@@ -72,9 +81,11 @@ const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 const KEY_LABELS = {
   [KEYS.alerts]: 'Предупреждения', [KEYS.tests]: 'Анализы', [KEYS.meds]: 'Лекарства', [KEYS.visits]: 'Визиты',
   [KEYS.metrics]: 'Цели показателей', [KEYS.metricsLog]: 'История показателей', [KEYS.profile]: 'Профиль',
-  [KEYS.hydration]: 'План воды', [KEYS.notifications]: 'Уведомления', [KEYS.activityDays]: 'Активность',
+  [KEYS.hydration]: 'План воды', [KEYS.notifications]: 'Уведомления', [KEYS.activityDays]: 'Архив прежней версии (activity_days)',
   [KEYS.activityGoals]: 'Цели активности', [KEYS.medLog]: 'Журнал приёма лекарств',
   [KEYS.medIntakes]: 'Приёмы лекарств', [KEYS.sleepLog]: 'Сон', [KEYS.sleepSettings]: 'Настройки сна',
+  [KEYS.stepsLog]: 'Шаги', [KEYS.walkLog]: 'Дистанция пешком', [KEYS.bikeLog]: 'Велосипед',
+  [KEYS.activityMigration]: 'Перенос активности',
 };
 
 /* Ошибка бэкапа с кодом — UI показывает message как есть */
@@ -95,6 +106,16 @@ export class SleepStoreError extends Error {
     this.existing = existing;
   }
 }
+/* Ошибка сохранения шагов / дистанции / поездки: DUPLICATE_DATE (existing — запись этой даты) | INVALID | NO_SPACE */
+export class ActivityStoreError extends Error {
+  constructor(code, message, existing = null) {
+    super(message);
+    this.name = 'ActivityStoreError';
+    this.code = code;
+    this.existing = existing;
+  }
+}
+
 /* Происхождение новой записи: вручную — source 'manual' и пустые поля источника; будущий импорт
    передаёт свои значения (sleepStages — только если есть, у ручных записей поля нет) */
 function sleepProvenance(v) {
@@ -463,6 +484,10 @@ const KEY_VALIDATORS = {
   [KEYS.medIntakes]: mapOf((list, d) => isDateStr(d) && d !== '' && Array.isArray(list) && list.every(MED_INTAKE_OK)),
   [KEYS.sleepLog]: isValidSleepLog,
   [KEYS.sleepSettings]: isValidSleepSettings,
+  [KEYS.stepsLog]: isValidStepsLog,
+  [KEYS.walkLog]: isValidWalkLog,
+  [KEYS.bikeLog]: isValidBikeLog,
+  [KEYS.activityMigration]: isValidActivityMigration,
 };
 
 /* Проверка набора данных финальной схемы; бросает BackupError с названием раздела */
@@ -492,6 +517,9 @@ function summarize(data) {
     notifications: (data[KEYS.notifications] || []).length,
     activityDays: Object.keys(data[KEYS.activityDays] || {}).length,
     sleep: Array.isArray(data[KEYS.sleepLog]) ? data[KEYS.sleepLog].length : 0,
+    steps: Object.keys(data[KEYS.stepsLog] || {}).length,
+    walk: Object.keys(data[KEYS.walkLog] || {}).length,
+    bike: Array.isArray(data[KEYS.bikeLog]) ? data[KEYS.bikeLog].length : 0,
   };
 }
 
@@ -762,7 +790,37 @@ export class StorageService {
     if ((await this._read(KEYS.medIntakes, null)) == null) await this._write(KEYS.medIntakes, {});
     if ((await this._read(KEYS.sleepLog, null)) == null) await this._write(KEYS.sleepLog, []);
     if ((await this._read(KEYS.sleepSettings, null)) == null) await this._write(KEYS.sleepSettings, defaultSleepSettings());
+    await this._ensureActivityKeys();
+    await this._migrateActivity();
     return this;
+  }
+
+  /* Шаги / дистанция / велосипед — аддитивные разделы (как sleep_log): появляются пустыми */
+  async _ensureActivityKeys() {
+    if ((await this._read(KEYS.stepsLog, null)) == null) await this._write(KEYS.stepsLog, {});
+    if ((await this._read(KEYS.walkLog, null)) == null) await this._write(KEYS.walkLog, {});
+    if ((await this._read(KEYS.bikeLog, null)) == null) await this._write(KEYS.bikeLog, []);
+  }
+
+  /* Однократный перенос старой «Активности» (activity_days) в steps_log / bike_log.
+     Отметка activity_migration пишется последней и только после успешной записи данных:
+     сбой посередине → при следующем запуске перенос повторится, но не задублирует
+     (migrateLegacyActivity пропускает занятые даты и уже перенесённые поездки).
+     Отметка есть → ничего не делается (удалённые пользователем записи не возвращаются).
+     activity_days не изменяется. → отметка | null (перенос уже был / не удалось записать) */
+  async _migrateActivity() {
+    if ((await this._read(KEYS.activityMigration, null)) != null) return null;
+    const res = migrateLegacyActivity({
+      activityDays: await this._read(KEYS.activityDays, {}),
+      stepsLog: await this._read(KEYS.stepsLog, {}),
+      bikeLog: await this._read(KEYS.bikeLog, []),
+    }, { now: nowISO() });
+    if (res.changed) {
+      if (!(await this._write(KEYS.stepsLog, res.stepsLog))) return null;
+      if (!(await this._write(KEYS.bikeLog, res.bikeLog))) return null;
+    }
+    if (!(await this._write(KEYS.activityMigration, res.marker))) return null;
+    return res.marker;
   }
 
   /* §6.3 привести схему к текущей версии */
@@ -820,6 +878,7 @@ export class StorageService {
     if ((await this._read(KEYS.medIntakes, null)) == null) await this._write(KEYS.medIntakes, {});
     if ((await this._read(KEYS.sleepLog, null)) == null) await this._write(KEYS.sleepLog, []);
     if ((await this._read(KEYS.sleepSettings, null)) == null) await this._write(KEYS.sleepSettings, defaultSleepSettings());
+    await this._ensureActivityKeys();
   }
 
   /* ---- Предупреждения ---- */
@@ -1326,6 +1385,134 @@ export class StorageService {
     });
   }
 
+  /* ---- Шаги, дистанция пешком, велосипед ----
+     steps_log / walk_log — один итог за календарный день (дубль даты невозможен: ключ — дата);
+     bike_log — поездки, итог дня = сумма km. Модель, проверка и статистика — services/activity.js.
+     Изменения сериализуются; запись проверяется перед сохранением. */
+  _serialActivity(fn) {
+    const run = (this._activityQueue || Promise.resolve()).then(fn, fn);
+    this._activityQueue = run.catch(() => {});
+    return run;
+  }
+  async _writeActivityKey(key, value) {
+    if (!(await this._write(key, value))) throw new ActivityStoreError('NO_SPACE', 'Не удалось сохранить: недостаточно места на устройстве.');
+  }
+  _dailyActivityKey(metric) {
+    if (metric === 'steps') return KEYS.stepsLog;
+    if (metric === 'walk') return KEYS.walkLog;
+    throw new Error(`не дневной показатель: ${metric}`);
+  }
+  async getDailyActivityLog(metric) {
+    const v = await this._read(this._dailyActivityKey(metric), {});
+    return isPlainObj(v) ? v : {};
+  }
+  async getDailyActivity(metric, date) {
+    return (await this.getDailyActivityLog(metric))[date] || null;
+  }
+  /* Сохранить дневной итог. value — normalizeDailyInput(…).value ({ date, steps|km, note }).
+     from — дата редактируемой записи: другая дата value.date → запись переносится одной записью.
+     Целевая дата уже занята другой записью → ActivityStoreError DUPLICATE_DATE (existing), пока
+     вызывающий не подтвердит замену (overwrite: true) — так случайный дубль/затирание невозможны.
+     Происхождение (source, createdAt) остаётся у записи и при правке, и при переносе. → { date, entry } */
+  async saveDailyActivity(metric, value, { from = null, overwrite = false } = {}) {
+    return this._serialActivity(async () => {
+      const M = ACTIVITY_METRICS[metric];
+      const key = this._dailyActivityKey(metric);
+      const log = { ...(await this.getDailyActivityLog(metric)) };
+      const date = value && value.date;
+      if (!isDateStr(date) || !date) throw new ActivityStoreError('INVALID', 'Укажите дату записи.');
+      const moving = from != null && from !== date;
+      const orig = from != null ? log[from] || null : null;
+      if (from != null && !orig) throw new ActivityStoreError('NOT_FOUND', 'Запись не найдена — данные изменились, пока была открыта форма.');
+      const target = log[date] || null;
+      if (target && (from == null || moving) && !overwrite) throw new ActivityStoreError('DUPLICATE_DATE', 'За эту дату уже есть запись.', { date, ...target });
+      const base = orig || target || {};
+      const at = nowISO();
+      const entry = {
+        ...base,
+        [M.field]: value[M.field],
+        note: typeof value.note === 'string' ? value.note.slice(0, ACTIVITY_NOTE_MAX) : (base.note || ''),
+        source: base.source || (typeof value.source === 'string' && value.source ? value.source : 'manual'),
+        createdAt: base.createdAt || at,
+        updatedAt: at,
+      };
+      if (!(metric === 'steps' ? isValidStepsEntry(entry) : isValidWalkEntry(entry))) throw new ActivityStoreError('INVALID', 'Запись заполнена некорректно.');
+      if (moving) delete log[from];
+      log[date] = entry;
+      await this._writeActivityKey(key, log);
+      return { date, entry };
+    });
+  }
+  /* → удалённая запись | null */
+  async removeDailyActivity(metric, date) {
+    return this._serialActivity(async () => {
+      const key = this._dailyActivityKey(metric);
+      const log = { ...(await this.getDailyActivityLog(metric)) };
+      const rec = log[date];
+      if (!rec) return null;
+      delete log[date];
+      await this._writeActivityKey(key, log);
+      return rec;
+    });
+  }
+  /* поездки: новые сверху */
+  async getBikeRides() {
+    const list = await this._read(KEYS.bikeLog, []);
+    return sortRides(Array.isArray(list) ? list : []);
+  }
+  async getBikeRide(id) {
+    return (await this.getBikeRides()).find((r) => r.id === id) || null;
+  }
+  /* value — normalizeRideInput(…).value ({ date, time, km, minutes, note }) → новая поездка */
+  async addBikeRide(value) {
+    return this._serialActivity(async () => {
+      const list = await this._read(KEYS.bikeLog, []);
+      const at = nowISO();
+      const v = value || {};
+      const ride = {
+        id: uid(), date: v.date, time: v.time ?? null, km: v.km ?? null, minutes: v.minutes ?? null,
+        note: typeof v.note === 'string' ? v.note.slice(0, ACTIVITY_NOTE_MAX) : '',
+        source: typeof v.source === 'string' && v.source ? v.source : 'manual', createdAt: at, updatedAt: at,
+      };
+      if (!isValidRide(ride)) throw new ActivityStoreError('INVALID', 'Поездка заполнена некорректно.');
+      await this._writeActivityKey(KEYS.bikeLog, [...(Array.isArray(list) ? list : []), ride]);
+      return ride;
+    });
+  }
+  /* Правка поездки: дата (перенос на другой день), время, km, минуты, заметка; id и происхождение остаются */
+  async updateBikeRide(id, value) {
+    return this._serialActivity(async () => {
+      const list = await this._read(KEYS.bikeLog, []);
+      const i = Array.isArray(list) ? list.findIndex((r) => r && r.id === id) : -1;
+      if (i < 0) return null;
+      const v = value || {};
+      const next = {
+        ...list[i], date: v.date, time: v.time ?? null, km: v.km ?? null, minutes: v.minutes ?? null,
+        note: typeof v.note === 'string' ? v.note.slice(0, ACTIVITY_NOTE_MAX) : (list[i].note || ''),
+        id, createdAt: list[i].createdAt || nowISO(), updatedAt: nowISO(),
+      };
+      if (!isValidRide(next)) throw new ActivityStoreError('INVALID', 'Поездка заполнена некорректно.');
+      const out = list.slice();
+      out[i] = next;
+      await this._writeActivityKey(KEYS.bikeLog, out);
+      return next;
+    });
+  }
+  /* → удалённая поездка | null */
+  async removeBikeRide(id) {
+    return this._serialActivity(async () => {
+      const list = await this._read(KEYS.bikeLog, []);
+      const rec = Array.isArray(list) ? list.find((r) => r && r.id === id) : null;
+      if (!rec) return null;
+      await this._writeActivityKey(KEYS.bikeLog, list.filter((r) => r.id !== id));
+      return rec;
+    });
+  }
+  /* хранилище показателя целиком (для экрана и статистики): объект дней или массив поездок */
+  async getActivityStore(metric) {
+    return metric === 'bike' ? this.getBikeRides() : this.getDailyActivityLog(metric);
+  }
+
   /* ---- Врачи и визиты ---- */
   async getVisits() {
     const list = await this._read(KEYS.visits, []);
@@ -1564,6 +1751,7 @@ export class StorageService {
     try {
       if (env.schemaVersion < CURRENT_SCHEMA_VERSION) await sandbox._migrate();
       await sandbox._ensureDefaults();
+      await sandbox._migrateActivity(); // старая копия без отметки — шаги/велотренажёр переносятся так же, как при запуске
     } catch {
       throw new BackupError('MIGRATION_FAILED', 'Не удалось обновить данные из старой резервной копии: структура файла повреждена.');
     }
@@ -1644,7 +1832,7 @@ export class StorageService {
     await Promise.all([
       this.getTests(), this.getVisits(), this.getMeds(), this.getMetricsLog(), this.getMetricsConfig(),
       this.getNotifications(), this.getProfile(), this.getHydration(), this.getAllActivity(), this.getGoals(),
-      this.getSleepEntries(), this.getSleepSettings(),
+      this.getSleepEntries(), this.getSleepSettings(), this.getDailyActivityLog('steps'), this.getDailyActivityLog('walk'), this.getBikeRides(),
     ]);
     return summarize(data);
   }

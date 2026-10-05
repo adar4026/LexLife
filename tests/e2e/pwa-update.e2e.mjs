@@ -162,6 +162,19 @@ const swVersion = (tab) => evaluate(tab, `
 const cacheNames = (tab) => evaluate(tab, 'return (await caches.keys()).sort()');
 const pageBuildInfo = (tab) => evaluate(tab, "return (await (await fetch('build-info.json')).json()).sha");
 
+/* Разделы, которые новая версия добавляет при первом запуске (аддитивно, без смены схемы):
+   шаги / дистанция пешком / велосипед и отметка переноса старой «Активности» (services/activity.js) */
+const ADDITIVE_KEYS = ['steps_log', 'walk_log', 'bike_log', 'activity_migration'];
+/* Прежние данные байт-в-байт; новых ключей — только из ADDITIVE_KEYS; IndexedDB и push — как были */
+function sameExceptAdditive(nextJson, prevJson) {
+  const a = JSON.parse(nextJson), b = JSON.parse(prevJson);
+  const added = Object.keys(a.localStorage).filter((k) => !(k in b.localStorage));
+  return Object.keys(b.localStorage).every((k) => a.localStorage[k] === b.localStorage[k])
+    && added.every((k) => ADDITIVE_KEYS.includes(k))
+    && JSON.stringify(a.indexedDB) === JSON.stringify(b.indexedDB) && a.push === b.push && a.scope === b.scope;
+}
+const addedKeys = (nextJson, prevJson) => Object.keys(JSON.parse(nextJson).localStorage).filter((k) => !(k in JSON.parse(prevJson).localStorage));
+
 /* Снимок пользовательских данных: весь localStorage, все базы IndexedDB, push-подписка */
 const snapshot = (tab) => evaluate(tab, `
   const ls = {}; for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); ls[k] = localStorage.getItem(k); }
@@ -242,7 +255,7 @@ async function main() {
 
     await tab.send('Page.reload', {});
     await waitFor(tab, "return globalThis.__E2E_BUILD === 'A' && document.querySelector('#screen').children.length > 0", 'перезапуск на A');
-    const snap0 = await snapshot(tab);
+    let snap0 = await snapshot(tab);
     check('A: снимок данных до обновления снят', snap0.length > 200, `${Math.round(snap0.length / 1024)} КБ`);
 
     /* исходная проблема: hash-навигация на открытом документе остаётся на загруженном коде */
@@ -263,7 +276,9 @@ async function main() {
     check('A→B: build-info в приложении = SHA сервера', (await pageBuildInfo(tab)) === B.sha);
     let names = await cacheNames(tab);
     check('A→B: кэш A удалён, кэш B на месте, чужой кэш не тронут', !names.includes(A.cache) && names.includes(B.cache) && names.includes('e2e-unrelated'), names.join(', '));
-    check('A→B: пользовательские данные без изменений', (await snapshot(tab)) === snap0);
+    const snapB = await snapshot(tab);
+    check('A→B: пользовательские данные без изменений (новые пустые разделы — только аддитивно)', sameExceptAdditive(snapB, snap0), `добавлены: ${addedKeys(snapB, snap0).join(', ') || 'нет'}`);
+    snap0 = snapB; // дальше — строгое совпадение со снимком после первого запуска B
 
     loads0 = tab.loads.length;
     for (const h of ['#/metric/water', '#/sleep', '#/meds', '#/tests', '#/home']) await evaluate(tab, `location.hash = '${h}'; await new Promise((r) => setTimeout(r, 250)); return true`);

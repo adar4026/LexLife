@@ -99,7 +99,7 @@ export async function run({ keep = false } = {}) {
 
     /* ---------- 1. все внутренние экраны ---------- */
     const routes = [
-      'profile', 'activity', 'visits', `visit/${v.id}`, 'visit/new', `visit/${v.id}/edit`, 'settings', 'export', 'water-import', 'theme',
+      'profile', 'steps', 'walk', 'bike', 'steps-log', 'walk-log', 'bike-log', 'sleep-log', 'visits', `visit/${v.id}`, 'visit/new', `visit/${v.id}/edit`, 'settings', 'export', 'water-import', 'theme',
       'notifications', 'goals', 'calendar', 'stats', 'security', 'move', 'sleep', 'sleep/new', 'sleep/settings',
       'med/new', `test/${t.id}`, 'test/new', `test/${t.id}/edit`, 'test-history/ldl',
       'metric/water', 'water-log', 'metric/weight', 'metric/pressure', 'metric/pulse',

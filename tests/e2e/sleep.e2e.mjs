@@ -60,13 +60,13 @@ export async function run({ keep = false } = {}) {
     localStorage.removeItem('sleep_settings');
     await Storage.init();
 
-    /* 1–4. шторка: «😴 Сон» между «Активность» и «Вода», открывает раздел */
+    /* 1–4. шторка: «😴 Сон» перед «Вода», после неё — «👟 Шаги» (раздела «Активность» больше нет), открывает раздел */
     await go('#/home');
     $('#avatar-btn').click();
     await sleep(200);
     const items = $$('#drawer .drawer-item').map((b) => txt(b));
-    const iA = items.indexOf('🏃 Активность'), iS = items.indexOf('😴 Сон'), iW = items.indexOf('💧 Вода');
-    check('2–3. в шторке «😴 Сон» сразу после «Активность», перед «Вода»', iS === iA + 1 && iW === iS + 1, items.join(' | '));
+    const iA = items.indexOf('🏃 Активность'), iS = items.indexOf('😴 Сон'), iW = items.indexOf('💧 Вода'), iSt = items.indexOf('👟 Шаги');
+    check('2–3. в шторке «😴 Сон» перед «Вода», затем «👟 Шаги»; «Активности» нет', iA === -1 && iS >= 0 && iW === iS + 1 && iSt === iW + 1, items.join(' | '));
     const sleepItem = $$('#drawer .drawer-item').find((b) => txt(b) === '😴 Сон');
     const water = $$('#drawer .drawer-item').find((b) => txt(b) === '💧 Вода');
     check('3a. пункт того же размера, что соседние', sleepItem && Math.abs(sleepItem.getBoundingClientRect().height - water.getBoundingClientRect().height) < 0.5
