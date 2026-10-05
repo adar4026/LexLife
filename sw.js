@@ -6,12 +6,25 @@
    Меняйте CACHE_VERSION при обновлении ассетов.
    Сборка для Cloudflare (scripts/build-assets.mjs) дописывает к нему
    короткий commit: каждый deploy main = новый sw.js = обновление кэша.
+
+   Обновление открытых вкладок (js/services/swUpdate.js): документ, загруженный
+   из кэша прежней версии, сам не перезагружается. Новый SW в activate (только при
+   обновлении — были кэши прежних версий) спрашивает каждую вкладку через
+   MessageChannel; ответившая перезагрузится сама (с учётом незаконченной формы),
+   не ответившая (старый код) — перезагружается здесь, один раз, WindowClient.navigate().
    ========================================================= */
 
-const CACHE_VERSION = 'lexlife-v56';
+const CACHE_VERSION = 'lexlife-v57';
 const FONT_CACHE = 'lexlife-fonts-v1';
 /* Журнал показанных срабатываний (push/локально) — общий со страницей (js/services/occurrenceStore.js) */
 const OCC_CACHE = 'lexlife-occ-v1';
+/* Кэши оболочки приложения любой версии (lexlife-v57, lexlife-v57-abc1234 …).
+   Удаляются только они: шрифты, журнал срабатываний и чужие кэши origin не трогаем. */
+const APP_CACHE_RE = /^lexlife-v\d/;
+/* Протокол обновления — те же строки, что в js/services/swUpdate.js */
+const UPDATE_MSG = 'lexlife:update-ready';
+const VERSION_MSG = 'lexlife:version';
+const UPDATE_ACK_MS = 3000;
 
 const APP_SHELL = [
   './',
@@ -32,6 +45,7 @@ const APP_SHELL = [
   './js/services/pushClient.js',
   './js/services/occurrenceStore.js',
   './js/services/deployment.js',
+  './js/services/swUpdate.js',
   './js/services/homeSummary.js',
   './js/services/meds.js',
   './js/services/sleep.js',
@@ -58,19 +72,48 @@ self.addEventListener('install', (event) => {
   );
 });
 
+/* Вкладка подтвердила, что перезагрузится сама (true), или промолчала (false — старый код) */
+function askClient(client) {
+  return new Promise((resolve) => {
+    let done = false;
+    const ch = new MessageChannel();
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { ch.port1.close(); } catch (e) { /* уже закрыт */ }
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), UPDATE_ACK_MS);
+    ch.port1.onmessage = (e) => finish(!!(e.data && e.data.ok));
+    try { client.postMessage({ type: UPDATE_MSG, version: CACHE_VERSION }, [ch.port2]); } catch (e) { finish(false); }
+  });
+}
+
+/* Вкладки, открытые до этой версии, переходят на неё: сами или (старый код) через navigate.
+   navigate() не ждём: навигация ждёт конца activate, ожидание дало бы взаимную блокировку. */
+async function handOverClients() {
+  const wins = await self.clients.matchAll({ type: 'window' });
+  const acked = await Promise.all(wins.map(askClient));
+  wins.forEach((c, i) => {
+    if (!acked[i] && typeof c.navigate === 'function') c.navigate(c.url).catch(() => {});
+  });
+}
+
 self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches
-      .keys()
-      .then((keys) =>
-        Promise.all(
-          keys
-            .filter((k) => k !== CACHE_VERSION && k !== FONT_CACHE && k !== OCC_CACHE)
-            .map((k) => caches.delete(k))
-        )
-      )
-      .then(() => self.clients.claim())
-  );
+  event.waitUntil((async () => {
+    const stale = (await caches.keys()).filter((k) => APP_CACHE_RE.test(k) && k !== CACHE_VERSION);
+    await Promise.all(stale.map((k) => caches.delete(k)));
+    await self.clients.claim();
+    /* первая установка (прежних кэшей нет) — документ уже из сети, перезагружать нечего */
+    if (stale.length) await handOverClients();
+  })());
+});
+
+/* Версия этого SW — для «О приложении», диагностики и проверки обновления */
+self.addEventListener('message', (event) => {
+  const d = event.data || {};
+  if (d.type === VERSION_MSG && event.ports && event.ports[0]) event.ports[0].postMessage({ type: VERSION_MSG, version: CACHE_VERSION });
 });
 
 /* Маршрут внутри приложения (никаких внешних URL из payload) */

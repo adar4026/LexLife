@@ -33,6 +33,7 @@ import { createNotifier, describeNotifyState, armPatch, waterRulePatch, NOTIF_RO
 import { createPushClient, SYNC_FAIL_TEXT, SERVER_FALLBACK_MS } from './services/pushClient.js';
 import { createOccurrenceStore } from './services/occurrenceStore.js';
 import { NEW_HOME_URL, PRIMARY_URL, migrationMode, deploymentRole, serverPushAllowed } from './services/deployment.js';
+import { createUpdateController, isFormRoute, hasUnsavedInput, UPDATE_MSG } from './services/swUpdate.js';
 
 /* Документы анализов: файлы в IndexedDB (только на этом устройстве), метаданные — в health_tests */
 const Attachments = new AttachmentService(Storage, new IdbAttachmentStore());
@@ -2144,10 +2145,13 @@ async function SleepSettingsScreen() {
     $('#ss-goal', form).textContent = formatSleepDuration(goal);
     $('[data-g="-1"]', form).disabled = goal <= SLEEP_GOAL_MIN;
     $('[data-g="1"]', form).disabled = goal >= SLEEP_GOAL_MAX;
+    form.toggleAttribute('data-unsaved', goal !== s.goalMinutes); // цель — не поле ввода: изменённость отмечаем явно
   };
   $$('[data-g]', form).forEach((b) => b.addEventListener('click', () => { goal = clampSleepGoal(goal + Number(b.dataset.g) * SLEEP_GOAL_STEP); paintGoal(); }));
-  $('#ss-bed', form).value = s.bedtime;
-  $('#ss-wake', form).value = s.wakeTime;
+  /* сохранённые значения — исходные значения полей (defaultValue), а не правка пользователя:
+     изменённой форма становится только после ввода (js/services/swUpdate.js → hasUnsavedInput) */
+  $('#ss-bed', form).defaultValue = s.bedtime;
+  $('#ss-wake', form).defaultValue = s.wakeTime;
   $('.med-form__cancel', form).addEventListener('click', leave);
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -5268,6 +5272,7 @@ async function render() {
     const y = history.state && typeof history.state.y === 'number' ? history.state.y : 0;
     window.scrollTo(0, y);
   }
+  updates.retry(); // отложенное обновление: экран сменился — если ввода нет, перезагрузка на новую версию
 }
 
 function initChrome() {
@@ -5277,14 +5282,44 @@ function initChrome() {
   $('#scrim').addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
 }
 
-function registerSW() {
+/* Обновление после deploy (js/services/swUpdate.js): документ из кэша прежней версии
+   перезагружается один раз, когда новый SW активен, — не во время формы или ввода. */
+const sessionStore = (() => { try { return window.sessionStorage; } catch { return null; } })();
+const updates = createUpdateController({
+  reload: () => location.reload(),
+  session: sessionStore,
+  isSafe: () => !isFormRoute(location.hash) && !document.querySelector('.dialog') && !hasUnsavedInput(document.body),
+});
+
+/* Сообщения SW. Подписка — при загрузке модуля, до boot(): сообщение об обновлении
+   может прийти, пока экран ещё строится (иначе SW сочтёт вкладку старой и перезагрузит сам). */
+function listenSW() {
   if (!('serviceWorker' in navigator)) return;
-  window.addEventListener('load', () => { navigator.serviceWorker.register('sw.js').catch((err) => console.warn('[sw]', err)); });
-  /* клик по уведомлению: SW просит открыть экран (только внутренние маршруты) */
   navigator.serviceWorker.addEventListener('message', (e) => {
     const d = e.data || {};
+    /* клик по уведомлению: SW просит открыть экран (только внутренние маршруты) */
     if (d.type === 'lexlife:open' && isSafeRoute(d.route) && location.hash !== d.route) location.hash = d.route;
+    /* новая версия активна: подтвердить SW (он не будет перезагружать вкладку сам) и перейти на неё */
+    if (d.type === UPDATE_MSG) {
+      if (e.ports && e.ports[0]) e.ports[0].postMessage({ ok: true });
+      updates.onUpdateReady(d.version);
+    }
   });
+}
+
+function registerSW() {
+  if (!('serviceWorker' in navigator)) return;
+  const register = () => navigator.serviceWorker.register('sw.js').catch((err) => console.warn('[sw]', err));
+  /* boot() ждёт данные и первый экран — к этому моменту load мог уже пройти */
+  if (document.readyState === 'complete') register();
+  else window.addEventListener('load', register, { once: true });
+}
+
+/* Вкладка открыта давно (iOS: возврат PWA из фона — не навигация, браузер sw.js не проверяет):
+   спросить сервер о новой версии. Не чаще раза в минуту; офлайн — молча. */
+function checkForUpdate() {
+  if (!('serviceWorker' in navigator) || !updates.shouldCheck()) return;
+  navigator.serviceWorker.getRegistration().then((r) => (r ? r.update() : null)).catch(() => {});
 }
 
 /* ---------- запуск ---------- */
@@ -5298,9 +5333,9 @@ async function boot() {
   window.addEventListener('hashchange', render);
   window.addEventListener('scroll', () => { clearTimeout(scrollSaveTimer); scrollSaveTimer = setTimeout(saveScrollState, 250); }, { passive: true });
   document.addEventListener('click', saveScrollState, true); // до перехода по ссылке/кнопке
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) { render(); notifier.check(); rulesChanged({ quiet: true }); } });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { render(); notifier.check(); rulesChanged({ quiet: true }); checkForUpdate(); } });
   window.addEventListener('online', () => { rulesChanged({ quiet: true }); });
-  window.addEventListener('pageshow', (e) => { if (e.persisted) notifier.check(); });
+  window.addEventListener('pageshow', (e) => { if (e.persisted) { notifier.check(); checkForUpdate(); } });
   await render();
   registerSW();
   startNotifier();
@@ -5311,4 +5346,5 @@ async function boot() {
   if (IdbAttachmentStore.available()) Attachments.cleanupOrphans().catch((err) => console.warn('[attachments] очистка пропущена', err && err.name));
   if (IdbAttachmentStore.available()) VisitFiles.cleanupOrphans().catch((err) => console.warn('[visit files] очистка пропущена', err && err.name));
 }
+listenSW();
 boot();

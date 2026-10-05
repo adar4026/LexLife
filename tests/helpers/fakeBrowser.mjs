@@ -16,6 +16,7 @@ export function createFakeCaches() {
     return {
       match: async (k) => { const r = m.get(keyOf(k)); return r ? r.clone() : undefined; },
       put: async (k, res) => { m.set(keyOf(k), res.clone()); },
+      addAll: async (reqs) => { for (const r of reqs) m.set(keyOf(r), { url: keyOf(r), cache: r.cache, clone() { return this; } }); },
       keys: async () => [...m.keys()].map((url) => ({ url })),
       delete: async (k) => m.delete(keyOf(k)),
     };
@@ -47,17 +48,28 @@ export async function createFakePushManager({ endpointHost = 'https://web.push.a
   return { pm, calls, current: () => current };
 }
 
-/* sw.js в изолированном контексте: push / notificationclick */
-export function loadServiceWorker({ caches = createFakeCaches(), scope = 'https://lexlife.test/' } = {}) {
+/* sw.js в изолированном контексте: push / notificationclick / install / activate / message.
+   clients — окна (matchAll), в них можно положить свои объекты с postMessage/navigate;
+   timeScale < 1 ускоряет таймеры SW (ожидание ответа вкладки) в тестах. */
+export function loadServiceWorker({ caches = createFakeCaches(), scope = 'https://lexlife.test/', timeScale = 1 } = {}) {
   const listeners = {}; const shown = []; const opened = []; const clients = [];
+  const calls = { claim: 0, skipWaiting: 0, matchAll: [] };
   const self = {
     addEventListener: (t, fn) => { listeners[t] = fn; },
     registration: { scope, showNotification: async (title, opts) => { shown.push({ title, opts }); } },
-    clients: { matchAll: async () => clients, openWindow: async (u) => { opened.push(u); }, claim: async () => {} },
-    skipWaiting: () => {}, location: { origin: new URL(scope).origin },
+    clients: {
+      matchAll: async (opts) => { calls.matchAll.push(opts); return clients; },
+      openWindow: async (u) => { opened.push(u); },
+      claim: async () => { calls.claim++; },
+    },
+    skipWaiting: () => { calls.skipWaiting++; }, location: { origin: new URL(scope).origin },
   };
-  vm.runInNewContext(readFileSync(new URL('../../sw.js', import.meta.url), 'utf8'), { self, caches, fetch: () => {}, URL, Request: class {}, Response, Date, JSON, String, encodeURIComponent });
+  class Request { constructor(url, opts = {}) { this.url = String(url); this.cache = opts.cache; } }
+  const timers = { setTimeout: (fn, ms) => setTimeout(fn, Math.round((ms || 0) * timeScale)), clearTimeout };
+  vm.runInNewContext(readFileSync(new URL('../../sw.js', import.meta.url), 'utf8'), {
+    self, caches, fetch: () => {}, URL, Request, Response, Date, JSON, String, encodeURIComponent, MessageChannel, Promise, ...timers,
+  });
   const fire = async (type, ev) => { const waits = []; listeners[type]({ ...ev, waitUntil: (p) => waits.push(p) }); await Promise.all(waits); };
   const pushJson = (obj) => fire('push', { data: { json: () => obj, text: () => JSON.stringify(obj) } });
-  return { listeners, shown, opened, clients, fire, pushJson, caches };
+  return { listeners, shown, opened, clients, fire, pushJson, caches, calls };
 }

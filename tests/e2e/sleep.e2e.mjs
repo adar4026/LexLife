@@ -13,6 +13,7 @@
    ========================================================= */
 
 import Storage, { dateKey, parseBackup } from '../../js/services/storage.js';
+import { hasUnsavedInput } from '../../js/services/swUpdate.js';
 
 const KEYS = ['sleep_log', 'sleep_settings'];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -191,6 +192,34 @@ export async function run({ keep = false } = {}) {
     await go('#/sleep');
     await waitFor(() => $('.sleep-row'), 'история после восстановления');
     check('18a. раздел снова показывает запись', $$('.sleep-row').length === 1);
+
+    /* «Настройки сна»: сохранённые значения — исходные, изменённой форма становится только после правки
+       (иначе обновление приложения на этом экране откладывалось бы без причины) */
+    await Storage.updateSleepSettings({ goalMinutes: 480, bedtime: '23:30', wakeTime: '07:30' });
+    await go('#/sleep/settings');
+    await waitFor(() => $('#ss-bed'), 'настройки сна');
+    const dirty = () => hasUnsavedInput(document.body);
+    check('S1. открыли «Настройки сна» — форма не изменена', !dirty());
+    check('S2. поля заполнены сохранёнными значениями как исходными (defaultValue)',
+      $('#ss-bed').value === '23:30' && $('#ss-bed').defaultValue === '23:30' && $('#ss-wake').value === '07:30' && $('#ss-wake').defaultValue === '07:30' && !dirty());
+    type($('#ss-bed'), '22:45');
+    check('S3. пользователь сменил время сна — форма изменена', dirty());
+    type($('#ss-bed'), '23:30');
+    check('S3a. вернул прежнее время — снова не изменена', !dirty());
+    $('[data-g="1"]').click();
+    check('S3b. изменил цель кнопкой «+» — форма изменена', dirty());
+    $('[data-g="-1"]').click();
+    check('S3c. вернул цель — не изменена', !dirty());
+    type($('#ss-bed'), '22:45');
+    $('.sleep-form button[type="submit"]').click();
+    await waitFor(() => location.hash === '#/sleep', 'возврат в «Сон» после сохранения');
+    await sleep(300);
+    const st = await Storage.getSleepSettings();
+    check('S4. сохранено: время сна 22:45, после сохранения форма не изменена', st.bedtime === '22:45' && st.wakeTime === '07:30' && !dirty(), JSON.stringify(st));
+    await go('#/sleep/settings');
+    await waitFor(() => $('#ss-bed'), 'настройки сна снова');
+    check('S4a. открыли снова — исходное значение уже новое (22:45), форма не изменена', $('#ss-bed').defaultValue === '22:45' && !dirty());
+    await go('#/sleep');
 
     /* вёрстка и доступность */
     check('H. нет горизонтальной прокрутки', document.documentElement.scrollWidth <= window.innerWidth, `${document.documentElement.scrollWidth} > ${window.innerWidth}`);
