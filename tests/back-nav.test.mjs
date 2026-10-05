@@ -284,7 +284,7 @@ test('app.js: старых вариантов возврата не остало
   assert.doesNotMatch(app, /‹ \$\{|‹ Назад|class="back-btn"/, 'текстовая кнопка «‹ Назад» — заменена компонентом');
   assert.doesNotMatch(app, /label: '(Назад|Показатели|Визиты|Отмена)', onBack/, 'подписи у кнопки нет');
   assert.doesNotMatch(app, /history\.replaceState\(null/, 'replaceState не должен стирать глубину записи');
-  assert.match(app, /import \{ BackButton, goBack, goBackTo, replaceRoute, replaceUrl, initNavHistory, readEntryUi, saveEntryUi \} from '\.\/ui\/backNav\.js';/);
+  assert.match(app, /import \{ BackButton, goBack, goBackTo, replaceRoute, replaceUrl, initNavHistory, readEntryUi, saveEntryUi, prevRoute \} from '\.\/ui\/backNav\.js';/);
   /* учёт истории подключается раньше роутера — глубина известна к render() */
   assert.ok(app.indexOf('initNavHistory();') > 0 && app.indexOf('initNavHistory();') < app.indexOf("window.addEventListener('hashchange', render);"));
 });

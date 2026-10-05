@@ -24,7 +24,7 @@ export const ROUTES = [
   ['#/home', 'home'], ['#/metrics', 'metrics'], ['#/meds', 'meds'], ['#/tests', 'tests'],
   ['#/metric/weight', 'metrics'], ['#/metric/pressure', 'metrics'], ['#/metric/water', 'metrics'], ['#/water-log', 'metrics'],
   ['#/test/new', 'tests'], ['#/test-history/hgb', 'tests'],
-  ['#/activity', null], ['#/settings', null], ['#/calendar', null],
+  ['#/steps', null], ['#/bike-log', null], ['#/settings', null], ['#/calendar', null],
   ['#/tests', 'tests'], ['#/home', 'home'],
 ];
 

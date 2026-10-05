@@ -11,6 +11,8 @@
    Даты — календарные ISO ГГГГ-ММ-ДД; внутри — номер дня (UTC-сутки), без влияния DST.
    ========================================================= */
 
+import { dayValues } from './activity.js';
+
 const DAY_MS = 86400000;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}$/;
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
@@ -33,7 +35,7 @@ export const DEFAULT_PERIOD = '30d';
    Это порог читаемости графика, а не медицинская норма. */
 export const MIN_DELTA = {
   weight: 0.5, sys: 3, dia: 3, pulse: 3, temperature: 0.2, spo2: 1, glucose: 0.3,
-  water: 150, activityMin: 5, steps: 500,
+  water: 150, steps: 500, bike: 1,
 };
 
 /* Условия расчёта тренда: не меньше TREND_MIN_POINTS дней с данными,
@@ -127,15 +129,10 @@ export const pickWater = (x) => {
   if (Array.isArray(x.entries) && x.entries.length) return x.entries.reduce((s, e) => s + (isNum(e && e.ml) ? e.ml : 0), 0);
   return null;
 };
-/* Активность: минуты = вело + другое + планка (сек → мин). Только если хоть одно поле минут заполнено. */
-export const pickActivityMin = (a) => {
-  if (!isObj(a)) return null;
-  const plank = Array.isArray(a.plank) ? a.plank.filter(isNum) : [];
-  if (!isNum(a.bike) && !isNum(a.otherMin) && !plank.length) return null;
-  const min = (isNum(a.bike) ? a.bike : 0) + (isNum(a.otherMin) ? a.otherMin : 0) + plank.reduce((s, v) => s + v, 0) / 60;
-  return Math.max(0, Math.round(min * 10) / 10);
-};
+/* Шаги старого раздела (activity_days) — только для вызова без steps_log */
 export const pickSteps = (a) => (isObj(a) && isNum(a.steps) ? Math.max(0, a.steps) : null);
+/* Шаги из steps_log (services/activity.js): { steps, … } — один итог дня */
+export const pickStepsEntry = (e) => (isObj(e) && isNum(e.steps) ? Math.max(0, e.steps) : null);
 
 /* ---------- периоды ---------- */
 export function periodRange(key, todayDay, firstDay = null) {
@@ -400,8 +397,12 @@ export function createStatsEngine(raw, todayIso) {
   const today = dayNum(todayIso);
   const log = isObj(raw.metricsLog) ? raw.metricsLog : {};
   const cfg = isObj(raw.metricsConfig) ? raw.metricsConfig : {};
-  const activityDays = isObj(raw.activityDays) ? raw.activityDays : {};
-  const goals = isObj(raw.activityGoals) ? raw.activityGoals : {};
+  /* Шаги и велосипед — самостоятельные показатели (services/activity.js):
+     steps_log — итог дня (вся ходьба, км — только расчётная оценка при показе), bike_log — поездки (день = сумма км; поездки без км
+     в километры не входят). Старые шаги из activity_days перенесены в steps_log; без steps_log
+     (старый вызов) шаги берутся из activity_days. */
+  const stepsLog = isObj(raw.stepsLog) ? raw.stepsLog : null;
+  const bikeRides = Array.isArray(raw.bikeLog) ? raw.bikeLog : [];
   const noFuture = (s) => s.filter((p) => p.day <= today);
 
   const series = {
@@ -413,10 +414,13 @@ export function createStatsEngine(raw, todayIso) {
     spo2: noFuture(toDailySeries(log.spo2, pickPoint)),
     glucose: noFuture(toDailySeries(log.glucose, pickPoint)),
     water: noFuture(toDailySeries(log.water, pickWater)),
-    activityMin: noFuture(toDailySeries(activityDays, pickActivityMin)),
-    steps: noFuture(toDailySeries(activityDays, pickSteps)),
+    steps: noFuture(stepsLog ? toDailySeries(stepsLog, pickStepsEntry) : toDailySeries(isObj(raw.activityDays) ? raw.activityDays : {}, pickSteps)),
+    bike: noFuture(toDailySeries(dayValues('bike', bikeRides), (v) => (isNum(v) ? Math.max(0, v) : null))),
   };
-  const activityRecorded = noFuture(toDailySeries(activityDays, (a) => (isObj(a) ? 1 : null)));
+  /* поездки без дистанции (перенесённый велотренажёр: только минуты) — считаются отдельно, не как 0 км */
+  const noKmRides = bikeRides.filter((r) => isObj(r) && !isNum(r.km) && typeof r.date === 'string' && ISO_RE.test(r.date))
+    .map((r) => ({ day: dayNum(r.date), minutes: isNum(r.minutes) ? r.minutes : 0 }))
+    .filter((r) => r.day <= today);
   const tests = (Array.isArray(raw.tests) ? raw.tests : [])
     .filter((t) => isObj(t) && typeof t.date === 'string' && ISO_RE.test(t.date) && dayNum(t.date) <= today)
     .map((t) => ({ ...t, day: dayNum(t.date) }))
@@ -427,7 +431,8 @@ export function createStatsEngine(raw, todayIso) {
     .map(dayNum)
     .filter((d) => d <= today);
 
-  const firstDays = [...Object.values(series), activityRecorded].filter((s) => s.length).map((s) => s[0].day);
+  const firstDays = Object.values(series).filter((s) => s.length).map((s) => s[0].day);
+  if (noKmRides.length) firstDays.push(Math.min(...noKmRides.map((r) => r.day)));
   tests.length && firstDays.push(tests[0].day);
   const firstDay = firstDays.length ? Math.min(...firstDays) : null;
   const hasAny = firstDay != null;
@@ -469,31 +474,16 @@ export function createStatsEngine(raw, todayIso) {
     water.prevGoalCompletion = prev ? calculateGoalCompletion(filterByPeriod(series.water, prev), waterGoal) : null;
     water.buckets = bucketize(water.points, range, size);
 
-    const actMin = block('activityMin', range, prev);
-    const steps = block('steps', range, prev);
-    const recorded = filterByPeriod(activityRecorded, range);
-    const activeDays = (r) => {
-      const days = new Set();
-      filterByPeriod(series.activityMin, r).forEach((p) => p.value > 0 && days.add(p.day));
-      filterByPeriod(series.steps, r).forEach((p) => p.value > 0 && days.add(p.day));
-      return days.size;
-    };
-    const bikeGoal = isNum(goals.bike_minutes) && goals.bike_minutes > 0 ? goals.bike_minutes : null;
-    const stepsGoal = isNum(goals.steps) && goals.steps > 0 ? goals.steps : null;
-    const bikeSeries = filterByPeriod(toDailySeries(activityDays, (a) => (isObj(a) && isNum(a.bike) ? a.bike : null)), range);
+    /* шаги / велосипед: у каждого свой блок, столбцы и лучший день */
     const bestOf = (pts) => pts.reduce((b, p) => (!b || p.value > b.value ? p : b), null);
-    const activity = {
-      minutes: { ...actMin, buckets: bucketize(actMin.points, range, size), best: bestOf(actMin.points) },
-      steps: { ...steps, buckets: bucketize(steps.points, range, size), best: bestOf(steps.points), goal: stepsGoal,
-        goalCompletion: calculateGoalCompletion(steps.points, stepsGoal) },
-      bike: { goal: bikeGoal, goalCompletion: calculateGoalCompletion(bikeSeries, bikeGoal) },
-      recordedDays: recorded.length,
-      activeDays: activeDays(range),
-      prevActiveDays: prev ? activeDays(prev) : null,
-      prevRecordedDays: prev ? filterByPeriod(activityRecorded, prev).length : null,
-      lastAll: activityRecorded.length ? activityRecorded[activityRecorded.length - 1] : null,
-      totalDays: activityRecorded.length,
+    const activityBlock = (key) => {
+      const b = block(key, range, prev);
+      return { ...b, buckets: bucketize(b.points, range, size), best: bestOf(b.points) };
     };
+    const inside = (r) => (x) => x.day >= r.start && x.day <= r.end;
+    const bike = activityBlock('bike');
+    const noKm = noKmRides.filter(inside(range));
+    bike.noKm = { count: noKm.length, minutes: noKm.reduce((s, r) => s + r.minutes, 0), totalAll: noKmRides.length };
 
     const inRange = (t) => t.day >= range.start && t.day <= range.end;
     const fields = Array.isArray(raw.testFields) ? raw.testFields : [];
@@ -531,7 +521,8 @@ export function createStatsEngine(raw, todayIso) {
       spo2: block('spo2', range, prev),
       glucose: block('glucose', range, prev),
       water,
-      activity,
+      steps: activityBlock('steps'),
+      bike,
       tests: testsModel,
       meds: {
         count: Array.isArray(raw.meds) ? raw.meds.length : 0,
