@@ -7,7 +7,7 @@
    ========================================================= */
 
 import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup, SleepStoreError } from './services/storage.js';
-import { createStatsEngine, evaluateWaterPlan, waterGoalDays, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay, dayNum } from './services/analytics.js';
+import { createStatsEngine, evaluateWaterPlan, waterGoalDays, getWaterStatsRange, WATER_PERIODS, formatLiters, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay, dayNum } from './services/analytics.js';
 import { parseWaterMinderCsv, assignImportKeys, buildWaterImportPlan, applyWaterImportPlan, applyTodayWaterImport, isWaterMinderKey } from './services/waterImport.js';
 import { lineChart, barChart as svgBarChart } from './ui/charts.js';
 import { AttachmentService, IdbAttachmentStore, AttachmentError, ATTACHMENT_ACCEPT, ATTACHMENT_TYPES, checkAttachmentFile, formatBytes, attachmentOf, VisitAttachmentService, VISIT_FILES_DB, visitDocsOf, MAX_FILES_PER_PICK } from './services/attachments.js';
@@ -63,6 +63,12 @@ const fmtFull = (d = new Date()) => {
 };
 const fmtDate = (iso) =>
   new Date(iso + 'T00:00:00').toLocaleDateString(RU, { day: 'numeric', month: 'short', year: 'numeric' });
+/* Подпись диапазона: год у начальной даты опускается, если он тот же, что у конечной
+   («6 сент. — 5 окт. 2026 г.»), иначе показывается у обеих («1 нояб. 2025 г. — 5 окт. 2026 г.»). */
+const fmtDateRange = (from, to) =>
+  `${from.slice(0, 4) === to.slice(0, 4)
+    ? new Date(from + 'T00:00:00').toLocaleDateString(RU, { day: 'numeric', month: 'short' })
+    : fmtDate(from)} — ${fmtDate(to)}`;
 const fmtNum = (n) => (n == null ? '—' : String(n).replace('.', ','));
 /* Значение показателя лаборатории: число или качественный результат бланка («отрицательно») */
 const fmtResult = (r) => (r.value == null && r.text ? r.text : fmtNum(r.value));
@@ -584,31 +590,33 @@ async function MetricScreen(key) {
   return screen;
 }
 
-/* серия для графика */
-function metricSeries(log, p, key) {
+/* Серия для графика. Диапазон — всегда canonical range периода (getWaterStatsRange):
+   график, подпись диапазона и среднее на экране «Вода» обязаны строиться по одному
+   и тому же startDate/endDate. range можно передать готовым, чтобы экран и график
+   гарантированно смотрели на один объект. */
+function metricSeries(log, p, key, range = null) {
+  const r = range || getWaterStatsRange(p, new Date());
   const labels = [];
   const values = [];
-  const today = new Date();
-  if (p === 'week' || p === 'month') {
-    const n = p === 'week' ? 7 : 30;
-    for (let i = n - 1; i >= 0; i--) {
-      const d = new Date(today); d.setDate(d.getDate() - i);
-      values.push(chartVal(key, log[dateKey(d)]) || 0);
-      if (p === 'week') labels.push(d.toLocaleDateString(RU, { weekday: 'short' }));
-      else labels.push(i % 5 === 0 ? String(d.getDate()) : '');
-    }
+  if (r.period !== 'year') {
+    r.dayKeys.forEach((k, i) => {
+      values.push(chartVal(key, log[k]) || 0);
+      const d = new Date(k + 'T00:00:00');
+      if (r.period === 'week') labels.push(d.toLocaleDateString(RU, { weekday: 'short' }));
+      else labels.push((r.numberOfDays - 1 - i) % 5 === 0 ? String(d.getDate()) : '');
+    });
   } else {
-    for (let i = 11; i >= 0; i--) {
-      const d = new Date(today.getFullYear(), today.getMonth() - i, 1);
-      let sum = 0, cnt = 0;
-      for (const [k, v] of Object.entries(log)) {
-        const dd = new Date(k + 'T00:00:00');
-        const cv = chartVal(key, v);
-        if (dd.getFullYear() === d.getFullYear() && dd.getMonth() === d.getMonth() && cv > 0) { sum += cv; cnt += 1; }
-      }
-      values.push(cnt ? sum / cnt : 0);
-      labels.push(d.toLocaleDateString(RU, { month: 'short' }));
+    /* 12 месячных столбцов: среднее по дням месяца с записями (дни без записей столбец не занижают) */
+    const byMonth = new Map(r.months.map((m) => [m.ym, []]));
+    for (const k of r.dayKeys) {
+      const cv = chartVal(key, log[k]);
+      if (cv > 0) byMonth.get(k.slice(0, 7)).push(cv);
     }
+    r.months.forEach((m) => {
+      const vals = byMonth.get(m.ym);
+      values.push(vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0);
+      labels.push(new Date(m.start + 'T00:00:00').toLocaleDateString(RU, { month: 'short' }));
+    });
   }
   return { labels, values };
 }
@@ -737,7 +745,7 @@ function flashNotifyResult(granted, onText) {
 
 async function WaterScreen() {
   const screen = el('<div></div>');
-  let period = ['week', 'month', 'year'].includes(readEntryUi('water')) ? readEntryUi('water') : 'year'; // 'week' | 'month' | 'year' — по умолчанию «Год», как у графика
+  let period = WATER_PERIODS.includes(readEntryUi('water')) ? readEntryUi('water') : 'year'; // 'week' | 'month' | 'year' — по умолчанию «Год», как у графика
   let editingGoal = false;
 
   async function paint() {
@@ -787,7 +795,9 @@ async function WaterScreen() {
     /* 6. История за день */
     screen.appendChild(journal(dayObj.entries || [], today));
 
-    /* 7. Графики неделя/месяц/год */
+    /* 7. Статистика периода: один canonical range на среднее, график, подпись и «цель выполнена».
+       Пересчитывается при каждой отрисовке — переключение периода меняет всё сразу. */
+    const range = getWaterStatsRange(period, new Date(), log);
     const seg = el(`
       <div class="seg" style="margin-top:14px">
         <button class="seg__btn ${period === 'week' ? 'is-active' : ''}" data-p="week" type="button">Неделя</button>
@@ -797,7 +807,9 @@ async function WaterScreen() {
     `);
     seg.addEventListener('click', (e) => { const b = e.target.closest('[data-p]'); if (b) { period = b.dataset.p; paint(); } });
     screen.appendChild(seg);
-    screen.appendChild(barChart(metricSeries(log, period, 'water'), goal));
+    const chartSec = barChart(metricSeries(log, period, 'water', range), goal);
+    $('.card', chartSec).prepend(averageHero(range)); // крупное среднее — над графиком, в том же блоке
+    screen.appendChild(chartSec);
 
     /* 8. Статистика */
     const L = (ml) => fmtNum(Math.round(ml / 100) / 10);
@@ -809,8 +821,7 @@ async function WaterScreen() {
       </div>
     `));
     screen.appendChild(el('<p class="plan-hint" style="margin:0 0 14px">Текущая серия — дни подряд по сегодня с итогом не меньше цели. Пока сегодня цель не выполнена, серия считается по вчера.</p>'));
-    screen.appendChild(goalPeriodStats(log, goal));
-    screen.appendChild(averagesBlock(log));
+    screen.appendChild(goalPeriodStats(log, goal, range));
 
     /* 9. Настройки напоминаний (тумблер = правило «Вода» центра уведомлений) */
     const waterRule = (await Storage.getNotifications()).find((n) => n.type === 'water') || null;
@@ -963,31 +974,32 @@ async function WaterScreen() {
     return sec;
   }
 
-  /* Календарные дни выбранного периода — те же, что на графике: неделя — 7 дней,
-     месяц — 30 дней, год — с 1-го числа месяца 11 месяцев назад; всё по сегодня. */
-  function periodDayKeys(p) {
-    const today = new Date();
-    const start = p === 'week' || p === 'month'
-      ? new Date(today.getFullYear(), today.getMonth(), today.getDate() - (p === 'week' ? 6 : 29))
-      : new Date(today.getFullYear(), today.getMonth() - 11, 1);
-    const keys = [];
-    for (const d = start; dateKey(d) <= dateKey(today); d.setDate(d.getDate() + 1)) keys.push(dateKey(d));
-    return keys;
+  /* Крупное среднее периода над графиком (Apple Health по смыслу, типографика LexLife).
+     Значение — средний суточный объём canonical range: сумма за диапазон / календарные дни
+     диапазона, дни без записей = 0, будущие дни в диапазон не входят. */
+  function averageHero(range) {
+    return el(`
+      <div class="wavg">
+        <div class="wavg__cap">В среднем</div>
+        <div class="wavg__val">${esc(formatLiters(range.average))}<span class="wavg__unit">л/день</span></div>
+        <div class="wavg__range">${esc(fmtDateRange(range.startDate, range.endDate))}</div>
+      </div>
+    `);
   }
+
   /* Выполнение цели за выбранный период: всего дней с целью (не обязательно подряд) и лучшая серия.
+     Дни периода — те же range.dayKeys, по которым построены график и среднее. Диапазон уже
+     показан над графиком (averageHero) — здесь не дублируется, только сами цифры периода.
      Пересчитывается из журнала при каждой отрисовке — после добавления, правки, переноса и удаления. */
-  function goalPeriodStats(log, goal) {
-    const keys = periodDayKeys(period);
+  function goalPeriodStats(log, goal, rng) {
+    const keys = rng.dayKeys;
     const g = waterGoalDays(log, goal, keys);
-    const name = period === 'week' ? 'неделя' : period === 'month' ? 'месяц' : 'год';
-    const range = `${fmtDate(keys[0])} – ${fmtDate(keys[keys.length - 1])}`;
+    const name = rng.label;
+    const range = fmtDateRange(rng.startDate, rng.endDate);
     const box = el(`
-      <div>
-        <div style="font-size:12px; color:var(--text2); margin-bottom:8px">за период: ${name} · ${esc(range)}</div>
-        <div class="stat-row">
-          <div class="stat stat--link" role="button" tabindex="0" aria-label="Цель выполнена, дней: ${g.count}. Показать даты"><div class="stat__num">${g.count}</div><div class="stat__label">цель выполнена, дней ›</div></div>
-          <div class="stat"><div class="stat__num">${g.bestStreak}</div><div class="stat__label">лучшая серия цели, дней</div></div>
-        </div>
+      <div class="stat-row">
+        <div class="stat stat--link" role="button" tabindex="0" aria-label="Цель выполнена, дней: ${g.count}. Показать даты"><div class="stat__num">${g.count}</div><div class="stat__label">цель выполнена, дней ›</div></div>
+        <div class="stat"><div class="stat__num">${g.bestStreak}</div><div class="stat__label">лучшая серия цели, дней</div></div>
       </div>
     `);
     const card = $('.stat--link', box);
@@ -1003,31 +1015,6 @@ async function WaterScreen() {
     card.addEventListener('click', open);
     card.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
     return box;
-  }
-
-  /* средний суточный объём за последние n дней (по дням с записями) */
-  function avgOver(log, n) {
-    const today = new Date();
-    const vals = [];
-    for (let i = 0; i < n; i++) {
-      const d = new Date(today); d.setDate(d.getDate() - i);
-      const o = log[dateKey(d)]; const t = o ? o.total || 0 : 0;
-      if (t > 0) vals.push(t);
-    }
-    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
-  }
-  function averagesBlock(log) {
-    const L = (ml) => fmtNum(Math.round(ml / 100) / 10);
-    return el(`
-      <div class="card" style="padding:12px; margin-top:10px">
-        <div style="font-size:12px; color:var(--text2); margin-bottom:8px">среднее, л/день</div>
-        <div class="wavg">
-          <div><div class="wavg__num">${L(avgOver(log, 7))}</div><div class="wavg__lbl">неделя</div></div>
-          <div class="wavg__mid"><div class="wavg__num">${L(avgOver(log, 30))}</div><div class="wavg__lbl">месяц</div></div>
-          <div><div class="wavg__num">${L(avgOver(log, 365))}</div><div class="wavg__lbl">год</div></div>
-        </div>
-      </div>
-    `);
   }
 
   /* Журнал приёмов за сегодня (с удалением) */

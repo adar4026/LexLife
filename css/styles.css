@@ -1252,12 +1252,23 @@ body.is-scroll-locked {
 .wqbar__fab:active { filter: brightness(0.9); }
 .wdel { background: none; border: 0; color: var(--text2); font-size: 15px; padding: 4px 8px; flex-shrink: 0; }
 
-/* Средние нед/мес/год (модуль воды) */
-.wavg { display: flex; text-align: center; }
-.wavg > div { flex: 1; }
-.wavg__mid { border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
-.wavg__num { font-size: 19px; font-weight: 800; font-family: var(--font-head); }
-.wavg__lbl { font-size: 11px; color: var(--text2); margin-top: 2px; }
+/* Крупное среднее выбранного периода над графиком (модуль воды) */
+.wavg { margin: 0 0 14px; }
+.wavg__cap { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text2); }
+.wavg__val {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 2px;
+  font-size: 40px;
+  line-height: 1.05;
+  font-weight: 800;
+  font-family: var(--font-head);
+  letter-spacing: -0.02em;
+}
+.wavg__unit { font-size: 15px; font-weight: 700; font-family: inherit; color: var(--text2); letter-spacing: 0; }
+.wavg__range { font-size: 12px; color: var(--text2); margin-top: 4px; }
+@media (max-width: 360px) { .wavg__val { font-size: 34px; } }
 
 /* План гидратации + настройки напоминаний */
 .plan-row { gap: 10px; }

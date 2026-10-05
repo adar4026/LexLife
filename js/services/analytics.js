@@ -294,6 +294,67 @@ export function waterGoalDays(log, goal, dayKeys) {
   return { count: days.length, days, bestStreak: best };
 }
 
+/* ---------- экран «Вода»: единый диапазон периода (canonical range) ----------
+   Неделя / Месяц / Год: один диапазон на весь экран — график, подпись диапазона,
+   «цель выполнена, дней» и крупное среднее над графиком берут его, и только его.
+   Даты календарные локальные (как dateKey), конец диапазона — всегда сегодня:
+   будущие дни в текущий незавершённый период не входят.
+     week  — 7 дней по сегодня;
+     month — 30 дней по сегодня;
+     year  — с 1-го числа месяца 11 месяцев назад по сегодня (12 столбцов графика).
+   total дня = pickWater(log[date]) || 0 — день без записей считается нулём
+   (в отличие от «Статистики», где пропуск дня ≠ 0: там ряд измерений, здесь — суточный объём).
+   average = sum / numberOfDays, мл/день. Журнал только читается. */
+export const WATER_PERIODS = ['week', 'month', 'year'];
+
+/* Объём воды в литрах для подписи «л/день»: всегда один знак после запятой
+   («1,3», «2,0»), ровный ноль — «0». Единый формат литров на экране «Вода». */
+export const formatLiters = (ml) =>
+  (typeof ml !== 'number' || !Number.isFinite(ml) || ml <= 0
+    ? '0'
+    : (ml / 1000).toLocaleString('ru-RU', { minimumFractionDigits: 1, maximumFractionDigits: 1 }));
+export const WATER_PERIOD_LABEL = { week: 'неделя', month: 'месяц', year: 'год' };
+
+const localKey = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+
+export function getWaterStatsRange(period, now = new Date(), log = null) {
+  const p = WATER_PERIODS.includes(period) ? period : 'year';
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const start = p === 'year'
+    ? new Date(today.getFullYear(), today.getMonth() - 11, 1)
+    : new Date(today.getFullYear(), today.getMonth(), today.getDate() - (p === 'week' ? 6 : 29));
+  const endDate = localKey(today);
+  const dayKeys = [];
+  for (const d = new Date(start); localKey(d) <= endDate; d.setDate(d.getDate() + 1)) dayKeys.push(localKey(d));
+
+  /* год — 12 месячных столбцов графика; последний обрезан сегодняшним днём */
+  let months = null;
+  if (p === 'year') {
+    months = [];
+    for (let i = 11; i >= 0; i--) {
+      const m = new Date(today.getFullYear(), today.getMonth() - i, 1);
+      const last = localKey(new Date(m.getFullYear(), m.getMonth() + 1, 0));
+      const s = localKey(m);
+      months.push({ ym: s.slice(0, 7), start: s, end: last > endDate ? endDate : last });
+    }
+  }
+
+  const dailyTotals = dayKeys.map((date) => ({ date, total: Math.max(0, pickWater(log ? log[date] : null) || 0) }));
+  const sum = dailyTotals.reduce((s, x) => s + x.total, 0);
+  return {
+    period: p,
+    label: WATER_PERIOD_LABEL[p],
+    startDate: dayKeys[0],
+    endDate,
+    numberOfDays: dayKeys.length,
+    dayKeys,
+    months,
+    dailyTotals,
+    sum,
+    average: dayKeys.length ? sum / dayKeys.length : 0,
+  };
+}
+
 /* ---------- качество данных ---------- */
 export function calculateDataCoverage(points, range, todayDay, allPoints = points) {
   const past = allPoints.filter((p) => p.day <= todayDay);

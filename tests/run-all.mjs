@@ -13,6 +13,7 @@ const run = [
   ['meds.test.mjs', 'America/Los_Angeles'], ['meds.test.mjs', 'Asia/Tokyo'], ['meds.test.mjs', 'Europe/Madrid'], // локальный день приёма
   ['sleep.test.mjs', 'Europe/Madrid'], ['sleep.test.mjs', 'America/Los_Angeles'], ['sleep.test.mjs', 'Asia/Tokyo'], ['sleep.test.mjs', 'UTC'], // день пробуждения, CET/CEST
   ['history-import.test.mjs', 'Europe/Madrid'], ['history-import.test.mjs', 'America/Los_Angeles'], ['history-import.test.mjs', 'Asia/Tokyo'], // локальные даты истории
+  ['water-stats-range.test.mjs'], ['water-stats-range.test.mjs', 'America/Los_Angeles'], ['water-stats-range.test.mjs', 'Asia/Tokyo'], ['water-stats-range.test.mjs', 'Pacific/Kiritimati'], // диапазон периода воды — локальный календарь
   ['notifications.test.mjs'], // сам перебирает 4 timezone
   ['push-worker.test.mjs', 'Asia/Tokyo'],
   ['push-client.test.mjs', 'Europe/Madrid'],
