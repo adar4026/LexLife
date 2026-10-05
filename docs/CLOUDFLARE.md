@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Primary production** | `https://lexlife.alexus4026.workers.dev/` — Worker `lexlife` (Static Assets + `/api` + D1 + Cron) |
-| **Legacy backup** | `https://adar4026.github.io/LexLife/` — GitHub Pages из `main`, без серверного push, не отключается до отдельного решения |
+| **Legacy backup** | `https://adar4026.github.io/LexLife/` — GitHub Pages: production-сборка `dist/` из `main` (workflow `.github/workflows/pages.yml`), без серверного push, не отключается до отдельного решения |
 | **Source of truth** | GitHub `adar4026/LexLife`, ветка `main` |
 | **Автодеплой** | Cloudflare Workers Builds: push в `main` → `npm ci` → `npm test` → `npm run build` → `npx wrangler deploy` |
 
@@ -57,7 +57,7 @@ GitHub main ── source of truth
 | `js/services/pushClient.js` | фронтенд: устройство, подписка, синхронизация правил, offline; `serverAllowed: false` на резервной копии |
 | `js/services/zonedSchedule.js` | расписание в IANA timezone (общий для сервера и occurrenceId) |
 | `js/services/occurrenceStore.js` | журнал показанных срабатываний (Cache API, общий со SW) |
-| `build-info.json` | в репозитории `sha: null` (так его видит GitHub Pages); сборка Cloudflare пишет version/sha/builtAt |
+| `build-info.json` | в репозитории `sha: null` (заглушка для корня репозитория без сборки); сборка — Cloudflare и GitHub Pages — пишет version/sha/builtAt |
 | `scripts/build-assets.mjs` | `dist/` из allowlist + отметки сборки (`build-info.json`, `CACHE_VERSION-<sha7>` в `sw.js`) |
 | `scripts/gen-vapid.mjs` | пара VAPID; `--dev-vars` пишет локальную пару в `.dev.vars` (gitignored) |
 
@@ -165,7 +165,8 @@ API-токен Cloudflare не хранится в GitHub; секреты Worker
 
 `npm run build` пишет в `dist/build-info.json` версию (`APP_VERSION`), commit (`WORKERS_CI_COMMIT_SHA`) и время, а в
 `dist/sw.js` — `CACHE_VERSION = 'lexlife-vNN-<sha7>'`. Видно в «Настройки → О приложении» (`build 1a2b3c4 · дата`)
-и в `GET /api/status`. На GitHub Pages сборки нет — там «без номера сборки», адрес «резервный (GitHub Pages)».
+и в `GET /api/status`. На GitHub Pages тот же `npm run build` (workflow `pages.yml`), поэтому номер сборки есть и там;
+адрес по-прежнему «резервный (GitHub Pages)», `/api` на нём нет.
 
 ### Обновление Service Worker
 
@@ -176,7 +177,8 @@ API-токен Cloudflare не хранится в GitHub; секреты Worker
 приложения загружаются статически при старте (динамически — только pdf.js, он не меняется между сборками), а без
 `skipWaiting` PWA на iPhone, которую почти никогда не закрывают полностью, могла бы неделями оставаться на старой
 версии. Новый код начинает работать со следующего запуска приложения. Ручной `CACHE_VERSION` (`lexlife-vNN`) всё
-равно поднимается при изменении ассетов — это версия для GitHub Pages, где сборки нет.
+равно поднимается при изменении ассетов: это человекочитаемая версия ассетов, по ней видно, что менялось,
+и она попадает в имя кэша на обоих адресах (`lexlife-vNN-<sha7>`).
 
 ## D1 migrations
 
@@ -237,7 +239,10 @@ npm run db:migrate:remote                            # применить
 
 ## GitHub Pages (legacy backup)
 
-- Источник — ветка `main`, корень репозитория (без сборки). После merge в `main` получает тот же код.
+- Источник — workflow `.github/workflows/pages.yml`: push в `main` → `npm test` → `npm run build` → публикуется `dist/`.
+  Наружу уходит только allowlist сборки (`index.html`, `manifest.json`, `build-info.json`, `sw.js`, `css`, `js`, `icons`);
+  `tests/`, `docs/`, `scripts/`, `worker/`, `private/` на Pages недоступны (404). До 2026-10-05 публиковался корень
+  репозитория (`build_type: legacy`), поэтому `sw.js` там был без суффикса commit, а `tests/` отдавались наружу.
 - Не отключать, не делать redirect, не менять DNS, не удалять старую PWA с iPhone до отдельного решения.
 - Роль `legacy`: ни одного запроса к `/api` (проверено e2e по логу сервера), плашка «Резервная версия» со ссылкой
   на основной адрес (без автоматического перехода), `notificationclick` открывает только свой origin (относительные
@@ -250,13 +255,15 @@ npm run db:migrate:remote                            # применить
 1. `npm test` — зелёный (в т. ч. Node 24, как в Workers Builds).
 2. Секретов нет: `git diff origin/main..HEAD` без ключей/токенов/endpoint, без `private/` и бэкапов.
 3. D1: `npx wrangler d1 migrations list lexlife --remote` — новых миграций нет, или применены отдельно до релиза.
-4. Если менялись ассеты — поднят `CACHE_VERSION` в `sw.js` (для GitHub Pages).
+4. Если менялись ассеты — поднят `CACHE_VERSION` в `sw.js`, и проверка версии в `tests/notifications.test.mjs`
+   обновлена на то же число (она сверяет точное значение).
 5. Push в `main` → Workers Builds зелёный (Dashboard → lexlife → Deployments). Второй deploy вручную не делать.
 6. `GET /api/status` → `200`, `db: ok`, `push: configured`, `build.sha` = commit из `main`.
 7. SW обновился: «Настройки → О приложении» показывает новый `build`, офлайн открывается.
 8. Push: «Проверить фоновый push» на iPhone приходит; число устройств/подписок в D1 не выросло.
 9. Cron: `npx wrangler tail lexlife` — вызовы раз в минуту без исключений; D1 без ошибок (`d1 info`).
-10. GitHub Pages: `https://adar4026.github.io/LexLife/` открывается, показывает «Резервная версия», к `/api` не обращается.
+10. GitHub Pages: workflow «GitHub Pages (резервная копия)» зелёный; `https://adar4026.github.io/LexLife/` открывается,
+    показывает «Резервная версия», к `/api` не обращается; `/tests/run-all.mjs` и `/package.json` отдают 404.
 11. Записать новую стабильную точку (тег + Worker version), если релиз подтверждён на iPhone.
 
 ## Локальная разработка
