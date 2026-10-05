@@ -1,0 +1,54 @@
+# Резервная копия LexLife на GitHub Pages (роль `legacy`, см. docs/CLOUDFLARE.md).
+# Публикуется production-сборка dist/, а не корень репозитория: наружу уходят
+# только файлы приложения из allowlist сборки (index.html, manifest.json,
+# build-info.json, sw.js, css, js, icons) — без tests/, docs/, scripts/, worker/.
+# Сборка штатная (`npm run build`), поэтому на Pages тот же CACHE_VERSION с
+# суффиксом commit, что и на Cloudflare, и настоящий build-info.json.
+# Зависимостей нет: тесты и сборка работают на встроенных модулях Node.
+name: GitHub Pages (резервная копия)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Один деплой за раз; идущую публикацию не отменяем.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Резервную копию не публикуем из сломанного кода.
+      - name: npm test
+        run: npm test
+
+      - name: npm run build
+        run: npm run build
+        env:
+          WORKERS_CI_BRANCH: ${{ github.ref_name }}
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
