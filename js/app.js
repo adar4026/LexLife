@@ -29,9 +29,9 @@ import {
   napMinutes, totalDayMinutes, minutesToClock, clampSleepGoal, addDays as sleepAddDays,
 } from './services/sleep.js';
 import {
-  ACTIVITY_METRICS, ACTIVITY_KEYS, LEGACY_ACTIVITY_SOURCE, STEPS_MAX, WALK_KM_MAX, RIDE_KM_MAX, RIDE_MINUTES_MAX, ACTIVITY_NOTE_MAX,
+  ACTIVITY_METRICS, ACTIVITY_KEYS, LEGACY_ACTIVITY_SOURCE, ACTIVITY_NOTE_MAX, STEPS_SOURCES, STEPS_SOURCE_CHOICES,
   normalizeDailyInput, normalizeRideInput, dayValues, ridesByDate, rideDayKm, latestValue, lastDays, activityPeriodStats, comparePrevPeriod,
-  fmtActivityValue, fmtActivity, activityUnit,
+  fmtActivityValue, fmtActivity, activityUnit, stepsToKm, fmtKmApprox, parseActivityNumber,
 } from './services/activity.js';
 import { nextFire } from './services/notifySchedule.js';
 import { createNotifier, describeNotifyState, armPatch, waterRulePatch, NOTIF_ROUTES, isSafeRoute } from './services/notifier.js';
@@ -157,7 +157,6 @@ const HOME_ICONS = {
   sleep: '<path d="M19.6 14.8A7.9 7.9 0 0 1 9.2 4.4a7.9 7.9 0 1 0 10.4 10.4z"/>',
   sliders: '<path d="M4 7.5h9M17.5 7.5H20M4 16.5h3M11.5 16.5H20"/><circle cx="15.2" cy="7.5" r="2.2"/><circle cx="9.2" cy="16.5" r="2.2"/>',
   steps: '<path d="M8.6 3.8c1.7 0 2.6 1.7 2.6 3.8s-1.1 4-2.6 4-2.7-1.6-2.7-3.9.9-3.9 2.7-3.9z"/><path d="M6.3 14.1h4.6l-.3 2.1a2.2 2.2 0 0 1-4.3 0z"/><path d="M15.6 7.8c1.7 0 2.6 1.7 2.6 3.8s-1.1 4-2.6 4-2.7-1.6-2.7-3.9.9-3.9 2.7-3.9z"/><path d="M13.3 18.1h4.6l-.3 2.1a2.2 2.2 0 0 1-4.3 0z"/>',
-  walk: '<circle cx="13.2" cy="4.4" r="1.9"/><path d="M9.6 21l2.4-6.4 2.8 2.7V21"/><path d="M12 14.6l.9-5.8-3.5 1.9-1.3 3.1"/><path d="M12.9 8.8l2.2 3 2.9 1"/>',
   bike: '<circle cx="6" cy="15.8" r="3.7"/><circle cx="18" cy="15.8" r="3.7"/><path d="M6 15.8l3.7-6.9h6.4L18 15.8"/><path d="M9.7 8.9l2.6 6.9H6"/><path d="M8.4 6.4h2.8"/><path d="M14.8 6h2.4l-1.1 2.9"/>',
 };
 HOME_ICONS.temperature = HOME_ICONS.pulse;
@@ -190,11 +189,11 @@ function homeSection(title, route, label, more = 'Все') {
 async function HomeScreen() {
   const now = new Date();
   const today = dateKey(now);
-  const [water, goal, hyd, tests, metricsLog, visits, meds, takenToday, intakes, sleepEntries, sleepSettings, stepsLog, walkLog, bikeRides] = await Promise.all([
+  const [water, goal, hyd, tests, metricsLog, visits, meds, takenToday, intakes, sleepEntries, sleepSettings, stepsLog, bikeRides] = await Promise.all([
     Storage.getWater(today), Storage.getWaterGoal(), Storage.getHydration(), Storage.getTests(), Storage.getMetricsLog(),
     Storage.getVisits(), Storage.getMeds(), Storage.getMedLog(today), Storage.getMedIntakes(today),
     Storage.getSleepEntries(), Storage.getSleepSettings(),
-    Storage.getDailyActivityLog('steps'), Storage.getDailyActivityLog('walk'), Storage.getBikeRides(),
+    Storage.getDailyActivityLog('steps'), Storage.getBikeRides(),
   ]);
   const screen = el('<div class="home"></div>');
   /* мягкое появление — только при первом открытии Главной за запуск (не на каждом переключении вкладки) */
@@ -203,7 +202,7 @@ async function HomeScreen() {
 
   screen.appendChild(renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, intakes, metricsLog, enter }));
   screen.appendChild(renderHomeSleep(getSleepForDate(sleepEntries, today), sleepSettings.goalMinutes));
-  const activityStores = { steps: stepsLog, walk: walkLog, bike: bikeRides };
+  const activityStores = { steps: stepsLog, bike: bikeRides };
   ACTIVITY_KEYS.forEach((k) => screen.appendChild(renderHomeActivity(k, activityStores[k], today)));
   const upcoming = renderUpcoming({ meds, takenToday, intakes, visits, now });
   if (upcoming) screen.appendChild(upcoming);
@@ -371,8 +370,9 @@ function renderHomeSleep(e, goal) {
   return sec;
 }
 
-/* ---------- Шаги / Дистанция пешком / Велосипед: отдельная карточка каждого показателя ----------
-   Как карточка сна: значение за сегодня (или последнее записанное и его дата), справа — мини-график
+/* ---------- Шаги / Велосипед: отдельная карточка каждого показателя ----------
+   Как карточка сна: значение за сегодня (или последнее записанное и его дата; у шагов — с расчётными
+   км: «8 450 шагов · ≈ 6,3 км»), справа — мини-график
    последних 7 дней; нажатие — экран показателя. Значения — services/activity.js (dayValues). */
 const plRides = (n) => `${n} ${plural(n, 'поездка', 'поездки', 'поездок')}`;
 function activitySpark(values, today) {
@@ -2947,7 +2947,6 @@ async function restoreFlow(file) {
     ['Архив прежней версии (планка и др.), дней', summary.activityDays],
     ['Сон', `${summary.sleep || 0} ${plural(summary.sleep || 0, 'запись', 'записи', 'записей')}`],
     ['Шаги', `${summary.steps || 0} ${plural(summary.steps || 0, 'день', 'дня', 'дней')}`],
-    ['Дистанция пешком', `${summary.walk || 0} ${plural(summary.walk || 0, 'день', 'дня', 'дней')}`],
     ['Велосипед', `${summary.bike || 0} ${plural(summary.bike || 0, 'поездка', 'поездки', 'поездок')}`],
   ];
   if (full) rows.push(['Документы анализов (PDF/фото)', full.attachments.length], ['Документы врачей и визитов', (full.visitAttachments || []).length]);
@@ -3385,7 +3384,7 @@ const WL_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const WL_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 
 /* =========================================================
-   Единый журнал показателя — вода, сон, шаги, дистанция пешком, велосипед.
+   Единый журнал показателя — вода, сон, шаги, велосипед.
    Один сценарий: показатель → «Журнал» → любая дата → добавить / изменить / удалить.
    Месяц ‹ › и «Сегодня», поля «Месяц» и «Перейти к дате», итог месяца, «+ Добавить запись»;
    ниже — дни месяца (новые сверху) с итогом дня и записями ✎ / ✕. Выбранная дата
@@ -3631,16 +3630,18 @@ async function WaterLogScreen(param) {
 }
 
 /* =========================================================
-   Шаги (#/steps) · Дистанция пешком (#/walk) · Велосипед (#/bike) — самостоятельные показатели
+   Шаги (#/steps) · Велосипед (#/bike) — самостоятельные показатели
    по образцу «Сна»: значение за выбранный день · статистика Неделя / Месяц / Год (календарные
-   периоды с ‹ ›) · последние записи · «Журнал» (#/steps-log, #/walk-log, #/bike-log — единый журнал).
-   Модель и расчёты — services/activity.js, хранение — Storage (steps_log, walk_log, bike_log).
+   периоды с ‹ ›) · последние записи · «Журнал» (#/steps-log, #/bike-log — единый журнал).
+   «Шаги» — вся ходьба (прогулка, дома, беговая дорожка); рядом с шагами — расчётные км
+   (stepsToKm, только оценка, не хранится). Модель и расчёты — services/activity.js,
+   хранение — Storage (steps_log, bike_log).
    Выбранные период и день живут в записи истории (saveEntryUi): «Назад» из журнала — туда же.
    ========================================================= */
 const ACT_PERIOD_KINDS = SLEEP_KINDS.map(([k]) => k);
 const ACT_SOURCE = { manual: 'вручную', [LEGACY_ACTIVITY_SOURCE]: 'перенесено из прежней версии' };
 const actSourceText = (e) => ACT_SOURCE[(e && e.source) || 'manual'] || esc(e.source);
-const ACT_JOURNAL_TITLE = { steps: 'Журнал шагов', walk: 'Журнал дистанции пешком', bike: 'Журнал поездок' };
+const ACT_JOURNAL_TITLE = { steps: 'Журнал шагов', bike: 'Журнал поездок' };
 const hhmmNow = () => { const d = new Date(); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
 /* Поездка без километров (перенесённый велотренажёр — только минуты) — никогда не «0 км»:
    «Велотренажёр · 35 мин» и подпись «Дистанция не указана»; в километры не входит. */
@@ -3658,36 +3659,52 @@ function rideSub(r) {
   return [r.km == null ? 'Дистанция не указана' : '', actSourceText(r), note ? esc(note) : ''].filter(Boolean).join(' · ');
 }
 const NO_KM = 'Дистанция не указана';
-const dailySub = (e) => [actSourceText(e), e.note ? esc(e.note) : ''].filter(Boolean).join(' · ');
+/* источник итога шагов — вторичная строка: «Беговая дорожка · заметка» */
+const stepsSourceText = (e) => esc(STEPS_SOURCES[(e && e.source) || 'manual'] || e.source);
+const dailySub = (e) => [stepsSourceText(e), e.note ? esc(e.note) : ''].filter(Boolean).join(' · ');
+/* «8 450 <small>шагов · ≈ 6,3 км</small>» — крупное значение дня / среднего */
+const actValueHtml = (metric, v) => {
+  const km = metric === 'steps' ? fmtKmApprox(stepsToKm(v)) : '';
+  return `${esc(fmtActivityValue(metric, v))} <small>${esc(activityUnit(metric, v))}${km ? ` · ${esc(km)}` : ''}</small>`;
+};
 /* число для поля ввода: 8450 / «6,4» */
 const actInputValue = (metric, v) => (v == null ? '' : metric === 'steps' ? String(v) : String(v).replace('.', ','));
 const actErrorsHtml = (errors) => `<p>${Object.values(errors).map((t) => esc(t)).join('<br>')}</p>`;
 
-/* Дневной итог (шаги / дистанция пешком): добавить или изменить, в т.ч. перенести на другую дату.
-   from — дата редактируемой записи (null — новая). Дата уже занята → «Заменить?» (у дня один итог,
-   дубля не бывает). Ошибка ввода → форма снова с введёнными значениями. → сохранённая дата | null */
+/* Дневной итог шагов: добавить или изменить, в т.ч. перенести на другую дату.
+   Вся ходьба дня — одним итогом; источник (вручную / прогулка / беговая дорожка) — только метка.
+   Под полем — расчётные км, пересчитываются при вводе. from — дата редактируемой записи (null — новая).
+   Дата уже занята → «Заменить?» (у дня один итог, дубля не бывает). Ошибка ввода → форма снова
+   с введёнными значениями. → сохранённая дата | null */
 async function editDailyActivity(metric, { date, from = null, existing = null } = {}) {
   const M = ACTIVITY_METRICS[metric];
-  const isSteps = metric === 'steps';
-  let v = { date, value: existing ? actInputValue(metric, existing[M.field]) : '', note: existing ? existing.note || '' : '' };
+  let v = { date, value: existing ? actInputValue(metric, existing[M.field]) : '', note: existing ? existing.note || '' : '', source: (existing && existing.source) || 'manual' };
   for (;;) {
     let raw = null;
-    const ok = await showDialog({
+    /* прочие метки (перенесённые записи, будущий автоматический источник) остаются выбранными как есть */
+    const choices = STEPS_SOURCE_CHOICES.includes(v.source) || !STEPS_SOURCES[v.source] ? STEPS_SOURCE_CHOICES : [...STEPS_SOURCE_CHOICES, v.source];
+    const kmHint = (val) => { const n = parseActivityNumber(val); return fmtKmApprox(n != null && !Number.isNaN(n) ? stepsToKm(n) : null); };
+    const pending = showDialog({
       title: from ? 'Изменить запись' : 'Новая запись',
       body: `
         <label class="field__label" for="jr-d">Дата</label>
         <input class="input" type="date" id="jr-d" value="${esc(v.date)}" max="${esc(dateKey())}">
-        <label class="field__label" for="jr-v" style="margin-top:10px">${isSteps ? 'Шаги за день' : 'Дистанция за день, км'}</label>
-        <input class="input" type="text" id="jr-v" inputmode="${isSteps ? 'numeric' : 'decimal'}" autocomplete="off" value="${esc(v.value)}" placeholder="${isSteps ? '8 450' : '6,4'}">
-        ${isSteps ? '<p class="dialog__muted" style="margin:6px 0 0">Шаги на беговой дорожке — тоже сюда: они входят в общий итог дня.</p>' : ''}
+        <label class="field__label" for="jr-v" style="margin-top:10px">Шаги за день</label>
+        <input class="input" type="text" id="jr-v" inputmode="numeric" autocomplete="off" value="${esc(v.value)}" placeholder="8 450">
+        <p class="dialog__muted act-km-hint" id="jr-km" aria-live="polite" style="margin:6px 0 0">${esc(kmHint(v.value))}</p>
+        <label class="field__label" for="jr-src" style="margin-top:10px">Источник</label>
+        <select class="select" id="jr-src">${choices.map((k) => `<option value="${esc(k)}"${k === v.source ? ' selected' : ''}>${esc(STEPS_SOURCES[k])}</option>`).join('')}</select>
+        <p class="dialog__muted" style="margin:6px 0 0">Прогулка, ходьба дома, беговая дорожка — всё входит в один итог шагов за день.</p>
         <label class="field__label" for="jr-note" style="margin-top:10px">Заметка (необязательно)</label>
         <input class="input" type="text" id="jr-note" maxlength="${ACTIVITY_NOTE_MAX}" value="${esc(v.note)}">
       `,
       actions: [
         { label: 'Отмена', value: false },
-        { label: from ? 'Сохранить' : 'Добавить', value: true, kind: 'primary', onClick: () => { raw = { date: $('#jr-d').value, value: $('#jr-v').value, note: $('#jr-note').value }; } },
+        { label: from ? 'Сохранить' : 'Добавить', value: true, kind: 'primary', onClick: () => { raw = { date: $('#jr-d').value, value: $('#jr-v').value, source: $('#jr-src').value, note: $('#jr-note').value }; } },
       ],
     });
+    $('#jr-v').addEventListener('input', (e) => { $('#jr-km').textContent = kmHint(e.target.value); });
+    const ok = await pending;
     if (!ok || !raw) return null;
     const n = normalizeDailyInput(metric, raw, { today: dateKey() });
     if (!n.ok) { await alertDialog('Запись не сохранена', actErrorsHtml(n.errors)); v = raw; continue; }
@@ -3813,7 +3830,7 @@ async function ActivityMetricScreen(metric) {
     const v = values[d] ?? null;
     const entry = metric === 'bike' ? null : store[d] || null;
     const rides = metric === 'bike' ? byDate.get(d) || [] : [];
-    const val = v != null ? `${esc(fmtActivityValue(metric, v))} <small>${esc(activityUnit(metric, v))}</small>` : rides.length ? NO_KM : 'Нет записи';
+    const val = v != null ? actValueHtml(metric, v) : rides.length ? NO_KM : 'Нет записи';
     let sub = '';
     if (entry) sub = dailySub(entry);
     else if (rides.length) sub = `${plRides(rides.length)}: ${rides.map((r) => esc(rideTitle(r))).join(', ')}`;
@@ -3856,7 +3873,6 @@ async function ActivityMetricScreen(metric) {
     const next = shiftPeriod(b, 1);
     const st = activityPeriodStats(values, ui.kind, ui.anchor, today);
     const cmp = comparePrevPeriod(values, ui.kind, ui.anchor, today);
-    const unitOf = (v) => activityUnit(metric, v);
     statsSlot.innerHTML = '';
     statsSlot.appendChild(el('<div class="section__head"><h2 class="section__title" id="act-st-title">Статистика</h2></div>'));
     const seg = el(`<div class="st-period" role="group" aria-label="Период статистики">${SLEEP_KINDS.map(([k, t]) => `<button class="st-period__btn${k === ui.kind ? ' is-active' : ''}" type="button" data-k="${k}" aria-pressed="${k === ui.kind}">${t}</button>`).join('')}</div>`);
@@ -3884,8 +3900,8 @@ async function ActivityMetricScreen(metric) {
     const card = el(`
       <div class="card st-card sleep-card act-card">
         <p class="sleep-kpi__label">В среднем за день</p>
-        <p class="sleep-kpi__val act-avg">${esc(fmtActivityValue(metric, st.average))} <small>${esc(unitOf(st.average))}</small></p>
-        <p class="sleep-kpi__sub">по ${st.daysWithData} ${daysDat(st.daysWithData)} с записями из ${st.elapsedDays}${cmp ? ` · ${cmp.delta >= 0 ? '+' : '−'}${esc(fmtActivity(metric, Math.abs(cmp.delta)))} по сравнению с ${PREV[ui.kind]}` : ''}</p>
+        <p class="sleep-kpi__val act-avg">${actValueHtml(metric, st.average)}</p>
+        <p class="sleep-kpi__sub">по ${st.daysWithData} ${daysDat(st.daysWithData)} с записями из ${st.elapsedDays}${cmp ? ` · ${cmp.delta >= 0 ? '+' : '−'}${esc(fmtActivity(metric, Math.abs(cmp.delta), { km: false }))} по сравнению с ${PREV[ui.kind]}` : ''}</p>
       </div>
     `);
     const bars = st.bars.map((x) => ({ start: dayNum(x.start), end: dayNum(x.end), value: x.value, src: x }));
@@ -3913,12 +3929,15 @@ async function ActivityMetricScreen(metric) {
       },
     }));
     const best = st.max, min = st.min;
+    /* в узкой плитке шаги — значение, расчётные км — вторичной строкой */
+    const tileVal = (v) => esc(fmtActivity(metric, v, { km: false }));
+    const tileSub = (v, text) => esc([metric === 'steps' ? fmtKmApprox(stepsToKm(v)) : '', text].filter(Boolean).join(' · '));
     card.appendChild(el(`
       <div class="sgrid sleep-grid act-grid">
-        <div class="sgrid__item"><div class="sgrid__label">Лучший день</div><div class="sgrid__val act-best">${esc(fmtActivity(metric, best.value))}</div><div class="sgrid__sub">${esc(sleepDayMonth(best.date, today))}</div></div>
-        <div class="sgrid__item"><div class="sgrid__label">Минимум</div><div class="sgrid__val act-min">${esc(fmtActivity(metric, min.value))}</div><div class="sgrid__sub">${esc(sleepDayMonth(min.date, today))}</div></div>
+        <div class="sgrid__item"><div class="sgrid__label">Лучший день</div><div class="sgrid__val act-best">${tileVal(best.value)}</div><div class="sgrid__sub">${tileSub(best.value, sleepDayMonth(best.date, today))}</div></div>
+        <div class="sgrid__item"><div class="sgrid__label">Минимум</div><div class="sgrid__val act-min">${tileVal(min.value)}</div><div class="sgrid__sub">${tileSub(min.value, sleepDayMonth(min.date, today))}</div></div>
         <div class="sgrid__item"><div class="sgrid__label">Дней с данными</div><div class="sgrid__val act-days">${st.daysWithData} из ${st.elapsedDays}</div><div class="sgrid__sub">${esc(sleepPeriodTitle(b))}</div></div>
-        <div class="sgrid__item"><div class="sgrid__label">Всего за период</div><div class="sgrid__val act-total">${esc(fmtActivity(metric, st.total))}</div><div class="sgrid__sub">сумма записанных дней</div></div>
+        <div class="sgrid__item"><div class="sgrid__label">Всего за период</div><div class="sgrid__val act-total">${tileVal(st.total)}</div><div class="sgrid__sub">${tileSub(st.total, 'сумма записанных дней')}</div></div>
       </div>
     `));
     card.appendChild(el(`<p class="st-note">Среднее, минимум и лучший день — только по дням с записями: пропущенный день не считается нулём.${ui.kind === 'year' ? ' Год показан по месяцам (среднее за день с записями); записи каждого дня сохраняются как есть.' : ''}${metric === 'bike' ? ' Итог дня — сумма дистанций всех поездок; поездки без дистанции в километры не входят.' : ''}</p>`));
@@ -3952,7 +3971,7 @@ async function ActivityMetricScreen(metric) {
   return screen;
 }
 
-/* Журнал шагов / дистанции пешком / поездок — тот же журнал, что у воды */
+/* Журнал шагов / поездок — тот же журнал, что у воды */
 async function ActivityLogScreen(metric, param) {
   const M = ACTIVITY_METRICS[metric];
   const screen = el(`<div class="act-log act-log--${metric}"></div>`);
@@ -4984,7 +5003,6 @@ const ST = {
   glucose: { name: 'Глюкоза', gen: 'глюкозы', unit: 'ммоль/л', d: 1, minSpan: 2 },
   water: { name: 'Потребление воды', gen: 'потребления воды', unit: 'мл', d: 0 },
   steps: { name: 'Количество шагов', gen: 'количества шагов', unit: 'шагов', d: 0 },
-  walk: { name: 'Дистанция пешком', gen: 'пешей дистанции', unit: 'км', d: 1 },
   bike: { name: 'Дистанция на велосипеде', gen: 'дистанции на велосипеде', unit: 'км', d: 1 },
 };
 const POINT_KEYS = ['weight', 'pulse', 'temperature', 'spo2', 'glucose'];
@@ -5013,12 +5031,12 @@ function lastLabel(point, today) {
 const pressureTxt = (s, d) => (s && d ? `${fmtN(s, 0)}/${fmtN(d, 0)}` : '—');
 
 async function StatsScreen() {
-  const [metricsLog, metricsConfig, tests, medLog, meds, medIntakes, stepsLog, walkLog, bikeLog] = await Promise.all([
+  const [metricsLog, metricsConfig, tests, medLog, meds, medIntakes, stepsLog, bikeLog] = await Promise.all([
     Storage.getMetricsLog(), Storage.getMetricsConfig(),
     Storage.getTests(), Storage.getAllMedLog(), Storage.getMeds(), Storage.getAllMedIntakes(),
-    Storage.getDailyActivityLog('steps'), Storage.getDailyActivityLog('walk'), Storage.getBikeRides(),
+    Storage.getDailyActivityLog('steps'), Storage.getBikeRides(),
   ]);
-  const engine = createStatsEngine({ metricsLog, metricsConfig, tests, medLog, medIntakes, meds, stepsLog, walkLog, bikeLog, testFields: TEST_FIELDS }, dateKey());
+  const engine = createStatsEngine({ metricsLog, metricsConfig, tests, medLog, medIntakes, meds, stepsLog, bikeLog, testFields: TEST_FIELDS }, dateKey());
   const screen = el('<div class="stats"></div>');
   let period = loadStatsPeriod();
 
@@ -5053,7 +5071,6 @@ async function StatsScreen() {
             <button class="btn-ghost" type="button" data-route="metric/pressure">🩸 Давление</button>
             <button class="btn-ghost" type="button" data-route="metric/water">💧 Вода</button>
             <button class="btn-ghost" type="button" data-route="steps">👟 Шаги</button>
-            <button class="btn-ghost" type="button" data-route="walk">🚶 Пешком</button>
             <button class="btn-ghost" type="button" data-route="bike">🚴 Велосипед</button>
           </div>
         </div>
@@ -5121,7 +5138,7 @@ async function StatsScreen() {
       cards.push(card({
         id: `st-${k}`, emoji: A.emoji, name: A.title,
         val: b.points.length ? fmtActivityValue(k, b.stats.avg) : '—', unit: k === 'steps' ? 'шагов/день' : 'км/день',
-        sub: b.points.length ? `по ${b.stats.days} ${daysDat(b.stats.days)} с записями`
+        sub: b.points.length ? `${k === 'steps' ? `${fmtKmApprox(stepsToKm(b.stats.avg))}/день · ` : ''}по ${b.stats.days} ${daysDat(b.stats.days)} с записями`
           : noKm ? `${plRides(b.noKm.count)} без дистанции` : (b.totalDays ? 'нет записей за период' : 'Недостаточно данных'),
       }));
     });
@@ -5177,7 +5194,6 @@ async function StatsScreen() {
     add('pulse', m.pulse);
     add('water', m.water, 'мл/день');
     add('steps', m.steps, 'шагов/день');
-    add('walk', m.walk, 'км/день');
     add('bike', m.bike, 'км/день');
     EXTRA_KEYS.forEach((k) => add(k, m[k]));
     /* регулярность измерений относительно предыдущего периода */
@@ -5226,7 +5242,7 @@ async function StatsScreen() {
       if (wc.deltaAvg != null) rows.push(['Среднее потребление воды', `${fmtN(wc.cur.avg)} против ${fmtN(wc.prev.avg)} мл/день · ${daysTxt}${goalTxt}`, `${fmtSigned(roundedDelta(wc.cur.avg, wc.prev.avg))} мл/день`]);
       else rows.push(['Среднее потребление воды', `${wc.cur.count ? 'в предыдущем периоде записей нет' : 'в этом периоде записей нет'} · ${daysTxt}`, wc.cur.count ? `${fmtN(wc.cur.avg)} мл/день` : '—']);
     }
-    [['steps', 'Шаги в среднем', 'шагов/день'], ['walk', 'Пешком в среднем', 'км/день'], ['bike', 'Велосипед в среднем', 'км/день']].forEach(([k, title, unit]) => {
+    [['steps', 'Шаги в среднем', 'шагов/день'], ['bike', 'Велосипед в среднем', 'км/день']].forEach(([k, title, unit]) => {
       const c = m[k].compare, d = ST[k].d;
       if (!c.cur.days && !c.prev.days) return;
       const daysTxt = `записи за ${c.cur.days} против ${c.prev.days} дн.`;
@@ -5386,7 +5402,7 @@ async function StatsScreen() {
     return sec;
   }
 
-  /* ---------- Шаги / Дистанция пешком / Велосипед: у каждого свой блок, своё хранилище и свой экран ---------- */
+  /* ---------- Шаги / Велосипед: у каждого свой блок, своё хранилище и свой экран ---------- */
   function activityStatSection(m, k) {
     const A = ACTIVITY_METRICS[k], b = m[k];
     const unit = k === 'steps' ? 'шагов' : 'км';
@@ -5411,12 +5427,15 @@ async function StatsScreen() {
     const note = aggNote(m.bucketSize);
     if (note) cardEl.appendChild(el(`<p class="st-note">${esc(note)}</p>`));
     const total = b.points.reduce((s, p) => s + p.value, 0);
+    /* шаги — основное значение плитки, расчётные км — вторичной строкой */
+    const val = (v) => fmtActivity(k, v, { km: false });
+    const sub = (v, text) => [k === 'steps' && v != null ? fmtKmApprox(stepsToKm(v)) : '', text].filter(Boolean).join(' · ');
     cardEl.appendChild(el(tiles([
-      ['Среднее в день', fmtActivity(k, b.stats.avg), `по ${b.stats.days} ${daysDat(b.stats.days)} с записями`],
-      ['Лучший день', b.best ? fmtActivity(k, b.best.value) : '—', b.best ? fmtDayShort(b.best.day) : ''],
-      ['Минимум', b.stats.min ? fmtActivity(k, b.stats.min.value) : '—', b.stats.min ? fmtDayShort(b.stats.min.day) : ''],
+      ['Среднее в день', val(b.stats.avg), sub(b.stats.avg, `по ${b.stats.days} ${daysDat(b.stats.days)} с записями`)],
+      ['Лучший день', b.best ? val(b.best.value) : '—', b.best ? sub(b.best.value, fmtDayShort(b.best.day)) : ''],
+      ['Минимум', b.stats.min ? val(b.stats.min.value) : '—', b.stats.min ? sub(b.stats.min.value, fmtDayShort(b.stats.min.day)) : ''],
       ['Дней с данными', `${b.stats.days} из ${m.range.days}`, `записей нет: ${m.range.days - b.stats.days} дн.`],
-      ['Всего за период', fmtActivity(k, total), 'сумма записанных дней'],
+      ['Всего за период', val(total), sub(total, 'сумма записанных дней')],
     ])));
     if (noKmNote) cardEl.appendChild(noKmNote);
     sec.appendChild(cardEl);
@@ -5584,7 +5603,6 @@ const DRAWER_SECTIONS = [
     { route: 'sleep', icon: '😴', title: 'Сон' },
     { route: 'metric/water', icon: '💧', title: 'Вода' },
     { route: 'steps', icon: '👟', title: 'Шаги' },
-    { route: 'walk', icon: '🚶', title: 'Дистанция пешком' },
     { route: 'bike', icon: '🚴', title: 'Велосипед' },
     { route: 'visits', icon: '🩺', title: 'Врачи и визиты' },
   ],

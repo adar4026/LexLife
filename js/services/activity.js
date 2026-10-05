@@ -1,15 +1,18 @@
 /* =========================================================
-   activity.js — самостоятельные показатели «Шаги», «Дистанция пешком», «Велосипед»:
-   модель записи, проверка, суммы по дням, статистика периода, миграция старой «Активности».
+   activity.js — самостоятельные показатели «Шаги» и «Велосипед»:
+   модель записи, проверка, суммы по дням, статистика периода, миграция старой «Активности»,
+   расчётные километры из шагов (stepsToKm).
    Чистые функции без DOM и без хранилища (storage.js импортирует этот файл).
 
    Модель (аддитивные ключи, схема v8 не меняется — как sleep_log и med_intakes):
    • steps_log = { "ГГГГ-ММ-ДД": { steps, note, source, createdAt, updatedAt } }
      Один итог за календарный день: повторная запись той же даты обновляет значение,
-     дубля быть не может по устройству хранилища. Шаги на беговой дорожке — обычные шаги.
-   • walk_log  = { "ГГГГ-ММ-ДД": { km, note, source, createdAt, updatedAt } }
-     Тоже один дневной итог (как шаги и точечные показатели metrics_log): итог дня вводится
-     и правится целиком, его дата переносится одной операцией.
+     дубля быть не может по устройству хранилища. «Шаги» — вся ходьба за день: прогулка,
+     дома, беговая дорожка, вручную, будущий автоматический источник. source — только метка
+     происхождения итога (STEPS_SOURCES), отдельного показателя у источника нет.
+     Километры рядом с шагами — оценка, считается при показе (stepsToKm) и нигде не хранится:
+     ни в записи, ни в резервной копии. Реальную дистанцию (GPS / Apple Health), если она
+     появится, нельзя молча смешивать с этой оценкой.
    • bike_log  = [{ id, date, time, km, minutes, note, source, createdAt, updatedAt }]
      Несколько поездок за день; итог дня — сумма km. time «ЧЧ:ММ» необязательно;
      km или minutes — хотя бы одно (перенесённые записи велотренажёра — только минуты).
@@ -18,15 +21,14 @@
      поэтому удалённая пользователем перенесённая запись не возвращается ни при следующем
      запуске, ни после восстановления новой копии.
    source: 'manual' — вручную, 'activity' — перенесено из старого раздела «Активность»;
-   будущие источники (импорт) — свои ключи. Пропущенный день — «нет данных», а не 0.
+   у шагов ещё 'stroll' / 'treadmill' / 'auto' (STEPS_SOURCES); будущие источники — свои ключи. Пропущенный день — «нет данных», а не 0.
    ========================================================= */
 
 import { periodBounds, shiftPeriod, addDays, daysBetween, localDay } from './sleep.js';
 
-export const ACTIVITY_KEYS = ['steps', 'walk', 'bike'];
+export const ACTIVITY_KEYS = ['steps', 'bike'];
 /* Ограничения ввода (разумные пределы для одного дня / одной поездки) */
 export const STEPS_MAX = 200000;
-export const WALK_KM_MAX = 300;
 export const RIDE_KM_MAX = 1000;
 export const RIDE_MINUTES_MAX = 1440;
 export const ACTIVITY_NOTE_MAX = 500;
@@ -36,9 +38,13 @@ export const ACTIVITY_MIGRATION_VERSION = 1;
 /* Описание показателей для экранов: единица, точность, маршруты */
 export const ACTIVITY_METRICS = {
   steps: { key: 'steps', title: 'Шаги', short: 'Шаги', emoji: '👟', route: 'steps', logRoute: 'steps-log', kind: 'daily', field: 'steps', unit: 'шагов', decimals: 0, max: STEPS_MAX },
-  walk: { key: 'walk', title: 'Дистанция пешком', short: 'Пешком', emoji: '🚶', route: 'walk', logRoute: 'walk-log', kind: 'daily', field: 'km', unit: 'км', decimals: 2, max: WALK_KM_MAX },
   bike: { key: 'bike', title: 'Велосипед', short: 'Велосипед', emoji: '🚴', route: 'bike', logRoute: 'bike-log', kind: 'rides', field: 'km', unit: 'км', decimals: 2, max: RIDE_KM_MAX },
 };
+
+/* Источник дневного итога шагов — только метка. Выбрать в форме можно STEPS_SOURCE_CHOICES;
+   'auto' — задел под автоматический источник, 'activity' — перенесённые записи. */
+export const STEPS_SOURCES = { manual: 'Вручную', stroll: 'Прогулка', treadmill: 'Беговая дорожка', auto: 'Автоматически', activity: 'Перенесено из прежней версии' };
+export const STEPS_SOURCE_CHOICES = ['manual', 'stroll', 'treadmill'];
 
 /* ---------- примитивы ---------- */
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -71,8 +77,9 @@ export function parseActivityNumber(raw) {
 
 /* ---------- форма → запись ---------- */
 
-/* Дневной итог (шаги / дистанция пешком). input: { date, value, note }, opts.today.
-   → { ok, errors, value: { date, steps|km, note } } */
+/* Дневной итог шагов. input: { date, value, note, source? }, opts.today.
+   source — ключ STEPS_SOURCES (не задан — хранилище оставит прежний / 'manual').
+   → { ok, errors, value: { date, steps, note[, source] } } */
 export function normalizeDailyInput(metric, input = {}, { today = localDay() } = {}) {
   const M = ACTIVITY_METRICS[metric];
   if (!M || M.kind !== 'daily') throw new Error(`не дневной показатель: ${metric}`);
@@ -82,17 +89,16 @@ export function normalizeDailyInput(metric, input = {}, { today = localDay() } =
   else if (date > today) errors.date = 'Дата не может быть в будущем';
   const n = parseActivityNumber(input.value);
   let v = null;
-  if (n == null || Number.isNaN(n)) errors.value = metric === 'steps' ? 'Укажите количество шагов' : 'Укажите дистанцию в километрах';
-  else if (metric === 'steps') {
+  if (n == null || Number.isNaN(n)) errors.value = 'Укажите количество шагов';
+  else {
     v = Math.round(n);
     if (v < 0 || v > STEPS_MAX) errors.value = `Шагов — от 0 до ${STEPS_MAX.toLocaleString('ru-RU')}`;
-  } else {
-    v = round2(n);
-    if (v < 0 || v > WALK_KM_MAX) errors.value = `Дистанция — от 0 до ${WALK_KM_MAX} км`;
   }
+  const source = input.source == null || input.source === '' ? null : String(input.source);
+  if (source != null && !Object.prototype.hasOwnProperty.call(STEPS_SOURCES, source)) errors.source = 'Неизвестный источник';
   const note = String(input.note || '').trim().slice(0, ACTIVITY_NOTE_MAX);
   const ok = !Object.keys(errors).length;
-  return { ok, errors, value: ok ? { date, [M.field]: v, note } : null };
+  return { ok, errors, value: ok ? { date, [M.field]: v, note, ...(source ? { source } : {}) } : null };
 }
 
 /* Поездка. input: { date, time, km, minutes, note } → { ok, errors, value } */
@@ -128,12 +134,8 @@ const metaOk = (e) => (e.source == null || (typeof e.source === 'string' && SOUR
 export function isValidStepsEntry(e) {
   return isObj(e) && isInt(e.steps) && e.steps >= 0 && e.steps <= STEPS_MAX && metaOk(e);
 }
-export function isValidWalkEntry(e) {
-  return isObj(e) && isNum(e.km) && e.km >= 0 && e.km <= WALK_KM_MAX && metaOk(e);
-}
 const dailyLogOf = (entryOk) => (v) => isObj(v) && Object.entries(v).every(([d, e]) => isActivityDay(d) && entryOk(e));
 export const isValidStepsLog = dailyLogOf(isValidStepsEntry);
-export const isValidWalkLog = dailyLogOf(isValidWalkEntry);
 
 export function isValidRide(e) {
   const hasKm = e && e.km != null, hasMin = e && e.minutes != null;
@@ -171,7 +173,7 @@ export function rideDayKm(list) {
 }
 
 /* Значения по дням: { "ГГГГ-ММ-ДД": число } — только дни, где значение есть.
-   store — steps_log / walk_log (объект) или bike_log (массив). */
+   store — steps_log (объект) или bike_log (массив). */
 export function dayValues(metric, store) {
   const M = ACTIVITY_METRICS[metric];
   const out = {};
@@ -286,6 +288,26 @@ export function migrateLegacyActivity({ activityDays, stepsLog, bikeLog } = {}, 
   return { stepsLog: steps, bikeLog: rides, marker, changed: marker.stepsAdded + marker.bikeAdded > 0 };
 }
 
+/* ---------- километры из шагов (оценка) ----------
+   Длина шага при ходьбе ≈ рост × 0,415; км = шаги × длина шага (см) / 100 000, округление до 0,1.
+   Роста в приложении нет → DEFAULT_HEIGHT_CM (шаг 74,7 см). Длина шага считается в целых мм,
+   чтобы округление не зависело от двоичной погрешности (180 × 0,415 = 74,69999…). */
+export const STEP_LENGTH_FACTOR = 0.415;
+export const DEFAULT_HEIGHT_CM = 180;
+const HEIGHT_MIN = 100, HEIGHT_MAX = 250;
+const stepLengthMm = (heightCm) => Math.round((isNum(heightCm) && heightCm >= HEIGHT_MIN && heightCm <= HEIGHT_MAX ? heightCm : DEFAULT_HEIGHT_CM) * STEP_LENGTH_FACTOR * 10);
+/* длина шага, см: 180 → 74,7; рост не задан / вне 100–250 см → по DEFAULT_HEIGHT_CM */
+export const stepLengthCm = (heightCm) => stepLengthMm(heightCm) / 10;
+/* шаги → км (0,1) | null, если шагов нет / некорректно */
+export function stepsToKm(steps, heightCm) {
+  if (!isNum(steps) || steps < 0) return null;
+  return Math.round((Math.round(steps) * stepLengthMm(heightCm)) / 100000) / 10;
+}
+/* «≈ 6,3 км» (неразрывные пробелы — «≈» не отрывается от числа) | '' */
+export function fmtKmApprox(km) {
+  return isNum(km) ? `≈\u00a0${km.toLocaleString('ru-RU', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}\u00a0км` : '';
+}
+
 /* ---------- форматирование ---------- */
 export function fmtActivityValue(metric, v) {
   if (v == null || !isNum(v)) return '—';
@@ -301,4 +323,12 @@ const plural = (n, one, few, many) => {
 };
 /* единица под число: «1 шаг», «3 шага», «8 450 шагов»; км не склоняется */
 export const activityUnit = (metric, v) => (metric === 'steps' ? plural(v ?? 0, 'шаг', 'шага', 'шагов') : 'км');
-export const fmtActivity = (metric, v) => `${fmtActivityValue(metric, v)} ${activityUnit(metric, v)}`;
+/* «8 450 шагов · ≈ 6,3 км» — у шагов рядом всегда расчётные км (opts.km: false — без них,
+   opts.heightCm — рост, если появится); «7,4 км» — велосипед */
+export function fmtActivity(metric, v, { km = true, heightCm } = {}) {
+  const base = `${fmtActivityValue(metric, v)} ${activityUnit(metric, v)}`;
+  if (metric !== 'steps' || !km) return base;
+  const approx = fmtKmApprox(stepsToKm(v, heightCm));
+  return approx ? `${base} · ${approx}` : base;
+}
+export const fmtSteps = (steps, heightCm) => fmtActivity('steps', steps, { heightCm });

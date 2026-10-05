@@ -163,8 +163,8 @@ const cacheNames = (tab) => evaluate(tab, 'return (await caches.keys()).sort()')
 const pageBuildInfo = (tab) => evaluate(tab, "return (await (await fetch('build-info.json')).json()).sha");
 
 /* Разделы, которые новая версия добавляет при первом запуске (аддитивно, без смены схемы):
-   шаги / дистанция пешком / велосипед и отметка переноса старой «Активности» (services/activity.js) */
-const ADDITIVE_KEYS = ['steps_log', 'walk_log', 'bike_log', 'activity_migration'];
+   шаги / велосипед и отметка переноса старой «Активности» (services/activity.js) */
+const ADDITIVE_KEYS = ['steps_log', 'bike_log', 'activity_migration'];
 /* Прежние данные байт-в-байт; новых ключей — только из ADDITIVE_KEYS; IndexedDB и push — как были */
 function sameExceptAdditive(nextJson, prevJson) {
   const a = JSON.parse(nextJson), b = JSON.parse(prevJson);

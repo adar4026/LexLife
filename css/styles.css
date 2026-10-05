@@ -2461,29 +2461,25 @@ a.sleep-last:active { background: var(--surface-2); }
 }
 
 /* =========================================================
-   Шаги / Дистанция пешком / Велосипед (#/steps, #/walk, #/bike) и единый журнал.
+   Шаги / Велосипед (#/steps, #/bike) и единый журнал.
    Экраны показателей повторяют «Сон» (те же sleep-*, st-*, sgrid-классы); здесь — только
    отличия: цвета значков на Главной, мини-график 7 дней, панель журнала, выбор дня.
    ========================================================= */
 :root {
   --hm-steps: #f2a65a;
-  --hm-walk: #6fd38f;
   --hm-bike: #6cb8f0;
 }
 [data-theme="light"] {
   --hm-steps: #b8530c;
-  --hm-walk: #1d7f45;
   --hm-bike: #1b67ad;
 }
 .hrow__icon--steps { color: var(--hm-steps); background: color-mix(in srgb, var(--hm-steps) 14%, transparent); }
-.hrow__icon--walk { color: var(--hm-walk); background: color-mix(in srgb, var(--hm-walk) 14%, transparent); }
 .hrow__icon--bike { color: var(--hm-bike); background: color-mix(in srgb, var(--hm-bike) 14%, transparent); }
 /* мини-график последних 7 дней: сегодня — цвет показателя, остальные — приглушённо */
 .hspark { width: 60px; height: 27px; flex-shrink: 0; }
 .hspark__bar { fill: color-mix(in srgb, var(--hm-ink) 28%, transparent); }
 .hspark__none { fill: color-mix(in srgb, var(--hm-ink) 14%, transparent); }
 .hact[data-activity="steps"] .hspark__today { fill: var(--hm-steps); }
-.hact[data-activity="walk"] .hspark__today { fill: var(--hm-walk); }
 .hact[data-activity="bike"] .hspark__today { fill: var(--hm-bike); }
 
 /* экран показателя: выбранный день */

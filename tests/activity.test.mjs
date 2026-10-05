@@ -1,6 +1,8 @@
 /* =========================================================
-   tests/activity.test.mjs — самостоятельные показатели «Шаги», «Дистанция пешком», «Велосипед»
+   tests/activity.test.mjs — самостоятельные показатели «Шаги» и «Велосипед»
    (js/services/activity.js + StorageService): ввод за любую дату, правка, отсутствие дублей,
+   расчётные км рядом с шагами (stepsToKm), беговая дорожка = обычные шаги, нет «Дистанции пешком»
+   и walk_log,
    поездки и сумма дня, перенос на другую дату, статистика Неделя / Месяц / Год и её пересчёт,
    сохранность воды и сна, резервная копия, импорт старой копии, безопасная миграция
    старого раздела «Активность» (activity_days).
@@ -14,9 +16,11 @@ import assert from 'node:assert/strict';
 import { StorageService, MemoryDriver, parseBackup, BackupError, ActivityStoreError, CURRENT_SCHEMA_VERSION } from '../js/services/storage.js';
 import {
   ACTIVITY_METRICS, normalizeDailyInput, normalizeRideInput, dayValues, ridesByDate, rideDayKm, latestValue, lastDays,
-  activityPeriodStats, comparePrevPeriod, migrateLegacyActivity, isValidStepsLog, isValidWalkLog, isValidBikeLog, isValidRide,
-  fmtActivity, parseActivityNumber, STEPS_MAX,
+  activityPeriodStats, comparePrevPeriod, migrateLegacyActivity, isValidStepsLog, isValidBikeLog, isValidRide,
+  fmtActivity, parseActivityNumber, STEPS_MAX, ACTIVITY_KEYS, STEPS_SOURCES, STEPS_SOURCE_CHOICES,
+  stepsToKm, stepLengthCm, fmtKmApprox, fmtSteps, DEFAULT_HEIGHT_CM,
 } from '../js/services/activity.js';
+import * as ActivityModule from '../js/services/activity.js';
 import { normalizeSleepInput, inferBedDate, formatSleepDuration } from '../js/services/sleep.js';
 import { createStatsEngine } from '../js/services/analytics.js';
 
@@ -31,8 +35,7 @@ async function fresh() {
   await s.init();
   return s;
 }
-const steps = (date, value, note = '') => normalizeDailyInput('steps', { date, value, note }, { today: TODAY }).value;
-const walk = (date, value, note = '') => normalizeDailyInput('walk', { date, value, note }, { today: TODAY }).value;
+const steps = (date, value, note = '', source) => normalizeDailyInput('steps', { date, value, note, source }, { today: TODAY }).value;
 const ride = (date, time, km, minutes = '') => normalizeRideInput({ date, time, km, minutes }, { today: TODAY }).value;
 /* «существующая» установка со старыми данными: вода, сон, старая «Активность» */
 const WATER = { '2026-10-01': { total: 1800, entries: [{ t: '09:00', ml: 300 }, { t: '12:30', ml: 1500 }] }, '2026-10-02': { total: 900, entries: [] } };
@@ -105,35 +108,107 @@ test('шаги: ввод «8 450», беговая дорожка — те же 
   assert.equal(normalizeDailyInput('steps', { date: '2026-10-05', value: STEPS_MAX + 1 }, { today: TODAY }).ok, false);
   assert.equal(normalizeDailyInput('steps', { date: '2026-02-30', value: 1 }, { today: TODAY }).ok, false, 'несуществующая дата');
   assert.equal(parseActivityNumber('6,4'), 6.4);
-  assert.equal(plain(fmtActivity('steps', 8450)), '8 450 шагов');
-  assert.equal(plain(fmtActivity('steps', 1)), '1 шаг');
-  assert.equal(plain(fmtActivity('steps', 3)), '3 шага');
-  assert.equal(fmtActivity('walk', 6.4), '6,4 км');
+  assert.equal(plain(fmtActivity('steps', 8450)), '8 450 шагов · ≈ 6,3 км');
+  assert.equal(plain(fmtActivity('steps', 8450, { km: false })), '8 450 шагов');
+  assert.equal(plain(fmtActivity('steps', 1, { km: false })), '1 шаг');
+  assert.equal(plain(fmtActivity('steps', 3, { km: false })), '3 шага');
   assert.equal(fmtActivity('bike', 18.2), '18,2 км');
-  assert.deepEqual(Object.keys(ACTIVITY_METRICS), ['steps', 'walk', 'bike']);
+  assert.deepEqual(Object.keys(ACTIVITY_METRICS), ['steps', 'bike']);
 });
 
-/* ---------- 4–5. дистанция пешком ---------- */
+/* ---------- 4–5. «Дистанции пешком» нет; км рядом с шагами — расчёт ---------- */
 
-test('4. дистанция пешком: «6,4» км за дату', async () => {
+test('4. «Дистанции пешком» нет: ни показателя, ни walk_log, ни API', async () => {
+  assert.deepEqual(ACTIVITY_KEYS, ['steps', 'bike']);
+  assert.equal('walk' in ACTIVITY_METRICS, false);
+  assert.ok(!Object.values(ACTIVITY_METRICS).some((M) => /walk/.test(`${M.route} ${M.logRoute}`) || /пешком/i.test(M.title)), 'нет #/walk, #/walk-log');
+  assert.ok(!Object.keys(ActivityModule).some((k) => /walk/i.test(k)), 'нет isValidWalk*, WALK_KM_MAX');
+  assert.throws(() => normalizeDailyInput('walk', { date: '2026-10-04', value: 1 }), /не дневной показатель/);
   const s = await fresh();
-  await s.saveDailyActivity('walk', walk('2026-10-02', '6,4'));
-  const log = await s.getDailyActivityLog('walk');
-  assert.equal(log['2026-10-02'].km, 6.4);
-  assert.ok(isValidWalkLog(log));
-  assert.equal(dayValues('walk', log)['2026-10-02'], 6.4);
+  assert.equal(await s._read('walk_log', null), null, 'свежая установка не создаёт walk_log');
+  await assert.rejects(s.getDailyActivityLog('walk'), /не дневной показатель/);
+  const b = await s.exportBackup();
+  assert.equal('walk_log' in b.data, false, 'в бэкапе нет walk_log');
 });
 
-test('5. правка пешей дистанции и перенос на другую дату одной операцией', async () => {
+test('5. км из шагов: шаг = рост × 0,415, км = шаги × шаг / 100 000, округление до 0,1', () => {
+  assert.equal(stepLengthCm(180), 74.7);
+  assert.equal(stepsToKm(8450, 180), 6.3); // 8450 × 74,7 / 100 000 = 6,312…
+  assert.equal(stepsToKm(3200, 180), 2.4); // 2,390…
+  assert.equal(stepsToKm(12100, 180), 9); // 9,038…
+  assert.equal(stepsToKm(56200, 180), 42); // 41,98…
+  assert.equal(stepsToKm(8450, 165), 5.8); // шаг 68,5 см → 5,788…
+  /* округление ровно на границе 0,05: 1000 шагов × 75 см = 0,75 км → 0,8; 100 × 74,7 см = 0,0747 → 0,1 */
+  assert.equal(stepsToKm(1000, 180.7), 0.8);
+  assert.equal(stepsToKm(100, 180), 0.1);
+  assert.equal(stepsToKm(60, 180), 0);
+  assert.equal(stepsToKm(0, 180), 0);
+  assert.equal(plain(fmtSteps(3200, 180)), '3 200 шагов · ≈ 2,4 км');
+  assert.equal(plain(fmtSteps(8450, 180)), '8 450 шагов · ≈ 6,3 км');
+  assert.equal(plain(fmtSteps(12100, 180)), '12 100 шагов · ≈ 9,0 км');
+  assert.equal(plain(fmtSteps(56200, 180)), '56 200 шагов · ≈ 42,0 км');
+  assert.equal(fmtKmApprox(6.3), '≈\u00a06,3\u00a0км', '≈ не отрывается от числа');
+  /* ровно одна строка: шаги · ≈ км */
+  assert.match(plain(fmtSteps(8450)), /^8 450 шагов · ≈ 6,3 км$/);
+  assert.equal(plain(fmtSteps(8450)).replace(/ (?=\d{3}\b)/, ''), '8450 шагов · ≈ 6,3 км');
+});
+
+test('5a. роста нет / некорректный — шаг по умолчанию, без NaN и undefined', () => {
+  assert.equal(DEFAULT_HEIGHT_CM, 180);
+  for (const h of [undefined, null, NaN, 0, -170, 40, 400, '180', Infinity]) {
+    assert.equal(stepLengthCm(h), 74.7, `рост ${String(h)}`);
+    assert.equal(stepsToKm(8450, h), 6.3);
+    const t = fmtSteps(8450, h);
+    assert.ok(!/NaN|undefined|null|Infinity/.test(t), t);
+  }
+  for (const v of [null, undefined, NaN, -5, 'x']) {
+    assert.equal(stepsToKm(v), null);
+    assert.ok(!/NaN|undefined|≈/.test(fmtActivity('steps', v)), `шаги ${String(v)}: ${fmtActivity('steps', v)}`);
+  }
+  assert.equal(fmtKmApprox(null), '');
+  /* среднее с дробью: км — от того же округлённого числа шагов, что и на экране */
+  assert.equal(plain(fmtActivity('steps', 8450.4)), '8 450 шагов · ≈ 6,3 км');
+});
+
+test('5b. изменение числа шагов сразу меняет км; км нигде не хранятся', async () => {
   const s = await fresh();
-  await s.saveDailyActivity('walk', walk('2026-10-02', 6.4));
-  await s.saveDailyActivity('walk', walk('2026-10-02', '7,25'), { from: '2026-10-02' });
-  assert.equal((await s.getDailyActivity('walk', '2026-10-02')).km, 7.25);
-  await s.saveDailyActivity('walk', walk('2026-09-30', '7,25'), { from: '2026-10-02' });
-  const log = await s.getDailyActivityLog('walk');
-  assert.deepEqual(Object.keys(log), ['2026-09-30']);
-  assert.equal(log['2026-09-30'].km, 7.25);
-  await assert.rejects(s.saveDailyActivity('walk', walk('2026-10-01', 1), { from: '2026-10-03' }), (e) => e.code === 'NOT_FOUND');
+  await s.saveDailyActivity('steps', steps('2026-10-04', 3200));
+  let e = await s.getDailyActivity('steps', '2026-10-04');
+  assert.equal(plain(fmtActivity('steps', e.steps)), '3 200 шагов · ≈ 2,4 км');
+  await s.saveDailyActivity('steps', steps('2026-10-04', '12 100'), { from: '2026-10-04' });
+  e = await s.getDailyActivity('steps', '2026-10-04');
+  assert.equal(plain(fmtActivity('steps', e.steps)), '12 100 шагов · ≈ 9,0 км');
+  assert.deepEqual(Object.keys(e).sort(), ['createdAt', 'note', 'source', 'steps', 'updatedAt'], 'в записи нет km');
+  const b = await s.exportBackup();
+  assert.ok(!/"km"/.test(JSON.stringify(b.data.steps_log)), 'в бэкапе у шагов нет km');
+});
+
+test('5c. беговая дорожка — обычные шаги: тот же дневной итог, источник — только метка', async () => {
+  assert.deepEqual(STEPS_SOURCE_CHOICES, ['manual', 'stroll', 'treadmill']);
+  assert.equal(STEPS_SOURCES.treadmill, 'Беговая дорожка');
+  assert.equal(STEPS_SOURCES.auto, 'Автоматически');
+  assert.equal(normalizeDailyInput('steps', { date: '2026-10-04', value: 1, source: 'gps' }, { today: TODAY }).ok, false, 'неизвестный источник');
+  const s = await fresh();
+  await s.saveDailyActivity('steps', steps('2026-10-04', 4000, '', 'treadmill'));
+  const log = await s.getDailyActivityLog('steps');
+  assert.deepEqual(log['2026-10-04'].steps, 4000);
+  assert.equal(log['2026-10-04'].source, 'treadmill');
+  assert.deepEqual(dayValues('steps', log), { '2026-10-04': 4000 }, 'входит в общий ряд шагов');
+  assert.equal(plain(fmtActivity('steps', 4000)), '4 000 шагов · ≈ 3,0 км', 'км — по той же формуле');
+  /* повторный ввод за ту же дату (прогулка) — не дубль: только замена итога дня */
+  await assert.rejects(s.saveDailyActivity('steps', steps('2026-10-04', 9000, '', 'stroll')), (e) => e.code === 'DUPLICATE_DATE');
+  await s.saveDailyActivity('steps', steps('2026-10-04', 9000, '', 'stroll'), { overwrite: true });
+  assert.deepEqual(Object.keys(await s.getDailyActivityLog('steps')), ['2026-10-04']);
+  assert.equal((await s.getDailyActivity('steps', '2026-10-04')).source, 'stroll');
+  /* правка без источника оставляет прежнюю метку */
+  await s.saveDailyActivity('steps', steps('2026-10-04', 9100), { from: '2026-10-04' });
+  assert.equal((await s.getDailyActivity('steps', '2026-10-04')).source, 'stroll');
+  /* отдельной метрики / журнала / статистики у дорожки нет */
+  assert.equal('treadmill' in ACTIVITY_METRICS, false);
+  const m = createStatsEngine({ stepsLog: await s.getDailyActivityLog('steps') }, TODAY).forPeriod('7d');
+  assert.equal(m.steps.stats.avg, 9100);
+  assert.equal('treadmill' in m, false);
+  assert.equal(await s._read('treadmill_log', null), null);
 });
 
 /* ---------- 6–9. велосипед ---------- */
@@ -299,7 +374,6 @@ test('15–16. существующие вода и сон: байт-в-байт
   const before = { water: await d.get('metrics_log'), sleep: await d.get('sleep_log'), act: await d.get('activity_days'), goals: await d.get('activity_goals') };
   const s = await new StorageService(d).init();
   await s.saveDailyActivity('steps', steps('2026-10-04', 5000));
-  await s.saveDailyActivity('walk', walk('2026-10-04', 4.2));
   const r = await s.addBikeRide(ride('2026-10-04', '08:00', 10));
   await s.removeBikeRide(r.id);
   assert.equal(await d.get('metrics_log'), before.water, 'вода (metrics_log) не изменилась');
@@ -324,23 +398,23 @@ test('сон через полночь: 23:40 → 07:10 = 7 ч 30 мин, дат
 test('17. бэкап содержит новые разделы и проходит самопроверку', async () => {
   const s = await fresh();
   await s.saveDailyActivity('steps', steps('2026-10-04', 8450));
-  await s.saveDailyActivity('walk', walk('2026-10-04', 6.4));
   await s.addBikeRide(ride('2026-10-04', '08:30', 7.4));
   const b = await s.exportBackup();
   assert.equal(b.data.steps_log['2026-10-04'].steps, 8450);
-  assert.equal(b.data.walk_log['2026-10-04'].km, 6.4);
+  assert.equal(b.data.steps_log['2026-10-04'].km, undefined, 'км из шагов не хранятся');
+  assert.equal('walk_log' in b.data, false);
   assert.equal(b.data.bike_log.length, 1);
   assert.equal(b.data.activity_migration.version, 1);
   const created = await s.createBackup();
   assert.equal(created.verified, true);
   const prepared = await s.prepareRestore(parseBackup(created.json));
-  assert.deepEqual([prepared.summary.steps, prepared.summary.walk, prepared.summary.bike], [1, 1, 1]);
+  assert.deepEqual([prepared.summary.steps, prepared.summary.bike], [1, 1]);
+  assert.equal('walk' in prepared.summary, false, 'в превью нет «Дистанции пешком»');
 });
 
 test('18. восстановление новых разделов: атомарно, данные совпадают, повреждённый раздел отклоняется', async () => {
   const src = await fresh();
   await src.saveDailyActivity('steps', steps('2026-10-04', 8450));
-  await src.saveDailyActivity('walk', walk('2026-10-03', 3.1));
   await src.addBikeRide(ride('2026-10-04', '08:30', 7.4));
   await src.addBikeRide(ride('2026-10-04', '18:20', 12.1));
   const json = (await src.createBackup()).json;
@@ -349,7 +423,7 @@ test('18. восстановление новых разделов: атомар
   await dst.saveDailyActivity('steps', steps('2026-01-01', 1)); // прежние данные устройства заменяются копией целиком
   await dst.restoreBackup(await dst.prepareRestore(parseBackup(json)));
   assert.deepEqual(await dst.getDailyActivityLog('steps'), await src.getDailyActivityLog('steps'));
-  assert.deepEqual(await dst.getDailyActivityLog('walk'), await src.getDailyActivityLog('walk'));
+  assert.equal(plain(fmtActivity('steps', (await dst.getDailyActivity('steps', '2026-10-04')).steps)), '8 450 шагов · ≈ 6,3 км', 'км после восстановления считаются заново');
   assert.deepEqual(await dst.getBikeRides(), await src.getBikeRides());
   assert.equal(dayValues('bike', await dst.getBikeRides())['2026-10-04'], 19.5);
 
@@ -381,13 +455,26 @@ test('19. импорт старой копии (без новых раздело
     assert.equal(st['2026-09-29'].source, 'activity');
     const rides = await s.getBikeRides();
     assert.deepEqual(rides.map((r) => [r.date, r.minutes, r.km]).sort(), [['2026-09-29', 40, null], ['2026-10-01', 25, null]]);
-    assert.deepEqual(await s.getDailyActivityLog('walk'), {});
+    assert.equal(await s._read('walk_log', null), null);
     assert.deepEqual(await s._read('activity_days'), ACTIVITY_DAYS, 'activity_days восстановлен как есть');
     if (schemaVersion >= 8) {
       assert.deepEqual((await s.getWaterDay('2026-10-01')).entries, WATER['2026-10-01'].entries);
       assert.equal((await s.getSleepEntries()).length, 1);
     }
   }
+});
+
+test('19a. копия с посторонним walk_log: раздел пропускается, остальные данные восстанавливаются', async () => {
+  const src = await fresh();
+  await src.saveDailyActivity('steps', steps('2026-10-04', 8450));
+  const raw = JSON.parse((await src.createBackup()).json);
+  raw.data.walk_log = { '2026-10-04': { km: 6.4, note: '', source: 'manual' } };
+  const dst = await fresh();
+  const prepared = await dst.prepareRestore(parseBackup(JSON.stringify(raw)));
+  assert.deepEqual(prepared.ignoredKeys, ['walk_log']);
+  await dst.restoreBackup(prepared);
+  assert.equal(await dst._read('walk_log', null), null);
+  assert.equal((await dst.getDailyActivity('steps', '2026-10-04')).steps, 8450);
 });
 
 /* ---------- 20. миграция старой «Активности» ---------- */
@@ -447,18 +534,18 @@ test('миграция: существующие записи не переза�
 test('свежая установка: пустые разделы и отметка миграции; старые API «Активности» не сломаны', async () => {
   const s = await fresh();
   assert.deepEqual(await s.getDailyActivityLog('steps'), {});
-  assert.deepEqual(await s.getDailyActivityLog('walk'), {});
+  assert.equal(await s._read('walk_log', null), null);
   assert.deepEqual(await s.getBikeRides(), []);
   assert.equal((await s._read('activity_migration')).version, 1);
   assert.deepEqual(await s.getAllActivity(), {});
   await s.verifyIntegrity();
 });
 
-test('«Статистика»: три самостоятельных блока — шаги, пешком, велосипед; общего «activity» нет', () => {
+test('«Статистика»: два самостоятельных блока — шаги и велосипед; ни «activity», ни «walk»', () => {
   const engine = createStatsEngine({
     activityDays: { '2026-10-01': { steps: 7000, bike: 30 }, '2026-10-02': { steps: 5000 } },
     stepsLog: { '2026-10-02': { steps: 5000 }, '2026-10-03': { steps: 9000 } },
-    walkLog: { '2026-10-03': { km: 6.4 }, '2026-10-04': { km: 3.6 } },
+    walkLog: { '2026-10-03': { km: 6.4 }, '2026-10-04': { km: 3.6 } }, // устаревший вход игнорируется
     bikeLog: [
       { id: 'a', date: '2026-10-04', time: '08:30', km: 7.4 }, { id: 'b', date: '2026-10-04', time: '18:20', km: 12.1 },
       { id: 'legacy-2026-10-01', date: '2026-10-01', time: null, km: null, minutes: 35, source: 'activity' },
@@ -466,13 +553,13 @@ test('«Статистика»: три самостоятельных блока
   }, TODAY);
   /* шаги — только из steps_log: удалённый перенесённый день не возвращается из activity_days */
   assert.deepEqual(engine.series.steps.map((p) => [p.date, p.value]), [['2026-10-02', 5000], ['2026-10-03', 9000]]);
-  assert.deepEqual(engine.series.walk.map((p) => [p.date, p.value]), [['2026-10-03', 6.4], ['2026-10-04', 3.6]]);
+  assert.equal('walk' in engine.series, false);
   assert.deepEqual(engine.series.bike.map((p) => [p.date, p.value]), [['2026-10-04', 19.5]], 'велотренажёр без км — не 0 км и не точка ряда');
   assert.equal('activityMin' in engine.series, false);
   const m = engine.forPeriod('7d');
   assert.equal('activity' in m, false, 'общего блока «Активность» в модели нет');
   assert.equal(m.steps.stats.avg, 7000);
-  assert.equal(m.walk.stats.avg, 5);
+  assert.equal('walk' in m, false, 'блока «Дистанция пешком» нет');
   assert.equal(m.bike.stats.avg, 19.5);
   assert.equal(m.bike.best.value, 19.5);
   assert.deepEqual(m.bike.noKm, { count: 1, minutes: 35, totalAll: 1 }, 'поездки без дистанции — отдельно');

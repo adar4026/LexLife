@@ -35,7 +35,7 @@ export const DEFAULT_PERIOD = '30d';
    Это порог читаемости графика, а не медицинская норма. */
 export const MIN_DELTA = {
   weight: 0.5, sys: 3, dia: 3, pulse: 3, temperature: 0.2, spo2: 1, glucose: 0.3,
-  water: 150, steps: 500, walk: 0.5, bike: 1,
+  water: 150, steps: 500, bike: 1,
 };
 
 /* Условия расчёта тренда: не меньше TREND_MIN_POINTS дней с данными,
@@ -397,12 +397,11 @@ export function createStatsEngine(raw, todayIso) {
   const today = dayNum(todayIso);
   const log = isObj(raw.metricsLog) ? raw.metricsLog : {};
   const cfg = isObj(raw.metricsConfig) ? raw.metricsConfig : {};
-  /* Шаги, дистанция пешком, велосипед — самостоятельные показатели (services/activity.js):
-     steps_log / walk_log — итог дня, bike_log — поездки (день = сумма км; поездки без км
+  /* Шаги и велосипед — самостоятельные показатели (services/activity.js):
+     steps_log — итог дня (вся ходьба, км — только расчётная оценка при показе), bike_log — поездки (день = сумма км; поездки без км
      в километры не входят). Старые шаги из activity_days перенесены в steps_log; без steps_log
      (старый вызов) шаги берутся из activity_days. */
   const stepsLog = isObj(raw.stepsLog) ? raw.stepsLog : null;
-  const walkLog = isObj(raw.walkLog) ? raw.walkLog : {};
   const bikeRides = Array.isArray(raw.bikeLog) ? raw.bikeLog : [];
   const noFuture = (s) => s.filter((p) => p.day <= today);
 
@@ -416,7 +415,6 @@ export function createStatsEngine(raw, todayIso) {
     glucose: noFuture(toDailySeries(log.glucose, pickPoint)),
     water: noFuture(toDailySeries(log.water, pickWater)),
     steps: noFuture(stepsLog ? toDailySeries(stepsLog, pickStepsEntry) : toDailySeries(isObj(raw.activityDays) ? raw.activityDays : {}, pickSteps)),
-    walk: noFuture(toDailySeries(dayValues('walk', walkLog), (v) => (isNum(v) ? Math.max(0, v) : null))),
     bike: noFuture(toDailySeries(dayValues('bike', bikeRides), (v) => (isNum(v) ? Math.max(0, v) : null))),
   };
   /* поездки без дистанции (перенесённый велотренажёр: только минуты) — считаются отдельно, не как 0 км */
@@ -476,7 +474,7 @@ export function createStatsEngine(raw, todayIso) {
     water.prevGoalCompletion = prev ? calculateGoalCompletion(filterByPeriod(series.water, prev), waterGoal) : null;
     water.buckets = bucketize(water.points, range, size);
 
-    /* шаги / дистанция пешком / велосипед: у каждого свой блок, столбцы и лучший день */
+    /* шаги / велосипед: у каждого свой блок, столбцы и лучший день */
     const bestOf = (pts) => pts.reduce((b, p) => (!b || p.value > b.value ? p : b), null);
     const activityBlock = (key) => {
       const b = block(key, range, prev);
@@ -524,7 +522,6 @@ export function createStatsEngine(raw, todayIso) {
       glucose: block('glucose', range, prev),
       water,
       steps: activityBlock('steps'),
-      walk: activityBlock('walk'),
       bike,
       tests: testsModel,
       meds: {
