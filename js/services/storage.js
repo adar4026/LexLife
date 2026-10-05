@@ -10,6 +10,8 @@
    Ключи и модель данных — по ТЗ «LexLife».
    ========================================================= */
 
+import { isValidSleepLog, isValidSleepSettings, isValidSleepEntry, normalizeSleepSettings, defaultSleepSettings, findSleepByExternalId, SLEEP_NOTE_MAX } from './sleep.js';
+
 const APP_ID = 'lexlife';
 /* Старые бэкапы (экспортированные до ребрендинга) помечены прежним app id —
    принимаем их на импорт, чтобы не терять совместимость с уже сделанными бэкапами. */
@@ -36,13 +38,16 @@ export const KEYS = {
   notifications: 'notifications', // правила уведомлений (готовы под push)
   activityDays: 'activity_days',
   activityGoals: 'activity_goals',
-  medLog: 'med_log',
+  medLog: 'med_log',            // старый журнал: { "ГГГГ-ММ-ДД": ["Имя", ...] } — только чтение
+  medIntakes: 'med_intakes',    // приёмы: { "ГГГГ-ММ-ДД": [{ medId, scheduledTime, takenAt }] }
+  sleepLog: 'sleep_log',        // сон: [{ id, date (день пробуждения), sleepStart, sleepEnd, durationMinutes, … }] (services/sleep.js)
+  sleepSettings: 'sleep_settings', // цель сна, желаемое время, модель будущих напоминаний
 };
 
 /* Ключи с пользовательскими данными (для бэкапа/очистки) — без служебного meta */
 const DATA_KEYS = [
   KEYS.alerts, KEYS.tests, KEYS.meds, KEYS.visits, KEYS.metrics, KEYS.metricsLog, KEYS.profile, KEYS.hydration, KEYS.notifications,
-  KEYS.activityDays, KEYS.activityGoals, KEYS.medLog,
+  KEYS.activityDays, KEYS.activityGoals, KEYS.medLog, KEYS.medIntakes, KEYS.sleepLog, KEYS.sleepSettings,
 ];
 
 /* UI-настройка темы: хранится строкой (не JSON), живёт вне DATA_KEYS, но входит в бэкап (settings.theme) */
@@ -69,6 +74,7 @@ const KEY_LABELS = {
   [KEYS.metrics]: 'Цели показателей', [KEYS.metricsLog]: 'История показателей', [KEYS.profile]: 'Профиль',
   [KEYS.hydration]: 'План воды', [KEYS.notifications]: 'Уведомления', [KEYS.activityDays]: 'Активность',
   [KEYS.activityGoals]: 'Цели активности', [KEYS.medLog]: 'Журнал приёма лекарств',
+  [KEYS.medIntakes]: 'Приёмы лекарств', [KEYS.sleepLog]: 'Сон', [KEYS.sleepSettings]: 'Настройки сна',
 };
 
 /* Ошибка бэкапа с кодом — UI показывает message как есть */
@@ -78,6 +84,39 @@ export class BackupError extends Error {
     this.name = 'BackupError';
     this.code = code;
   }
+}
+
+/* Ошибка сохранения сна: DUPLICATE_DATE (existing — запись этой даты) | INVALID | NO_SPACE */
+export class SleepStoreError extends Error {
+  constructor(code, message, existing = null) {
+    super(message);
+    this.name = 'SleepStoreError';
+    this.code = code;
+    this.existing = existing;
+  }
+}
+/* Происхождение новой записи: вручную — source 'manual' и пустые поля источника; будущий импорт
+   передаёт свои значения (sleepStages — только если есть, у ручных записей поля нет) */
+function sleepProvenance(v) {
+  const o = v || {};
+  const p = {
+    source: typeof o.source === 'string' && o.source ? o.source : 'manual',
+    externalId: o.externalId ?? null,
+    sourceDevice: o.sourceDevice ? { ...o.sourceDevice } : null,
+    importedAt: o.importedAt ?? null,
+  };
+  if (o.sleepStages) p.sleepStages = { ...o.sleepStages };
+  return p;
+}
+/* Только поля модели сна (лишнее из формы не попадает в хранилище) */
+function sleepFields(v) {
+  const o = v || {};
+  return {
+    date: o.date, sleepStart: o.sleepStart, sleepEnd: o.sleepEnd, durationMinutes: o.durationMinutes,
+    quality: o.quality ?? null, awakenings: o.awakenings ?? 0,
+    naps: Array.isArray(o.naps) ? o.naps.map((n) => ({ minutes: n.minutes, start: n.start ?? null, end: n.end ?? null })) : [],
+    tags: Array.isArray(o.tags) ? o.tags.slice() : [], note: typeof o.note === 'string' ? o.note.slice(0, SLEEP_NOTE_MAX) : '',
+  };
 }
 
 /* Референсные значения для цветовой индикации (из ТЗ) */
@@ -142,6 +181,28 @@ function rememberRemovedKeys(day, removed) {
   if (!keys.length) return;
   day.removedKeys = [...new Set([...(Array.isArray(day.removedKeys) ? day.removedKeys : []), ...keys])];
 }
+/* Один приём лекарства за день — чистая функция над записями дня.
+   state: { intakes: [{ medId, scheduledTime, takenAt }] из med_intakes[day], legacy: [имена] из med_log[day] }.
+   taken: true — добавить приём (повтор не дублирует), false — удалить только этот приём (medId + time).
+   Старая отметка по имени (name в legacy) учитывается, пока у лекарства нет приёмов за день; при первой
+   новой отметке она переносится в приём legacyTime (takenAt: null — время приёма неизвестно).
+   → { intakes, legacy, legacyChanged } (вход не изменяется) */
+export function applyMedIntake(state, { medId, time = null, taken, name = null, legacyTime = null, takenAt = nowISO() }) {
+  let intakes = (Array.isArray(state && state.intakes) ? state.intakes : []).filter(isPlainObj).map((r) => ({ ...r }));
+  let legacy = Array.isArray(state && state.legacy) ? state.legacy.slice() : [];
+  let legacyChanged = false;
+  const t = time || null;
+  if (name && legacy.includes(name) && !intakes.some((r) => r.medId === medId)) {
+    legacy = legacy.filter((x) => x !== name);
+    legacyChanged = true;
+    intakes.push({ medId, scheduledTime: legacyTime || null, takenAt: null });
+  }
+  const same = (r) => r.medId === medId && (r.scheduledTime || null) === t;
+  if (taken) { if (!intakes.some(same)) intakes.push({ medId, scheduledTime: t, takenAt }); }
+  else intakes = intakes.filter((r) => !same(r));
+  return { intakes, legacy, legacyChanged };
+}
+
 /* §6.5 — метка времени в полном ISO (UTC) */
 const nowISO = () => new Date().toISOString();
 const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -273,6 +334,9 @@ function defaultNotifications() {
   ];
 }
 
+/* Аддитивные поля визита: вид события, название, время, метка импорта истории */
+const VISIT_EXTRA_FIELDS = ['kind', 'title', 'time', 'importId', 'importedAt', 'source'];
+
 /* Приводит визит к полной модели v7 (общий код для seed и миграции).
    Старый формат: doctor = "Врач · Специальность", desc = заключение. */
 function normalizeVisit(v) {
@@ -290,6 +354,8 @@ function normalizeVisit(v) {
     status: v.status || 'done',
     attachments: v.attachments || [],
     links: v.links || { testIds: [], medIds: [], reminderIds: [] },
+    /* аддитивные поля (services/visitKinds.js, services/historyImport.js) — только если заданы */
+    ...Object.fromEntries(VISIT_EXTRA_FIELDS.filter((k) => v[k] != null).map((k) => [k, v[k]])),
   };
 }
 
@@ -355,6 +421,12 @@ const METRIC_VALUE_OK = {
 };
 const metricValueOk = (m, x) => (METRIC_VALUE_OK[m] || isNumOrNull)(x);
 const NOTIF_TYPE_LIST = ['meds', 'water', 'pressure', 'weight', 'tests', 'visits'];
+/* Расписание лекарства (аддитивное поле): режим, дни недели (0=Вс…6=Сб, как в notifications), времена */
+export const MED_MODES = ['daily', 'days', 'asNeeded'];
+const isWeekdays = (v) => Array.isArray(v) && v.every((d) => Number.isInteger(d) && d >= 0 && d <= 6);
+const MED_SCHEDULE_OK = (s) => s == null || (isPlainObj(s) && MED_MODES.includes(s.mode)
+  && (s.days == null || isWeekdays(s.days)) && (s.times == null || (Array.isArray(s.times) && s.times.every((t) => isTimeStr(t) && t !== ''))));
+const MED_INTAKE_OK = (r) => isPlainObj(r) && isSafeId(r.medId) && isTimeOrNull(r.scheduledTime) && isStrOrNull(r.takenAt);
 
 /* Структура каждого ключа финальной схемы (CURRENT_SCHEMA_VERSION).
    Поля, которые UI подставляет в разметку без экранирования (id, фото, числа, время),
@@ -365,10 +437,11 @@ const KEY_VALIDATORS = {
     && TEST_FIELDS.every((f) => isNumOrNull(t[f])) && testExtrasOk(t)),
   [KEYS.meds]: listOf((m) => typeof m.name === 'string' && (m.id == null || isSafeId(m.id))
     && isTimeOrNull(m.reminder_time) && isNumOrNull(m.every_days) && isDateOrNull(m.start) && isStrOrNull(m.end)
-    && isStrOrNull(m.icon) && isStrOrNull(m.dose) && isStrOrNull(m.purpose)),
+    && isStrOrNull(m.icon) && isStrOrNull(m.dose) && isStrOrNull(m.purpose)
+    && MED_SCHEDULE_OK(m.schedule) && isStrOrNull(m.note) && isStrOrNull(m.deletedAt)),
   [KEYS.visits]: listOf((v) => isSafeId(v.id) && isDateStr(v.date) && isDateOrNull(v.nextDate)
     && ['doctor', 'specialty', 'clinic', 'reason', 'conclusion', 'recommendations', 'status'].every((f) => isStrOrNull(v[f]))
-    && (v.attachments == null || Array.isArray(v.attachments))
+    && (v.attachments == null || (Array.isArray(v.attachments) && v.attachments.every((a) => isPlainObj(a) && (a.attachmentId == null || isSafeId(a.attachmentId)))))
     && (v.links == null || (isPlainObj(v.links) && isIdList(v.links.testIds) && isIdList(v.links.medIds) && isIdList(v.links.reminderIds)))),
   [KEYS.metrics]: mapOf((c, m) => METRIC_KEYS.includes(m) && isPlainObj(c) && isStrOrNull(c.unit)
     && (m === 'pressure' ? c.goal == null || (isPlainObj(c.goal) && isNumOrNull(c.goal.systolic) && isNumOrNull(c.goal.diastolic)) : isNumOrNull(c.goal))),
@@ -387,6 +460,9 @@ const KEY_VALIDATORS = {
     && (a.plank == null || (Array.isArray(a.plank) && a.plank.every(isNumOrNull)))),
   [KEYS.activityGoals]: mapOf((x) => isNumOrNull(x)),
   [KEYS.medLog]: mapOf((list, d) => isDateStr(d) && d !== '' && Array.isArray(list) && list.every((x) => typeof x === 'string')),
+  [KEYS.medIntakes]: mapOf((list, d) => isDateStr(d) && d !== '' && Array.isArray(list) && list.every(MED_INTAKE_OK)),
+  [KEYS.sleepLog]: isValidSleepLog,
+  [KEYS.sleepSettings]: isValidSleepSettings,
 };
 
 /* Проверка набора данных финальной схемы; бросает BackupError с названием раздела */
@@ -415,6 +491,7 @@ function summarize(data) {
     visits: (data[KEYS.visits] || []).length,
     notifications: (data[KEYS.notifications] || []).length,
     activityDays: Object.keys(data[KEYS.activityDays] || {}).length,
+    sleep: Array.isArray(data[KEYS.sleepLog]) ? data[KEYS.sleepLog].length : 0,
   };
 }
 
@@ -681,6 +758,10 @@ export class StorageService {
     const meta = await this._read(KEYS.meta, null);
     if (!meta || !meta.seededAt) await this._seed();
     else await this._migrate();
+    /* аддитивные разделы без смены схемы: у существующих установок появляются пустыми / по умолчанию */
+    if ((await this._read(KEYS.medIntakes, null)) == null) await this._write(KEYS.medIntakes, {});
+    if ((await this._read(KEYS.sleepLog, null)) == null) await this._write(KEYS.sleepLog, []);
+    if ((await this._read(KEYS.sleepSettings, null)) == null) await this._write(KEYS.sleepSettings, defaultSleepSettings());
     return this;
   }
 
@@ -736,6 +817,9 @@ export class StorageService {
     if ((await this._read(KEYS.notifications, null)) == null) await this._write(KEYS.notifications, defaultNotifications());
     if ((await this._read(KEYS.activityDays, null)) == null) await this._write(KEYS.activityDays, {});
     if ((await this._read(KEYS.medLog, null)) == null) await this._write(KEYS.medLog, {});
+    if ((await this._read(KEYS.medIntakes, null)) == null) await this._write(KEYS.medIntakes, {});
+    if ((await this._read(KEYS.sleepLog, null)) == null) await this._write(KEYS.sleepLog, []);
+    if ((await this._read(KEYS.sleepSettings, null)) == null) await this._write(KEYS.sleepSettings, defaultSleepSettings());
   }
 
   /* ---- Предупреждения ---- */
@@ -1066,36 +1150,180 @@ export class StorageService {
       .sort((a, b) => a.date.localeCompare(b.date));
   }
 
-  /* ---- Лекарства ---- */
-  async getMeds() {
-    return this._read(KEYS.meds, []);
+  /* ---- Лекарства ----
+     health_meds — препараты; schedule / note / deletedAt — аддитивные поля (services/meds.js).
+     med_intakes — отметки по локальной дате: одна запись = один принятый приём
+     (medId + scheduledTime, null — приём без времени). med_log — старый журнал по имени:
+     только чтение, кроме переноса старой отметки дня в приём (applyMedIntake).
+     Изменения лекарств и приёмов сериализуются: быстрые касания не теряют запись. */
+  _serialMeds(fn) {
+    const run = (this._medsQueue || Promise.resolve()).then(fn, fn);
+    this._medsQueue = run.catch(() => {});
+    return run;
+  }
+  async _writeMedsKey(key, value) {
+    if (!(await this._write(key, value))) throw new Error('Не удалось сохранить: недостаточно места на устройстве.');
+  }
+  /* удалённые (deletedAt) остаются в базе ради истории приёмов и связей визитов — в списках их нет */
+  async getMeds({ includeDeleted = false } = {}) {
+    const list = await this._read(KEYS.meds, []);
+    return includeDeleted ? list : list.filter((m) => !m.deletedAt);
+  }
+  async getMed(id) {
+    return (await this._read(KEYS.meds, [])).find((m) => m.id === id && !m.deletedAt) || null;
   }
   async addMed(med) {
-    const list = await this._read(KEYS.meds, []);
-    const entry = { id: uid(), icon: '💊', active: true, ...med };
-    list.push(entry);
-    await this._write(KEYS.meds, list);
-    return entry;
+    return this._serialMeds(async () => {
+      const list = await this._read(KEYS.meds, []);
+      const entry = { id: uid(), icon: '💊', active: true, ...med };
+      list.push(entry);
+      await this._writeMedsKey(KEYS.meds, list);
+      return entry;
+    });
+  }
+  /* Правка: остальные поля записи (every_days, start, end, purpose, icon, active) сохраняются */
+  async updateMed(id, patch) {
+    return this._serialMeds(async () => {
+      const list = await this._read(KEYS.meds, []);
+      const i = list.findIndex((m) => m.id === id && !m.deletedAt);
+      if (i < 0) return null;
+      list[i] = { ...list[i], ...patch, id };
+      await this._writeMedsKey(KEYS.meds, list);
+      return list[i];
+    });
+  }
+  /* «Удалить»: препарат пропадает из списков; запись остаётся с deletedAt, история приёмов не трогается */
+  async removeMed(id) {
+    return this._serialMeds(async () => {
+      const list = await this._read(KEYS.meds, []);
+      const i = list.findIndex((m) => m.id === id && !m.deletedAt);
+      if (i < 0) return false;
+      list[i] = { ...list[i], active: false, deletedAt: nowISO() };
+      await this._writeMedsKey(KEYS.meds, list);
+      return true;
+    });
+  }
+  /* У лекарств из старых копий может не быть id (схема это допускала) — без него приём не отметить.
+     Дописывает только id, остальное не меняется; пишет, лишь если такие записи есть. */
+  async ensureMedIds() {
+    return this._serialMeds(async () => {
+      const list = await this._read(KEYS.meds, []);
+      let changed = false;
+      list.forEach((m) => { if (isPlainObj(m) && m.id == null) { m.id = uid(); changed = true; } });
+      if (changed) await this._writeMedsKey(KEYS.meds, list);
+      return changed;
+    });
   }
 
-  /* лог приёма: { "YYYY-MM-DD": ["Имя", ...] } (формат ТЗ) */
+  /* старый журнал «принял сегодня»: { "ГГГГ-ММ-ДД": ["Имя", ...] } (формат ТЗ) */
   async getMedLog(day = dateKey()) {
     const all = await this._read(KEYS.medLog, {});
     return all[day] || [];
   }
-  /* весь журнал приёма (только чтение — для статистики) */
+  /* весь старый журнал (только чтение — статистика) */
   async getAllMedLog() {
     return this._read(KEYS.medLog, {});
   }
-  async toggleMedTaken(name, day = dateKey()) {
-    const all = await this._read(KEYS.medLog, {});
-    const list = all[day] || [];
-    const i = list.indexOf(name);
-    if (i >= 0) list.splice(i, 1);
-    else list.push(name);
-    all[day] = list;
-    await this._write(KEYS.medLog, all);
-    return list.includes(name);
+  async getMedIntakes(day = dateKey()) {
+    const all = await this._read(KEYS.medIntakes, {});
+    return Array.isArray(all[day]) ? all[day] : [];
+  }
+  async getAllMedIntakes() {
+    return this._read(KEYS.medIntakes, {});
+  }
+  /* Отметить / снять один приём (medId + время) за день day — меняется только запись этого дня.
+     name + legacyTime: старая отметка дня по имени (med_log) переносится в приём legacyTime,
+     чтобы не пропасть при первой новой отметке этого лекарства в тот же день. */
+  async setMedIntake({ medId, time = null, taken, day = dateKey(), name = null, legacyTime = null, now = new Date() }) {
+    if (!isSafeId(medId) || !isDateStr(day) || day === '' || !isTimeOrNull(time)) throw new Error('setMedIntake: некорректный приём');
+    return this._serialMeds(async () => {
+      const [intakes, log] = await Promise.all([this._read(KEYS.medIntakes, {}), this._read(KEYS.medLog, {})]);
+      const next = applyMedIntake({ intakes: intakes[day], legacy: log[day] }, { medId, time, taken, name, legacyTime, takenAt: now.toISOString() });
+      if (next.intakes.length) intakes[day] = next.intakes;
+      else delete intakes[day];
+      await this._writeMedsKey(KEYS.medIntakes, intakes);
+      if (next.legacyChanged) {
+        if (next.legacy.length) log[day] = next.legacy;
+        else delete log[day];
+        await this._writeMedsKey(KEYS.medLog, log);
+      }
+      return next.intakes;
+    });
+  }
+
+  /* ---- Сон ----
+     sleep_log — записи сна (одна на дату пробуждения), sleep_settings — цель и желаемое время.
+     Модель, валидация и аналитика — services/sleep.js; UI обращается только к этим методам.
+     Запись проверяется перед сохранением (isValidSleepEntry); изменения сериализуются. */
+  _serialSleep(fn) {
+    const run = (this._sleepQueue || Promise.resolve()).then(fn, fn);
+    this._sleepQueue = run.catch(() => {});
+    return run;
+  }
+  async _writeSleepKey(key, value) {
+    if (!(await this._write(key, value))) throw new SleepStoreError('NO_SPACE', 'Не удалось сохранить: недостаточно места на устройстве.');
+  }
+  /* новые сверху (по дате пробуждения) */
+  async getSleepEntries() {
+    const list = await this._read(KEYS.sleepLog, []);
+    return (Array.isArray(list) ? list : []).slice().sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  }
+  async getSleepEntry(id) {
+    return (await this.getSleepEntries()).find((e) => e.id === id) || null;
+  }
+  /* value — результат normalizeSleepInput(…).value. Дата пробуждения уже занята → SleepStoreError DUPLICATE_DATE */
+  async addSleepEntry(value) {
+    return this._serialSleep(async () => {
+      const list = await this._read(KEYS.sleepLog, []);
+      const at = nowISO();
+      const entry = { ...sleepFields(value), ...sleepProvenance(value), id: uid(), createdAt: at, updatedAt: at };
+      if (!isValidSleepEntry(entry)) throw new SleepStoreError('INVALID', 'Запись сна заполнена некорректно.');
+      /* повторный импорт той же внешней записи не создаёт дубль */
+      const ext = findSleepByExternalId(list, entry.source, entry.externalId);
+      if (ext) throw new SleepStoreError('DUPLICATE_EXTERNAL', 'Эта запись сна уже импортирована.', ext);
+      const dup = list.find((e) => e.date === entry.date);
+      if (dup) throw new SleepStoreError('DUPLICATE_DATE', 'За эту дату сон уже записан.', dup);
+      list.push(entry);
+      await this._writeSleepKey(KEYS.sleepLog, list);
+      return entry;
+    });
+  }
+  /* правка из формы меняет только поля сна; происхождение (source, externalId, sourceDevice,
+     importedAt, sleepStages) остаётся как было — у старой записи без source его и не появляется */
+  async updateSleepEntry(id, value) {
+    return this._serialSleep(async () => {
+      const list = await this._read(KEYS.sleepLog, []);
+      const i = list.findIndex((e) => e.id === id);
+      if (i < 0) return null;
+      const next = { ...list[i], ...sleepFields(value), id, createdAt: list[i].createdAt || nowISO(), updatedAt: nowISO() };
+      if (!isValidSleepEntry(next)) throw new SleepStoreError('INVALID', 'Запись сна заполнена некорректно.');
+      const dup = list.find((e) => e.id !== id && e.date === next.date);
+      if (dup) throw new SleepStoreError('DUPLICATE_DATE', 'За эту дату сон уже записан.', dup);
+      list[i] = next;
+      await this._writeSleepKey(KEYS.sleepLog, list);
+      return next;
+    });
+  }
+  /* → удалённая запись | null */
+  async removeSleepEntry(id) {
+    return this._serialSleep(async () => {
+      const list = await this._read(KEYS.sleepLog, []);
+      const rec = list.find((e) => e.id === id);
+      if (!rec) return null;
+      await this._writeSleepKey(KEYS.sleepLog, list.filter((e) => e.id !== id));
+      return rec;
+    });
+  }
+  async getSleepSettings() {
+    return normalizeSleepSettings(await this._read(KEYS.sleepSettings, null));
+  }
+  async updateSleepSettings(patch) {
+    return this._serialSleep(async () => {
+      const cur = normalizeSleepSettings(await this._read(KEYS.sleepSettings, null));
+      const next = normalizeSleepSettings({ ...cur, ...patch, reminders: { ...cur.reminders, ...((patch && patch.reminders) || {}) } });
+      await this._writeSleepKey(KEYS.sleepSettings, next);
+      return next;
+    });
   }
 
   /* ---- Врачи и визиты ---- */
@@ -1121,8 +1349,93 @@ export class StorageService {
     await this._write(KEYS.visits, list);
     return list[i];
   }
+  /* Импорт медицинской истории (services/historyImport.js) — только слияние (merge), только ДОБАВЛЕНИЕ.
+     Каждый раздел перечитывается непосредственно перед записью, новые записи дописываются
+     в конец текущего списка; существующие не удаляются, не заменяются и не изменяются.
+     Записи с уже существующим id/importId пропускаются (повторный импорт → 0).
+     После записи — проверка: каждая прежняя запись на месте байт-в-байт, их не стало меньше.
+     Сбой записи или проверки → из разделов убираются ТОЛЬКО добавленные этим импортом id
+     (тоже через перечитывание и слияние), и бросается ошибка. → { medsAdded, visitsAdded, before, after } */
+  async addImportedHistory({ meds = [], visits = [] } = {}) {
+    return this._serialMeds(async () => {
+      const has = (list, r) => list.some((x) => x.id === r.id || (r.importId && x.importId === r.importId));
+      const prevMeds = await this._read(KEYS.meds, []);
+      const prevVisits = await this._read(KEYS.visits, []);
+      if (!Array.isArray(prevMeds) || !Array.isArray(prevVisits)) throw new Error('Разделы «Лекарства» или «Визиты» повреждены — импорт отменён, данные не изменены.');
+      const newMeds = meds.filter((m) => !has(prevMeds, m));
+      const newVisits = visits.filter((v) => !has(prevVisits, v)).map(normalizeVisit);
+      const addedIds = new Set([...newMeds, ...newVisits].map((r) => r.id));
+      const append = async (key, items) => {
+        if (!items.length) return true;
+        const cur = await this._read(key, []); // перечитать прямо перед записью — слияние с актуальным списком
+        if (!Array.isArray(cur)) return false;
+        return this._write(key, [...cur, ...items.filter((r) => !has(cur, r))]);
+      };
+      const undo = async () => {
+        for (const key of [KEYS.visits, KEYS.meds]) {
+          const cur = await this._read(key, []);
+          if (Array.isArray(cur) && cur.some((r) => addedIds.has(r.id))) await this._write(key, cur.filter((r) => !addedIds.has(r.id)));
+        }
+      };
+      /* все прежние записи на месте и не изменены; количество не уменьшилось */
+      const kept = (prev, cur) => Array.isArray(cur) && cur.length >= prev.length
+        && JSON.stringify(cur.slice(0, prev.length)) === JSON.stringify(prev); // дописывание только в конец: прежние — неизменный префикс
+
+      let ok = (await append(KEYS.meds, newMeds)) && (await append(KEYS.visits, newVisits));
+      const curMeds = await this._read(KEYS.meds, []);
+      const curVisits = await this._read(KEYS.visits, []);
+      if (ok) ok = kept(prevMeds, curMeds) && kept(prevVisits, curVisits);
+      if (!ok) {
+        await undo();
+        throw new Error('Импорт не выполнен: запись или проверка сохранности не прошла. Добавленные записи убраны, прежние данные не изменены.');
+      }
+      return {
+        medsAdded: newMeds.length, visitsAdded: newVisits.length,
+        before: { meds: prevMeds.length, visits: prevVisits.length },
+        after: { meds: curMeds.length, visits: curVisits.length },
+      };
+    });
+  }
+  /* → удалённая запись | null (документы удаляет VisitAttachmentService.deleteVisit) */
   async removeVisit(id) {
-    await this._write(KEYS.visits, (await this._read(KEYS.visits, [])).filter((v) => v.id !== id));
+    const list = await this._read(KEYS.visits, []);
+    const rec = list.find((v) => v.id === id);
+    if (!rec) return null;
+    await this._write(KEYS.visits, list.filter((v) => v.id !== id));
+    return rec;
+  }
+  /* Документы записи (services/attachments.js, VisitAttachmentService): меняется только поле
+     attachments этой записи — новые метаданные ДОПИСЫВАЮТСЯ к уже прикреплённым. → запись | null */
+  async addVisitAttachments(id, metas) {
+    const list = await this._read(KEYS.visits, []);
+    const i = list.findIndex((v) => v.id === id);
+    if (i < 0) return null;
+    const cur = Array.isArray(list[i].attachments) ? list[i].attachments : [];
+    const fresh = metas.filter((m) => !cur.some((a) => a && a.attachmentId === m.attachmentId));
+    list[i] = { ...list[i], attachments: [...cur, ...fresh] };
+    if (!(await this._write(KEYS.visits, list))) throw new Error('Не удалось сохранить: недостаточно места на устройстве.');
+    return list[i];
+  }
+  /* Убрать один документ из записи (сама запись и другие документы остаются) → true | false */
+  async removeVisitAttachment(id, attachmentId) {
+    const list = await this._read(KEYS.visits, []);
+    const i = list.findIndex((v) => v.id === id);
+    if (i < 0 || !Array.isArray(list[i].attachments) || !list[i].attachments.some((a) => a && a.attachmentId === attachmentId)) return false;
+    list[i] = { ...list[i], attachments: list[i].attachments.filter((a) => !(a && a.attachmentId === attachmentId)) };
+    if (!(await this._write(KEYS.visits, list))) throw new Error('Не удалось сохранить: недостаточно места на устройстве.');
+    return true;
+  }
+  /* Строгое чтение визитов для очистки «висячих» документов (как readTestsStrict) */
+  async readVisitsStrict() {
+    try {
+      if ((await this.driver.get(ROLLBACK_KEY)) != null) return null;
+      const raw = await this.driver.get(KEYS.visits);
+      if (raw == null) return null;
+      const list = JSON.parse(raw);
+      return Array.isArray(list) ? list : null;
+    } catch {
+      return null;
+    }
   }
 
   /* ---- Активность ---- */
@@ -1331,6 +1644,7 @@ export class StorageService {
     await Promise.all([
       this.getTests(), this.getVisits(), this.getMeds(), this.getMetricsLog(), this.getMetricsConfig(),
       this.getNotifications(), this.getProfile(), this.getHydration(), this.getAllActivity(), this.getGoals(),
+      this.getSleepEntries(), this.getSleepSettings(),
     ]);
     return summarize(data);
   }

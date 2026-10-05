@@ -360,9 +360,9 @@ export function createStatsEngine(raw, todayIso) {
     .filter((t) => isObj(t) && typeof t.date === 'string' && ISO_RE.test(t.date) && dayNum(t.date) <= today)
     .map((t) => ({ ...t, day: dayNum(t.date) }))
     .sort((a, b) => a.day - b.day);
-  const medLog = isObj(raw.medLog) ? raw.medLog : {};
-  const medDays = Object.keys(medLog)
-    .filter((d) => ISO_RE.test(d) && Array.isArray(medLog[d]) && medLog[d].length)
+  /* дни с отметками приёма: старый журнал по имени (med_log) + приёмы (med_intakes) */
+  const marked = (log) => Object.keys(isObj(log) ? log : {}).filter((d) => ISO_RE.test(d) && Array.isArray(log[d]) && log[d].length);
+  const medDays = [...new Set([...marked(raw.medLog), ...marked(raw.medIntakes)])]
     .map(dayNum)
     .filter((d) => d <= today);
 

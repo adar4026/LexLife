@@ -2,7 +2,8 @@
    tests/e2e/bottom-nav.e2e.mjs — нижняя плавающая капсула в настоящем
    браузере (открытое приложение LexLife): активный пункт на основных и
    вложенных экранах, положение индикатора, неизменная геометрия, safe area
-   (подставляется через --safe-bottom), нижний отступ контента, подписи без
+   (подставляется через --safe-bottom — только тестовый override, в production
+   работает env(safe-area-inset-bottom)), системный шрифт, нижний отступ контента, подписи без
    обрезки, нет горизонтального скролла, переход без перезагрузки, Drawer.
    Данные не меняет — только переходы по экранам.
 
@@ -77,15 +78,20 @@ export async function run() {
       check(`«${lb.textContent}»: подпись без обрезки`, lb.scrollWidth <= lb.clientWidth + 0.5, `${lb.scrollWidth} > ${lb.clientWidth}`);
       check(`«${lb.textContent}»: зона касания ≥ 44×44`, ar.width >= 44 && ar.height >= 44, `${ar.width.toFixed(1)}×${ar.height.toFixed(1)}`);
       check(`«${lb.textContent}»: иконка 22×22`, ic.width === 22 && ic.height === 22);
+      check(`«${lb.textContent}»: системный шрифт`, /^-apple-system/.test(getComputedStyle(lb).fontFamily), getComputedStyle(lb).fontFamily);
     }
 
-    /* safe area (iPhone с Home Indicator ≈ 34px): капсула садится на границу, контент — выше капсулы */
+    /* safe area (iPhone с Home Indicator ≈ 34px): капсула на 10px заходит в safe area — 24px от края,
+       ~11px над Home Indicator (он занимает 8–13px от края); контент — выше капсулы */
     root.style.setProperty('--safe-bottom', '34px');
     await sleep(50);
     const rs = nav.getBoundingClientRect();
-    check('safe area 34px: капсула на границе safe area (без двойного отступа)', Math.abs(innerHeight - rs.bottom - 34) < 0.6, String(innerHeight - rs.bottom));
+    check('safe area 34px: капсула 24px от края, чуть выше Home Indicator', Math.abs(innerHeight - rs.bottom - 24) < 0.6, String(innerHeight - rs.bottom));
     const pad = parseFloat(getComputedStyle($('#screen')).paddingBottom);
-    check('safe area 34px: нижний отступ контента = 34 + 64 + 20', Math.abs(pad - 118) < 0.6, String(pad));
+    check('safe area 34px: нижний отступ контента = 24 + 64 + 20', Math.abs(pad - 108) < 0.6, String(pad));
+    root.style.setProperty('--safe-bottom', '12px');
+    await sleep(50);
+    check('малая safe area: не ниже 6px от края', Math.abs(innerHeight - nav.getBoundingClientRect().bottom - 6) < 0.6);
     root.style.removeProperty('--safe-bottom');
     await sleep(50);
 
@@ -114,7 +120,7 @@ export async function run() {
 
     /* Drawer как раньше */
     await go('#/home');
-    $('#menu-btn').click();
+    $('#avatar-btn').click();
     await sleep(320);
     check('Drawer открывается поверх капсулы', $('#drawer').classList.contains('open') && +getComputedStyle($('#drawer')).zIndex > +getComputedStyle(nav).zIndex);
     $('#scrim').click();

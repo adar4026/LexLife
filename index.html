@@ -28,8 +28,10 @@
 </head>
 <body>
   <div class="app" id="app">
-    <!-- Кнопка бокового меню (на основных экранах) -->
-    <button class="menu-btn" id="menu-btn" type="button" aria-label="Меню">☰</button>
+    <!-- Аватар профиля — кнопка бокового меню (на основных экранах); содержимое — из профиля (buildDrawer) -->
+    <button class="avatar-btn" id="avatar-btn" type="button" aria-label="Открыть меню" aria-controls="drawer">
+      <span class="avatar-btn__img" id="avatar-btn-img" aria-hidden="true"></span>
+    </button>
 
     <main class="screen" id="screen" role="main"></main>
 

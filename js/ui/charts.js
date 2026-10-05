@@ -35,14 +35,14 @@ function niceStep(span, count) {
   return (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10) * mag;
 }
 /* Ось Y: «круглые» деления, минимальный размах minSpan (чтобы шум не выглядел скачком) */
-function yScale(lo, hi, { zero = false, minSpan = 1 } = {}) {
+function yScale(lo, hi, { zero = false, minSpan = 1, step: fixedStep = null } = {}) {
   if (zero) lo = 0;
   if (hi - lo < minSpan) {
     const mid = (hi + lo) / 2;
     lo = zero ? 0 : mid - minSpan / 2;
     hi = zero ? Math.max(hi, minSpan) : mid + minSpan / 2;
   }
-  const step = niceStep(hi - lo, 4);
+  const step = fixedStep || niceStep(hi - lo, 4);
   const nlo = Math.floor(lo / step + 1e-9) * step;
   const nhi = Math.ceil(hi / step - 1e-9) * step;
   const ticks = [];
@@ -124,6 +124,20 @@ function xAxisSvg(range, x) {
     return `<text x="${x(d).toFixed(1)}" y="${H - 8}" text-anchor="${anchor}" class="chart__tick">${escXml(fmtTick(d, span))}</text>`;
   }).join('');
 }
+/* Свои подписи оси X ([{ day, label }]: «Пн…Вс», «1 5 10…», «Янв…»); крайние не выходят за поле,
+   подпись, которая налезла бы на предыдущую (узкий экран), пропускается — значение есть в карточке над графиком */
+function customXAxisSvg(labels, x, x0, x1) {
+  let lastRight = -Infinity;
+  return labels.map(({ day, label }) => {
+    const cx = x(day);
+    const w = String(label).length * 7;
+    const anchor = cx - w / 2 < x0 - 4 ? 'start' : cx + w / 2 > x1 + 4 ? 'end' : 'middle';
+    const left = anchor === 'start' ? cx : anchor === 'end' ? cx - w : cx - w / 2;
+    if (left < lastRight + 6) return '';
+    lastRight = left + w;
+    return `<text x="${cx.toFixed(1)}" y="${H - 8}" text-anchor="${anchor}" class="chart__tick">${escXml(label)}</text>`;
+  }).join('');
+}
 /* Линия цели — пунктир; подпись цели — в легенде (не перекрывает точки данных) */
 function goalSvg(goals, x0, x1, y, ys) {
   return goals.filter((g) => g.value >= ys.lo && g.value <= ys.hi).map((g) => {
@@ -136,7 +150,10 @@ function goalSvg(goals, x0, x1, y, ys) {
    range: { start, end } (номера дней); series: [{ key, label, color, points:[{day, value}] }];
    goals: [{ value, label }] — цель(и), goalLegend — общая подпись целей в легенде; trend: { from:{day,value}, to:{day,value} } | null;
    readout(day) → HTML карточки значения (данные экранирует вызывающий). */
-export function lineChart({ range, series, goals = [], goalLegend = '', trend = null, minSpan = 1, readout, ariaLabel }) {
+/* Необязательно: yFormat(v, step) — подписи оси Y (например, время суток); domain { lo, hi } — диапазон,
+   который всегда входит в шкалу (оценка 1–5); xLabels — свои подписи оси X; fit: false — ось X
+   всегда на весь период (календарная неделя/месяц/год); yStep — свой шаг делений оси Y. */
+export function lineChart({ range, series, goals = [], goalLegend = '', trend = null, minSpan = 1, readout, ariaLabel, yFormat = null, domain = null, xLabels = null, fit = true, yStep = null }) {
   const multi = series.length > 1;
   const legend = [
     ...(multi ? series.map((s) => `<span class="chart__key"><i class="chart__swatch" style="background:${s.color}"></i>${escXml(s.label)}</span>`) : []),
@@ -144,7 +161,7 @@ export function lineChart({ range, series, goals = [], goalLegend = '', trend = 
     ...(trend ? ['<span class="chart__key"><i class="chart__swatch chart__swatch--trend"></i>линия тренда</span>'] : []),
   ].join('');
   const days = [...new Set(series.flatMap((s) => s.points.map((p) => p.day)))].sort((a, b) => a - b);
-  const fitted = fitRange(range, days[0]);
+  const fitted = fit ? fitRange(range, days[0]) : null;
   const view = fitted || range;
   const { root, plot, readout: out } = frame({ ariaLabel, legend, note: fitted ? `Ось начинается с первой записи периода: ${fmtFull(days[0])}` : '' });
   let sel = days.length - 1;
@@ -156,10 +173,10 @@ export function lineChart({ range, series, goals = [], goalLegend = '', trend = 
   const reach = Math.max(dataHi - dataLo, minSpan) * 2;
   const shownGoals = goals.filter((g) => g.value >= dataLo - reach && g.value <= dataHi + reach);
   const hiddenGoals = goals.filter((g) => !shownGoals.includes(g));
-  const lo = Math.min(dataLo, ...shownGoals.map((g) => g.value));
-  const hi = Math.max(dataHi, ...shownGoals.map((g) => g.value));
-  const ys = yScale(lo, hi, { minSpan });
-  const yLabels = ys.ticks.map((v) => fmtAxis(v, ys.step));
+  const lo = Math.min(dataLo, ...shownGoals.map((g) => g.value), ...(domain ? [domain.lo] : []));
+  const hi = Math.max(dataHi, ...shownGoals.map((g) => g.value), ...(domain ? [domain.hi] : []));
+  const ys = yScale(lo, hi, { minSpan, step: yStep });
+  const yLabels = ys.ticks.map((v) => (yFormat ? yFormat(v, ys.step) : fmtAxis(v, ys.step)));
 
   function draw(W) {
     const x0 = leftPad(yLabels), x1 = W - PAD_R;
@@ -167,7 +184,7 @@ export function lineChart({ range, series, goals = [], goalLegend = '', trend = 
     const x = (d) => x0 + ((d - view.start) / spanD) * (x1 - x0);
     const y = (v) => PAD_T + (1 - (v - ys.lo) / (ys.hi - ys.lo)) * (H - PAD_T - PAD_B);
     geo = { x, y, x0, x1 };
-    let svg = gridSvg(ys, x0, x1, y, yLabels) + xAxisSvg(view, x) + goalSvg(shownGoals, x0, x1, y, ys);
+    let svg = gridSvg(ys, x0, x1, y, yLabels) + (xLabels ? customXAxisSvg(xLabels, x, x0, x1) : xAxisSvg(view, x)) + goalSvg(shownGoals, x0, x1, y, ys);
     if (hiddenGoals.length) {
       svg += hiddenGoals.map((g, i) => `<text x="${x1}" y="${PAD_T + 10 + i * 14}" text-anchor="end" class="chart__goal-lbl">${escXml(g.label)} ${g.value > hi ? '↑' : '↓'}</text>`).join('');
     }
@@ -214,10 +231,13 @@ export function lineChart({ range, series, goals = [], goalLegend = '', trend = 
 /* ---------- Столбчатый график ----------
    bars: [{ start, end, value|null }] — слоты периода (value null = нет данных);
    goal: { value, label } | null; readout(bar) → HTML. */
-export function barChart({ range, bars: allBars, goal = null, minSpan = 1, readout, ariaLabel, color = 'var(--viz-1)' }) {
-  const legend = goal ? `<span class="chart__key"><i class="chart__swatch chart__swatch--goal"></i>${escXml(goal.label)}</span>` : '';
+/* Необязательно: barColor(bar) — заливка конкретного столбца (по умолчанию color); yFormat(v, step) —
+   подписи оси Y; xLabels — свои подписи оси X ([{ day, label }], по центру слота); fit: false — ось X
+   на весь период; legendExtra — HTML дополнительных пунктов легенды (данные экранирует вызывающий). */
+export function barChart({ range, bars: allBars, goal = null, minSpan = 1, readout, ariaLabel, color = 'var(--viz-1)', barColor = null, yFormat = null, xLabels = null, fit = true, legendExtra = '' }) {
+  const legend = (goal ? `<span class="chart__key"><i class="chart__swatch chart__swatch--goal"></i>${escXml(goal.label)}</span>` : '') + legendExtra;
   const firstBar = allBars.find((b) => b.value != null);
-  const fitted = firstBar ? fitRange(range, firstBar.start) : null;
+  const fitted = fit && firstBar ? fitRange(range, firstBar.start) : null;
   const view = fitted ? { start: firstBar.start, end: range.end } : range;
   const bars = fitted ? allBars.filter((b) => b.end >= view.start) : allBars;
   const { root, plot, readout: out } = frame({ ariaLabel, legend, note: fitted ? `Ось начинается с первой записи периода: ${fmtFull(firstBar.points && firstBar.points.length ? firstBar.points[0].day : firstBar.start)}` : '' });
@@ -226,7 +246,7 @@ export function barChart({ range, bars: allBars, goal = null, minSpan = 1, reado
   let geo = null;
   const vals = bars.filter((b) => b.value != null).map((b) => b.value);
   const ys = yScale(0, Math.max(0, ...vals, goal ? goal.value : 0), { zero: true, minSpan });
-  const yLabels = ys.ticks.map((v) => fmtAxis(v, ys.step));
+  const yLabels = ys.ticks.map((v) => (yFormat ? yFormat(v, ys.step) : fmtAxis(v, ys.step)));
 
   function draw(W) {
     const x0 = leftPad(yLabels), x1 = W - PAD_R;
@@ -235,7 +255,7 @@ export function barChart({ range, bars: allBars, goal = null, minSpan = 1, reado
     const y = (v) => PAD_T + (1 - (v - ys.lo) / (ys.hi - ys.lo)) * (H - PAD_T - PAD_B);
     const base = y(0);
     geo = { x, x0, x1, total };
-    let svg = gridSvg(ys, x0, x1, y, yLabels) + xAxisSvg(view, (d) => x(d + 0.5));
+    let svg = gridSvg(ys, x0, x1, y, yLabels) + (xLabels ? customXAxisSvg(xLabels, (d) => x(d + 0.5), x0, x1) : xAxisSvg(view, (d) => x(d + 0.5)));
     svg += '<g class="chart__cursor"></g>';
     bars.forEach((b) => {
       if (b.value == null) return;
@@ -250,7 +270,7 @@ export function barChart({ range, bars: allBars, goal = null, minSpan = 1, reado
       const h = Math.max(2, base - top);
       const r = Math.min(4, w / 2, h);
       /* скругление только у вершины, база — прямая */
-      svg += `<path d="M${bx.toFixed(1)},${base.toFixed(1)}V${(base - h + r).toFixed(1)}Q${bx.toFixed(1)},${(base - h).toFixed(1)} ${(bx + r).toFixed(1)},${(base - h).toFixed(1)}H${(bx + w - r).toFixed(1)}Q${(bx + w).toFixed(1)},${(base - h).toFixed(1)} ${(bx + w).toFixed(1)},${(base - h + r).toFixed(1)}V${base.toFixed(1)}Z" style="fill:${color}"/>`;
+      svg += `<path d="M${bx.toFixed(1)},${base.toFixed(1)}V${(base - h + r).toFixed(1)}Q${bx.toFixed(1)},${(base - h).toFixed(1)} ${(bx + r).toFixed(1)},${(base - h).toFixed(1)}H${(bx + w - r).toFixed(1)}Q${(bx + w).toFixed(1)},${(base - h).toFixed(1)} ${(bx + w).toFixed(1)},${(base - h + r).toFixed(1)}V${base.toFixed(1)}Z" style="fill:${barColor ? barColor(b) : color}"/>`;
     });
     if (goal) svg += goalSvg([goal], x0, x1, y, ys);
     plot.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" aria-hidden="true">${svg}</svg>`;

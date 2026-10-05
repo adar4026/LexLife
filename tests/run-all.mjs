@@ -8,7 +8,11 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const run = [
-  ['attachments.test.mjs'], ['tests-journal.test.mjs'], ['bottom-nav.test.mjs'], ['water-goal-days.test.mjs'], ['water-import.test.mjs'], ['home-summary.test.mjs'],
+  ['attachments.test.mjs'], ['visit-attachments.test.mjs'], ['tests-journal.test.mjs'], ['bottom-nav.test.mjs'], ['back-nav.test.mjs'], ['water-goal-days.test.mjs'], ['water-import.test.mjs'], ['home-summary.test.mjs'],
+  ['visit-kinds.test.mjs', 'Asia/Tokyo'], ['visit-kinds.test.mjs', 'America/Los_Angeles'], ['visit-kinds.test.mjs', 'Europe/Madrid'], // поиск и относительное время — явные даты, но проверяем независимость от TZ процесса
+  ['meds.test.mjs', 'America/Los_Angeles'], ['meds.test.mjs', 'Asia/Tokyo'], ['meds.test.mjs', 'Europe/Madrid'], // локальный день приёма
+  ['sleep.test.mjs', 'Europe/Madrid'], ['sleep.test.mjs', 'America/Los_Angeles'], ['sleep.test.mjs', 'Asia/Tokyo'], ['sleep.test.mjs', 'UTC'], // день пробуждения, CET/CEST
+  ['history-import.test.mjs', 'Europe/Madrid'], ['history-import.test.mjs', 'America/Los_Angeles'], ['history-import.test.mjs', 'Asia/Tokyo'], // локальные даты истории
   ['notifications.test.mjs'], // сам перебирает 4 timezone
   ['push-worker.test.mjs', 'Asia/Tokyo'],
   ['push-client.test.mjs', 'Europe/Madrid'],

@@ -2,21 +2,32 @@
    app.js — точка входа, роутер, Drawer и экраны (MVP v1.0)
    Async-first: данные через StorageService с await.
    Навигация: нижний таб-бар (Главная/Показатели/Лекарства/Анализы)
-   + боковое меню (Drawer, ☰ справа сверху).
+   + боковое меню (Drawer; открывается аватаром профиля справа сверху).
    Показатели — единая модель: каждый показатель = модуль #/metric/<key>.
    ========================================================= */
 
-import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup } from './services/storage.js';
+import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup, SleepStoreError } from './services/storage.js';
 import { createStatsEngine, evaluateWaterPlan, waterGoalDays, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay, dayNum } from './services/analytics.js';
 import { parseWaterMinderCsv, assignImportKeys, buildWaterImportPlan, applyWaterImportPlan, applyTodayWaterImport, isWaterMinderKey } from './services/waterImport.js';
 import { lineChart, barChart as svgBarChart } from './ui/charts.js';
-import { AttachmentService, IdbAttachmentStore, AttachmentError, ATTACHMENT_ACCEPT, ATTACHMENT_TYPES, checkAttachmentFile, formatBytes, attachmentOf } from './services/attachments.js';
+import { AttachmentService, IdbAttachmentStore, AttachmentError, ATTACHMENT_ACCEPT, ATTACHMENT_TYPES, checkAttachmentFile, formatBytes, attachmentOf, VisitAttachmentService, VISIT_FILES_DB, visitDocsOf, MAX_FILES_PER_PICK } from './services/attachments.js';
 import { createFullBackup, prepareFullRestore, applyFullRestore, isZipFile, countDocsLostOnRestore } from './services/fullBackup.js';
 import { parsePreparedTest, importPreparedTest, PreparedImportError } from './services/preparedImport.js';
+import { parseMedicalHistory, buildHistoryImportPlan, applyHistoryImportPlan, HistoryImportError } from './services/historyImport.js';
+import { visitIcon, visitTitle, visitSub, visitTime, visitKindLabel, visitStatusChip, visitMatchesQuery, relativeVisitLabel } from './services/visitKinds.js';
 import { journal, groupSummary, testSections, sameDayNumber, indicatorHistory, evaluateField } from './services/testsJournal.js';
 import { openDocViewer as showDocViewer } from './ui/docViewer.js';
-import { setActiveTab } from './ui/bottomNav.js';
-import { waterProgress, attentionItems, recentActivity, upcomingMed, nextDose } from './services/homeSummary.js';
+import { setActiveTab, initBottomNav } from './ui/bottomNav.js';
+import { BackButton, goBack, goBackTo, replaceRoute, replaceUrl, initNavHistory, readEntryUi, saveEntryUi } from './ui/backNav.js';
+import { HOME_WATER_QUICK_ADD, waterProgress, homeWaterStatus, waterPlanMarker, waterPlanDelta, medsToday, upcomingVisit, attentionItems, recentActivity, upcomingMed } from './services/homeSummary.js';
+import { WEEKDAYS, MED_NAME_MAX, MED_DOSE_MAX, MED_NOTE_MAX, MED_TIMES_MAX, nextDose, medSchedule, medStatusOn, medDaySlots, isMedDueOn, nextDueDay, scheduleLabel, intakeSummary, normalizeMedInput, intakeHistory, medOccurrences, endedCourseWord } from './services/meds.js';
+import {
+  SLEEP_QUALITY, SLEEP_TAGS, SLEEP_GOAL_MIN, SLEEP_GOAL_MAX, SLEEP_GOAL_STEP, AWAKENINGS_MAX, NAP_MAX_MINUTES, SLEEP_NOTE_MAX, INSIGHT_MIN_DAYS,
+  qualityInfo, tagInfo, formatSleepDuration, formatSleepDelta, normalizeSleepInput, inferBedDate, calculateDuration, makeStamp, stampDay, stampTime,
+  getSleepForDate, averageSleep, averageBedtime, averageWakeTime, averageQuality, sleepConsistency, sleepGoalRate, currentSleepStreak, bestSleepStreak,
+  aggregateByWeek, aggregateByMonth, aggregateByYear, comparePeriods, factorInsights, insightText, periodBounds, shiftPeriod, entriesInRange,
+  napMinutes, totalDayMinutes, minutesToClock, clampSleepGoal, addDays as sleepAddDays,
+} from './services/sleep.js';
 import { nextFire } from './services/notifySchedule.js';
 import { createNotifier, describeNotifyState, armPatch, waterRulePatch, NOTIF_ROUTES, isSafeRoute } from './services/notifier.js';
 import { createPushClient, SYNC_FAIL_TEXT, SERVER_FALLBACK_MS } from './services/pushClient.js';
@@ -25,6 +36,8 @@ import { NEW_HOME_URL, PRIMARY_URL, migrationMode, deploymentRole, serverPushAll
 
 /* Документы анализов: файлы в IndexedDB (только на этом устройстве), метаданные — в health_tests */
 const Attachments = new AttachmentService(Storage, new IdbAttachmentStore());
+/* документы медицинских записей — отдельная база IndexedDB (services/attachments.js) */
+const VisitFiles = new VisitAttachmentService(Storage, new IdbAttachmentStore(VISIT_FILES_DB));
 
 /* ---------- DOM-помощники ---------- */
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -106,12 +119,16 @@ function metricCard(key, latest) {
 
 /* =========================================================
    Вкладка 1 — Главная (Dashboard)
-   Отвечает на три вопроса: что сегодня (вода, показатели) · что требует внимания
-   (отклонения последних анализов) · куда перейти (последняя активность).
+   Hero прямо на фоне страницы: главный показатель дня (вода и план гидратации) · показатели
+   дня 2×2 · действия. Ниже — ближайшее (лекарство, визит) · требует внимания (отклонения
+   последних анализов) · последняя активность.
    Данные — только из Storage; расчёты — js/services/homeSummary.js.
    ========================================================= */
-const HOME_QUICK_METRICS = ['weight', 'pulse', 'pressure'];
-const HOME_WATER_ADD = 250; // мл — та же запись, что и быстрый ввод модуля воды (Storage.addWaterEntry)
+const HOME_QUICK_METRICS = ['pressure', 'pulse', 'weight']; // ячейки после «Лекарств»
+const HOME_WATER_ADD = HOME_WATER_QUICK_ADD; // мл — кнопка hero «+ 300 мл», запись через Storage.addWaterEntry
+let homeEntered = false;
+let homeMarkerTimer = null; // лёгкое обновление раз в минуту: только положение плановой метки + a11y, без перерендера
+function stopHomeMarkerTimer() { clearInterval(homeMarkerTimer); homeMarkerTimer = null; }
 
 /* Линейные иконки одного семейства с таб-баром (24×24, обводка currentColor) */
 const HOME_ICONS = {
@@ -125,10 +142,14 @@ const HOME_ICONS = {
   chevron: '<path d="m9.5 6 6 6-6 6"/>',
   plus: '<path d="M12 5.5v13M5.5 12h13"/>',
   check: '<path d="m5.5 12.5 4.2 4.2 8.8-9.2"/>',
+  sleep: '<path d="M19.6 14.8A7.9 7.9 0 0 1 9.2 4.4a7.9 7.9 0 1 0 10.4 10.4z"/>',
+  sliders: '<path d="M4 7.5h9M17.5 7.5H20M4 16.5h3M11.5 16.5H20"/><circle cx="15.2" cy="7.5" r="2.2"/><circle cx="9.2" cy="16.5" r="2.2"/>',
 };
 HOME_ICONS.temperature = HOME_ICONS.pulse;
 HOME_ICONS.spo2 = HOME_ICONS.pulse;
 HOME_ICONS.glucose = HOME_ICONS.lab;
+/* капля главного показателя: заливка — мягкий вертикальный градиент фирменных цветов (токены темы) */
+const WATER_DROP_SVG = '<svg class="hh__drop" viewBox="0 0 24 30" aria-hidden="true"><defs><linearGradient id="hh-drop-g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--hm-drop-top)"/><stop offset="1" style="stop-color:var(--hm-drop-bottom)"/></linearGradient></defs><path fill="url(#hh-drop-g)" d="M12 1.5c-.5 0-.9.3-1.2.7C6.6 8 3 12.9 3 18.6 3 24 7 28.5 12 28.5s9-4.5 9-9.9c0-5.7-3.6-10.6-7.8-16.4-.3-.4-.7-.7-1.2-.7z"/></svg>';
 const homeIcon = (name, cls = '') => `<svg class="hi ${cls}" viewBox="0 0 24 24" aria-hidden="true">${HOME_ICONS[name] || HOME_ICONS.lab}</svg>`;
 
 const fmtLongDate = (iso) => new Date(iso + 'T00:00:00').toLocaleDateString(RU, { day: 'numeric', month: 'long', year: 'numeric' }).replace(/\s*г\.$/, '');
@@ -140,32 +161,33 @@ function fmtWhen(iso, today) {
   const d = new Date(iso + 'T00:00:00');
   return d.toLocaleDateString(RU, d.getFullYear() === y.getFullYear() ? { day: 'numeric', month: 'short' } : { day: 'numeric', month: 'short', year: 'numeric' }).replace(/\s*г\.$/, '');
 }
-function homeSection(title, route, label) {
+function homeSection(title, route, label, more = 'Все') {
   return el(`
     <section class="hsec">
       <div class="hsec__head">
         <h2 class="hsec__title">${esc(title)}</h2>
-        ${route ? `<a class="hsec__more" href="#/${route}" aria-label="${esc(label)}">Все${homeIcon('chevron', 'hsec__chev')}</a>` : ''}
+        ${route ? `<a class="hsec__more" href="#/${route}" aria-label="${esc(label)}">${esc(more)}${homeIcon('chevron', 'hsec__chev')}</a>` : ''}
       </div>
     </section>
   `);
 }
 
 async function HomeScreen() {
-  const today = dateKey();
-  const [water, goal, tests, metricsLog, visits, meds, takenToday] = await Promise.all([
-    Storage.getWater(today), Storage.getWaterGoal(), Storage.getTests(), Storage.getMetricsLog(), Storage.getVisits(),
-    Storage.getMeds(), Storage.getMedLog(today),
+  const now = new Date();
+  const today = dateKey(now);
+  const [water, goal, hyd, tests, metricsLog, visits, meds, takenToday, intakes, sleepEntries, sleepSettings] = await Promise.all([
+    Storage.getWater(today), Storage.getWaterGoal(), Storage.getHydration(), Storage.getTests(), Storage.getMetricsLog(),
+    Storage.getVisits(), Storage.getMeds(), Storage.getMedLog(today), Storage.getMedIntakes(today),
+    Storage.getSleepEntries(), Storage.getSleepSettings(),
   ]);
   const screen = el('<div class="home"></div>');
+  /* мягкое появление — только при первом открытии Главной за запуск (не на каждом переключении вкладки) */
+  const enter = !homeEntered;
+  homeEntered = true;
 
-  /* дата — единственный заголовок; справа — общая кнопка ☰ (index.html) */
-  screen.appendChild(el(`<header class="home-head"><p class="home-head__date">${esc(fmtFull(new Date()))}</p></header>`));
-  if (deploymentRole() === 'legacy') screen.appendChild(legacyNotice());
-
-  screen.appendChild(renderWaterHero(water, goal));
-  screen.appendChild(renderQuickMetrics(metricsLog, today));
-  const upcoming = renderUpcoming(meds, takenToday);
+  screen.appendChild(renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, intakes, metricsLog, enter }));
+  screen.appendChild(renderHomeSleep(getSleepForDate(sleepEntries, today), sleepSettings.goalMinutes));
+  const upcoming = renderUpcoming({ meds, takenToday, intakes, visits, now });
   if (upcoming) screen.appendChild(upcoming);
   const attention = renderAttentionSection(tests);
   if (attention) screen.appendChild(attention);
@@ -174,46 +196,95 @@ async function HomeScreen() {
   return screen;
 }
 
-/* ---------- Вода сегодня (hero) ---------- */
-function renderWaterHero(water, goal) {
-  const card = el(`
-    <section class="hw" aria-label="Вода сегодня">
-      <a class="hw__head" href="#/metric/water" aria-label="Вода: открыть модуль воды">
-        <span class="hw__icon">${homeIcon('water')}</span>
-        <span class="hw__title">Вода сегодня</span>
-        ${homeIcon('chevron', 'hw__chev')}
-      </a>
-      <p class="hw__val"><span class="hw__cur"></span><span class="hw__goal"></span></p>
-      <div class="hw__bar" role="progressbar" aria-label="Выпито от цели" aria-valuemin="0" aria-valuemax="100"><span class="hw__fill"></span></div>
-      <div class="hw__foot">
-        <p class="hw__status" aria-live="polite"></p>
-        <button class="hw__add" type="button" aria-label="Добавить ${HOME_WATER_ADD} мл воды">${homeIcon('plus')}${HOME_WATER_ADD} мл</button>
+/* ---------- Hero: композиция прямо на фоне страницы (без карточки) ----------
+   Главный показатель дня — вода: выпито / цель и остаток до цели (homeWaterStatus) в одной строке,
+   на шкале красная метка плана к текущему моменту (plannedByNow → waterPlanMarker), под шкалой
+   справа — её числовая подпись: отклонение от этого же плана (waterPlanDelta).
+   Ниже — показатели дня 2×2 и два действия. Фон — световые волны
+   .hh-ambient (только CSS, в границах hero, растворяются к «Ближайшему»). */
+function renderHomeHero({ now, today, water, goal, hyd, meds, takenToday, intakes, metricsLog, enter }) {
+  const hero = el(`
+    <section class="hh${enter ? ' hh--enter' : ''}" aria-labelledby="hh-title">
+      <div class="hh-ambient" aria-hidden="true"><span class="hh-wave hh-wave--a"></span><span class="hh-wave hh-wave--b"></span><span class="hh-wave hh-wave--c"></span></div>
+      <header class="hh__head">
+        <h1 class="hh__date" id="hh-title">${esc(fmtFull(now))}</h1>
+      </header>
+      <div class="hh__main">
+        <a class="hh__value water-main-value" href="#/metric/water">${WATER_DROP_SVG}<span class="hh__num"></span><span class="hh__unit">мл</span></a>
+        <p class="hh__caption"><span class="hh__goal"></span><span class="hh__left" aria-live="polite"></span></p>
+        <div class="hh__bar" role="progressbar" aria-label="Вода: выпито от цели" aria-valuemin="0" aria-valuemax="100"><span class="hh__fill"></span><span class="hh__plan" aria-hidden="true" hidden></span></div>
+        <p class="hh__meta"><span class="hh__pct"></span><span class="hh__dev"></span></p>
       </div>
+      <div class="hh__cta">
+        <a class="hh-btn hh-btn--soft" href="#/metric/water" aria-label="Подробнее о воде: план дня и журнал">Подробнее</a>
+        <button class="hh-btn hh-btn--accent" type="button" aria-label="Добавить ${HOME_WATER_ADD} мл воды">${homeIcon('plus')}${HOME_WATER_ADD} мл</button>
+      </div>
+      <div class="hm-grid"></div>
     </section>
   `);
+  if (deploymentRole() === 'legacy') $('.hh__head', hero).after(legacyNotice());
+
+  let currentWaterMl = water; // для периодического обновления метки и отклонения (та же вода, меняется только время)
   const paint = (cur) => {
+    currentWaterMl = cur;
     const p = waterProgress(cur, goal);
-    $('.hw__cur', card).textContent = fmtMl(p.current);
-    $('.hw__goal', card).textContent = ` / ${fmtMl(p.goal)} мл`;
-    const pct = Math.round(p.progress * 100);
-    $('.hw__fill', card).style.width = `${pct}%`;
-    const bar = $('.hw__bar', card);
-    bar.setAttribute('aria-valuenow', String(pct));
-    bar.setAttribute('aria-valuetext', `${fmtMl(p.current)} из ${fmtMl(p.goal)} мл`);
-    const st = $('.hw__status', card);
-    st.classList.toggle('is-done', p.reached);
-    st.innerHTML = p.reached
-      ? `${homeIcon('check')}Цель выполнена${p.over ? ` <span class="hw__over">+${esc(fmtMl(p.over))} мл</span>` : ''}`
-      : `Осталось <b>${esc(fmtMl(p.remaining))} мл</b>`;
+    const s = homeWaterStatus(p.current, p.goal);
+    const planned = hyd && hyd.wakeStart && hyd.wakeEnd ? plannedByNow(p.goal, hyd, nowMinutes()) : 0;
+    const mark = waterPlanMarker(planned, p.goal);
+    const d = waterPlanDelta(p.current, p.goal, planned);
+    const pct = p.goal ? Math.round((p.current / p.goal) * 100) : 0;
+    $('.hh__num', hero).textContent = fmtMl(p.current);
+    $('.hh__goal', hero).textContent = p.goal ? `воды из ${fmtMl(p.goal)} мл` : 'воды сегодня';
+    const left = $('.hh__left', hero);
+    left.className = `hh__left hh__left--${s.state}`;
+    left.innerHTML = s.state === 'done'
+      ? `${homeIcon('check')}Выполнено${s.over ? ` · +${esc(fmtMl(s.over))} мл` : ''}` // коротко: «Цель выполнена · +1 200 мл» не помещается рядом с «воды из 2 600 мл» на 375px
+      : s.state === 'remaining'
+        ? `Осталось: ${esc(fmtMl(s.remaining))} мл`
+        : '';
+    $('.hh__fill', hero).style.width = `${p.progress * 100}%`;
+    const plan = $('.hh__plan', hero);
+    plan.hidden = mark == null;
+    if (mark != null) plan.style.setProperty('--plan', String(mark));
+    const bar = $('.hh__bar', hero);
+    bar.setAttribute('aria-valuenow', String(Math.min(pct, 100)));
+    bar.setAttribute('aria-valuetext', p.goal ? `${fmtMl(p.current)} из ${fmtMl(p.goal)} мл, ${pct}%; по плану к этому времени ${fmtMl(planned)} мл` : `${fmtMl(p.current)} мл`);
+    $('.hh__pct', hero).textContent = p.goal ? `${pct}% от цели` : '';
+    const dev = $('.hh__dev', hero);
+    dev.className = `hh__dev hh__dev--${d.state}`;
+    dev.innerHTML = d.state === 'behind'
+      ? `<b>−${esc(fmtMl(-d.delta))} мл</b> · отстаёте`
+      : d.state === 'ahead'
+        ? `<b>+${esc(fmtMl(d.delta))} мл</b> · опережаете`
+        : d.state === 'onPlan' ? 'По плану' : 'Цель не задана';
+    $('.hh__value', hero).setAttribute('aria-label', `Вода сегодня: ${fmtMl(p.current)}${p.goal ? ` из ${fmtMl(p.goal)}` : ''} мл. Открыть модуль воды`);
   };
   paint(water);
+  /* плановая метка и отклонение от плана зависят от времени (вода и цель — нет): раз в минуту пересчитываем
+     то же paint() — он лишь переставляет метку, обновляет отклонение и aria-valuetext, без перерендера экрана.
+     stopHomeMarkerTimer() в render() гасит таймер при уходе с Главной или при повторном входе на неё. */
+  stopHomeMarkerTimer();
+  homeMarkerTimer = setInterval(() => paint(currentWaterMl), 60000);
 
-  /* значение и прогресс тоже ведут в модуль воды (ссылка в заголовке — путь для VoiceOver) */
-  card.addEventListener('click', (e) => {
-    if (e.target.closest('.hw__add, .hw__head')) return;
-    location.hash = '#/metric/water';
+  const grid = $('.hm-grid', hero);
+  homeMetricCells({ meds, takenToday, intakes, metricsLog, today }).forEach((c, i) => {
+    const cell = el(`
+      <a class="hm hm--${c.tone}" href="${c.href}" style="--i:${i}">
+        <span class="hm__label">${homeIcon(c.icon, 'hm__icon')}<span class="hm__name"></span></span>
+        <span class="hm__val${c.value ? '' : ' hm__val--none'}"></span>
+        <span class="hm__when"></span>
+      </a>
+    `);
+    $('.hm__name', cell).textContent = c.name;
+    const val = $('.hm__val', cell);
+    val.textContent = c.value || '—';
+    if (c.value && c.unit) val.appendChild(el(`<span class="hm__unit">${esc(c.unit)}</span>`));
+    $('.hm__when', cell).textContent = c.when;
+    cell.setAttribute('aria-label', c.label);
+    grid.appendChild(cell);
   });
-  const add = $('.hw__add', card);
+
+  const add = $('.hh-btn--accent', hero);
   add.addEventListener('click', async () => {
     if (add.disabled) return;
     add.disabled = true;
@@ -224,66 +295,97 @@ function renderWaterHero(water, goal) {
       add.disabled = false;
     }
   });
-  return card;
+  return hero;
 }
 
-/* ---------- Показатели: вес · пульс · давление ---------- */
-function renderQuickMetrics(metricsLog, today) {
-  const sec = homeSection('Показатели', 'metrics', 'Все показатели');
-  const grid = el('<div class="qm-grid"></div>');
-  const cells = HOME_QUICK_METRICS.map((key) => {
+/* Показатели дня 2×2: лекарства (отмеченные приёмы сегодня) · давление · пульс · вес (последние записи) */
+function homeMetricCells({ meds, takenToday, intakes, metricsLog, today }) {
+  const m = medsToday(meds, { today, takenToday, intakes });
+  const cells = [{
+    tone: 'med', icon: 'med', name: 'Лекарства', href: '#/meds', unit: '',
+    value: m.due ? `${m.taken} / ${m.due}` : null,
+    when: !m.due ? 'на сегодня нет' : m.taken >= m.due ? 'всё принято' : 'принято сегодня',
+    label: m.due ? `Лекарства сегодня: принято ${m.taken} из ${m.due}. Открыть лекарства` : 'Лекарства: на сегодня приёмов нет. Открыть лекарства',
+  }];
+  HOME_QUICK_METRICS.forEach((key) => {
     const M = METRICS[key];
     const log = (metricsLog && metricsLog[key]) || {};
     const date = Object.keys(log).filter((d) => log[d] != null && d <= today).sort().pop();
     const value = date ? fmtMetric(key, log[date]) : null;
-    /* давление «120/80» читается без единицы — в карточке её нет, в aria-label есть */
-    const unit = key === 'pressure' ? '' : M.unit;
-    return { key, M, date, value, unit };
+    cells.push({
+      tone: key, icon: key, name: M.name, href: `#/metric/${key}`,
+      /* давление «120/80» читается без единицы — в aria-label она есть */
+      value, unit: key === 'pressure' ? '' : M.unit,
+      when: date ? fmtWhen(date, today) : 'нет записей',
+      label: value ? `${M.name}: ${value} ${M.unit}, ${fmtWhen(date, today)}. Открыть` : `${M.name}: нет записей. Добавить`,
+    });
   });
-  /* один размер цифр для всего ряда: по самой длинной записи (CSS: --qm-chars) */
-  const chars = Math.max(3, ...cells.filter((c) => c.value).map((c) => c.value.length + c.unit.length * 0.5));
-  grid.style.setProperty('--qm-chars', String(chars));
-  cells.forEach(({ key, M, date, value, unit }) => {
-    const label = value
-      ? `${M.name}: ${value} ${M.unit}, ${fmtWhen(date, today)}. Открыть`
-      : `${M.name}: нет записей. Добавить`;
-    grid.appendChild(el(`
-      <a class="qm${value ? '' : ' qm--empty'}" href="#/metric/${key}" aria-label="${esc(label)}">
-        ${homeIcon(key, 'qm__icon')}
-        <span class="qm__name">${esc(M.name)}</span>
-        ${value
-          ? `<span class="qm__val">${esc(value)}${unit ? `<span class="qm__unit">${esc(unit)}</span>` : ''}</span><span class="qm__when">${esc(fmtWhen(date, today))}</span>`
-          : `<span class="qm__val qm__val--none" aria-hidden="true">—</span><span class="qm__add">${homeIcon('plus')}Добавить</span>`}
-      </a>
-    `));
-  });
-  sec.appendChild(grid);
-  return sec;
+  return cells;
 }
 
-/* ---------- Ближайшее: одно предстоящее лекарство (расписание и отметки — экран «Лекарства») ---------- */
-function renderUpcoming(meds, takenToday) {
-  const now = new Date();
-  const u = upcomingMed(meds, { now, takenToday });
-  if (!u) return null;
-  const today = dateKey(now);
-  const tomorrow = dateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1));
-  const day = u.date === today ? 'Сегодня' : u.date === tomorrow ? 'Завтра' : fmtWhen(u.date, today);
-  const when = [day, u.time].filter(Boolean).join(', ');
-  const sub = [when, u.dose].filter(Boolean).join(' · ');
-  const sec = homeSection('Ближайшее');
+/* ---------- Сон: запись за сегодня (день пробуждения) или приглашение записать ---------- */
+function renderHomeSleep(e, goal) {
+  const sec = homeSection('Сон', 'sleep', 'Открыть раздел «Сон»');
+  const met = e && e.durationMinutes >= goal;
   const row = el(`
-    <a class="hrow hrow--compact" href="#/meds">
-      <span class="hrow__icon">${homeIcon('med')}</span>
-      <span class="hrow__body"><span class="hrow__title"></span><span class="hrow__sub hrow__sub--one"></span></span>
+    <a class="hrow" href="#/sleep">
+      <span class="hrow__icon hrow__icon--sleep">${homeIcon('sleep')}</span>
+      <span class="hrow__body"><span class="hrow__title"></span>${e ? '<span class="hrow__sub hrow__sub--one"></span>' : ''}</span>
+      <span class="hrow__status ${e ? (met ? 'hrow__status--ok' : '') : 'hrow__status--add'}"></span>
       ${homeIcon('chevron', 'hrow__chev')}
     </a>
   `);
-  $('.hrow__title', row).textContent = u.name;
-  $('.hrow__sub', row).textContent = sub;
-  row.setAttribute('aria-label', `Ближайшее: ${u.name}, ${sub}; открыть лекарства`);
+  const status = $('.hrow__status', row);
+  if (e) {
+    const pct = Math.round((e.durationMinutes / goal) * 100);
+    $('.hrow__title', row).textContent = formatSleepDuration(e.durationMinutes);
+    $('.hrow__sub', row).textContent = `${stampTime(e.sleepStart)} → ${stampTime(e.sleepEnd)}`;
+    status.innerHTML = met ? `Цель выполнена ${homeIcon('check', 'hrow__ok')}` : `${pct}% цели`;
+    row.setAttribute('aria-label', `Сон сегодня: ${formatSleepDuration(e.durationMinutes)}, ${stampTime(e.sleepStart)} → ${stampTime(e.sleepEnd)}, ${met ? 'цель выполнена' : `${pct}% цели`}. Открыть раздел «Сон»`);
+  } else {
+    $('.hrow__title', row).textContent = 'Сегодня нет записи';
+    status.textContent = 'Добавить';
+    row.setAttribute('aria-label', 'Сон: сегодня нет записи. Открыть раздел «Сон», чтобы добавить');
+  }
   const list = el('<div class="hlist"></div>');
   list.appendChild(row);
+  sec.appendChild(list);
+  return sec;
+}
+
+/* ---------- Ближайшее: следующее лекарство и следующий визит (время · тип · действие) ---------- */
+function renderUpcoming({ meds, takenToday, intakes, visits, now }) {
+  const today = dateKey(now);
+  const tomorrow = dateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1));
+  const dayWord = (d) => (d === today ? 'Сегодня' : d === tomorrow ? 'Завтра' : fmtWhen(d, today));
+  const items = [];
+  const u = upcomingMed(meds, { now, takenToday, intakes });
+  if (u) items.push({ sort: `${u.date}T${u.time || '00:00'}`, tone: 'med', icon: 'med', href: '#/meds', title: u.name,
+    top: u.time || dayWord(u.date), bottom: u.time ? dayWord(u.date) : '', sub: ['Лекарство', u.dose].filter(Boolean).join(' · ') });
+  const v = upcomingVisit(visits, today);
+  if (v) items.push({ sort: `${v.date}T99`, tone: 'visit', icon: 'visit', href: `#/visit/${encodeURIComponent(v.visitId)}`, title: v.title,
+    top: dayWord(v.date), bottom: '', sub: v.next ? 'Следующий визит' : 'Визит к врачу' });
+  if (!items.length) return null;
+  items.sort((a, b) => a.sort.localeCompare(b.sort));
+
+  const sec = homeSection('Ближайшее', 'calendar', 'Открыть календарь', 'Календарь');
+  const list = el('<div class="hev-list"></div>');
+  items.forEach((it) => {
+    const row = el(`
+      <a class="hev" href="${it.href}">
+        <span class="hev__when"><b></b><small></small></span>
+        <span class="hev__icon hev__icon--${it.tone}">${homeIcon(it.icon)}</span>
+        <span class="hev__body"><span class="hev__title"></span><span class="hev__sub"></span></span>
+        ${homeIcon('chevron', 'hrow__chev')}
+      </a>
+    `);
+    $('.hev__when b', row).textContent = it.top;
+    $('.hev__when small', row).textContent = it.bottom;
+    $('.hev__title', row).textContent = it.title;
+    $('.hev__sub', row).textContent = it.sub;
+    row.setAttribute('aria-label', `${it.sub}: ${it.title}, ${[it.bottom, it.top].filter(Boolean).join(' ')}. Открыть`);
+    list.appendChild(row);
+  });
   sec.appendChild(list);
   return sec;
 }
@@ -368,10 +470,12 @@ async function MetricsScreen() {
 async function MetricScreen(key) {
   const M = METRICS[key];
   const screen = el('<div></div>');
-  let period = 'week';
+  const PERIOD_UI = ['week', 'month', 'year'];
+  let period = PERIOD_UI.includes(readEntryUi('metric')) ? readEntryUi('metric') : 'week';
   let editingGoal = false;
 
   async function paint() {
+    saveEntryUi('metric', period); // «Назад» с вложенного экрана — тот же период
     const [log, cfg] = await Promise.all([Storage.getMetricLog(key), Storage.getMetricConfig(key)]);
     const goal = cfg.goal;
     const days = Object.keys(log).sort();
@@ -379,7 +483,7 @@ async function MetricScreen(key) {
     const cur = lastDay != null ? log[lastDay] : null;
     screen.innerHTML = '';
 
-    screen.appendChild(backHeader(`${M.emoji} ${M.name}`, { label: 'Показатели', onBack: () => { location.hash = '#/metrics'; } }));
+    screen.appendChild(backHeader(`${M.emoji} ${M.name}`, { fallback: 'metrics' }));
 
     /* 1. Текущее значение + 2. Цель */
     const card = el(`
@@ -633,10 +737,11 @@ function flashNotifyResult(granted, onText) {
 
 async function WaterScreen() {
   const screen = el('<div></div>');
-  let period = 'year'; // 'week' | 'month' | 'year' — по умолчанию «Год», как у графика
+  let period = ['week', 'month', 'year'].includes(readEntryUi('water')) ? readEntryUi('water') : 'year'; // 'week' | 'month' | 'year' — по умолчанию «Год», как у графика
   let editingGoal = false;
 
   async function paint() {
+    saveEntryUi('water', period); // «Назад» из журнала воды — тот же период
     const [log, goal, record, loggedStreak, goalStreak, hyd] = await Promise.all([
       Storage.getWaterLog(), Storage.getWaterGoal(), Storage.getWaterRecord(), Storage.getWaterLoggedStreak(), Storage.getWaterStreak(), Storage.getHydration(),
     ]);
@@ -647,7 +752,7 @@ async function WaterScreen() {
     const remaining = Math.max(0, goal - total);
     const color = fillColor(pct);
     screen.innerHTML = '';
-    screen.appendChild(backHeader('💧 Вода', { label: 'Показатели', onBack: () => { location.hash = '#/metrics'; } }));
+    screen.appendChild(backHeader('💧 Вода', { fallback: 'metrics' }));
 
     /* 1. Кольцо + 2. текущий объём / цель */
     const r = 60, circ = 2 * Math.PI * r;
@@ -969,36 +1074,1104 @@ async function WaterScreen() {
 }
 
 /* =========================================================
-   Вкладка 3 — Лекарства
+   Вкладка 3 — Лекарства: приёмы на сегодня (отметка — на каждый приём, не на препарат),
+   история по дням. Форма — #/med/new, #/med/<id>/edit. Расписание и приёмы — services/meds.js.
    ========================================================= */
+const MED_MORE_SVG = '<svg class="hi" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5.5" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="18.5" cy="12" r="1.4" fill="currentColor" stroke="none"/></svg>';
+const hhmmOf = (iso) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? '' : `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+function medDayWord(day, today) {
+  const d = new Date(day + 'T00:00:00');
+  const t = new Date(today + 'T00:00:00');
+  const diff = Math.round((d - t) / 86400000);
+  if (diff === 0) return 'сегодня';
+  if (diff === 1) return 'завтра';
+  if (diff === -1) return 'вчера';
+  return d.toLocaleDateString(RU, { weekday: 'short', day: 'numeric', month: 'short' }).replace(/\s*г\.$/, '');
+}
+
+/* Порядок карточек: приёмы сегодня (по первому времени) → «по необходимости» → не сегодня → не принимается */
+function medRank(m, today) {
+  if (medStatusOn(m, today) !== 'active') return [3, ''];
+  if (medSchedule(m).mode === 'asNeeded') return [1, ''];
+  if (!isMedDueOn(m, today)) return [2, ''];
+  return [0, medSchedule(m).times[0] || '99:99'];
+}
+
 async function MedsScreen() {
-  const screen = el('<div></div>');
+  const screen = el('<div class="meds"></div>');
+  const today = dateKey();
+  let meds = [];
+  let intakes = [];
+  let legacyNames = [];
+
+  const header = () => el(`<header class="header"><p class="header__eyebrow">${esc(fmtFull(new Date()))}</p><h1 class="header__title">Лекарства</h1></header>`);
+
+  function summaryText() {
+    const s = intakeSummary(meds, today, { intakes, legacyNames });
+    if (!s.due) return 'Сегодня приёмов по расписанию нет';
+    if (s.taken >= s.due) return `Сегодня всё принято · ${s.due} ${plural(s.due, 'приём', 'приёма', 'приёмов')}`;
+    return `Сегодня принято ${s.taken} из ${s.due}`;
+  }
+
+  function renderSlot(m, x) {
+    const at = x.takenAt ? hhmmOf(x.takenAt) : '';
+    const state = x.taken ? (at ? `Принято${x.time ? '' : ' сегодня'} в ${at}` : 'Принято') : (x.time ? 'Не принято' : 'Принял сегодня');
+    const li = el(`
+      <li class="med-slot${x.taken ? ' is-taken' : ''}">
+        <button class="med-slot__btn" type="button" aria-pressed="${x.taken}">
+          ${x.time ? `<span class="med-slot__time">${esc(x.time)}</span>` : ''}
+          <span class="med-slot__state">${esc(state)}${x.extra ? '<small> · вне расписания</small>' : ''}</span>
+          <span class="med-slot__check" aria-hidden="true">${CHECK_SVG}</span>
+        </button>
+      </li>
+    `);
+    const btn = $('button', li);
+    btn.setAttribute('aria-label', `${m.name}, ${x.time ? x.time : 'приём сегодня'}: ${x.taken ? 'принято' : 'не принято'}`);
+    btn.dataset.slot = x.time || '';
+    btn.addEventListener('click', () => toggle(m, x, btn));
+    return li;
+  }
+
+  function offLine(m) {
+    const st = medStatusOn(m, today);
+    if (st === 'inactive') return 'Приём выключен';
+    if (st === 'ended') return m.start ? `Курс ${fmtWhen(m.start, today)} – ${fmtWhen(m.end, today)} · ${endedCourseWord(m)}` : `Курс ${endedCourseWord(m)} ${fmtWhen(m.end, today)}`;
+    const next = nextDueDay(m, today, 400);
+    if (st === 'notStarted') return `Начало курса — ${medDayWord(m.start, today)}`;
+    return next ? `Сегодня приёма нет · следующий — ${medDayWord(next, today)}` : 'Сегодня приёма нет';
+  }
+
+  function renderCard(m) {
+    const slots = medDaySlots(m, today, { intakes, legacyNames });
+    const s = medSchedule(m);
+    const meta = [m.dose, scheduleLabel(m), m.purpose].filter(Boolean);
+    if (!slots.length && s.times.length) meta.push(s.times.join(', '));
+    const card = el(`
+      <article class="med-card" data-id="${esc(m.id)}">
+        <div class="med-card__head">
+          <span class="med-card__icon" aria-hidden="true">${homeIcon('med')}</span>
+          <div class="med-card__body">
+            <h3 class="med-card__name"></h3>
+            <p class="med-card__meta"></p>
+          </div>
+          <button class="med-card__more" type="button">${MED_MORE_SVG}</button>
+        </div>
+      </article>
+    `);
+    $('.med-card__name', card).textContent = m.name;
+    $('.med-card__meta', card).textContent = meta.join(' · ');
+    $('.med-card__more', card).setAttribute('aria-label', `Действия: ${m.name}`);
+    if (m.note) {
+      const note = el('<p class="med-card__note"></p>');
+      note.textContent = m.note;
+      $('.med-card__body', card).appendChild(note);
+    }
+    if (slots.length) {
+      const ul = el('<ul class="med-slots"></ul>');
+      slots.forEach((x) => ul.appendChild(renderSlot(m, x)));
+      card.appendChild(ul);
+    } else {
+      const off = el('<p class="med-card__off"></p>');
+      off.textContent = offLine(m);
+      card.appendChild(off);
+    }
+    $('.med-card__more', card).addEventListener('click', () => medActions(m));
+    return card;
+  }
+
+  async function toggle(m, x, btn) {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    const first = medDaySlots(m, today, { intakes, legacyNames })[0];
+    try {
+      await Storage.setMedIntake({ medId: m.id, time: x.time, taken: !x.taken, day: today, name: m.name, legacyTime: first ? first.time : null });
+    } catch {
+      btn.disabled = false;
+      flash('Не удалось сохранить отметку');
+      return;
+    }
+    [intakes, legacyNames] = await Promise.all([Storage.getMedIntakes(today), Storage.getMedLog(today)]);
+    /* перерисовать только эту карточку и сводку: прокрутка и фокус остаются на месте */
+    const old = btn.closest('.med-card');
+    const fresh = renderCard(m);
+    old.replaceWith(fresh);
+    const again = $$('.med-slot__btn', fresh).find((b) => b.dataset.slot === (x.time || ''));
+    if (again) again.focus({ preventScroll: true });
+    const sum = $('.med-sum', screen);
+    if (sum) sum.textContent = summaryText();
+    paintHistory();
+  }
+
+  async function medActions(m) {
+    const act = await showDialog({
+      title: m.name, stack: true, cancelValue: null,
+      actions: [
+        { label: 'Редактировать', value: 'edit' },
+        { label: 'Удалить', value: 'delete', kind: 'destructive' },
+        { label: 'Отмена', value: null },
+      ],
+    });
+    if (act === 'edit') location.hash = `#/med/${encodeURIComponent(m.id)}/edit`;
+    if (act !== 'delete') return;
+    const ok = await showDialog({
+      title: `Удалить ${m.name}?`,
+      body: '<p class="dialog__muted">Лекарство исчезнет из списка. История приёма сохранится.</p>',
+      actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+    });
+    if (!ok) return;
+    try { await Storage.removeMed(m.id); } catch { flash('Не удалось удалить'); return; }
+    flash('Удалено');
+    await paint();
+  }
+
+  let historyOpen = false;
+  let endedOpen = false;
+  async function paintHistory() {
+    const box = $('.med-history:not(.med-ended)', screen);
+    if (!box) return;
+    const [all, allIntakes, allLegacy] = await Promise.all([Storage.getMeds({ includeDeleted: true }), Storage.getAllMedIntakes(), Storage.getAllMedLog()]);
+    const days = intakeHistory(all, allIntakes, allLegacy, { until: today, days: 14 });
+    box.hidden = !days.length;
+    const list = $('.med-history__list', box);
+    list.innerHTML = '';
+    days.forEach(({ day, items }) => {
+      const row = el('<li class="med-history__day"><span class="med-history__date"></span><span class="med-history__items"></span></li>');
+      const w = medDayWord(day, today);
+      $('.med-history__date', row).textContent = w.charAt(0).toUpperCase() + w.slice(1);
+      $('.med-history__items', row).textContent = items.map((it) => (it.time ? `${it.name} ${it.time}` : it.name)).join(' · ');
+      list.appendChild(row);
+    });
+  }
+
   async function paint() {
-    const [meds, takenToday] = await Promise.all([Storage.getMeds(), Storage.getMedLog()]);
+    meds = await Storage.getMeds();
+    if (meds.some((m) => m.id == null)) { await Storage.ensureMedIds(); meds = await Storage.getMeds(); }
+    [intakes, legacyNames] = await Promise.all([Storage.getMedIntakes(today), Storage.getMedLog(today)]);
     screen.innerHTML = '';
-    screen.appendChild(el(`<header class="header"><p class="header__eyebrow">${esc(fmtFull(new Date()))}</p><h1 class="header__title">Лекарства</h1></header>`));
-    const list = el('<section class="section" style="margin-top:14px"><div class="list-card"></div></section>');
-    const box = $('.list-card', list);
-    if (!meds.length) box.appendChild(el('<div class="empty">Пока нет лекарств</div>'));
-    else meds.forEach((m) => {
-      const taken = takenToday.includes(m.name);
-      const nd = nextDose(m);
-      const sub = [m.dose, m.purpose].filter(Boolean).join(' · ');
-      const sched = m.reminder_time ? `Напоминание ${m.reminder_time}` : nd ? `След. доза: ${fmtDate(nd)}` : '';
-      const row = el(`
-        <div class="row ${taken ? 'row--done' : ''}">
-          <span class="row__icon">${esc(m.icon || '💊')}</span>
-          <div class="row__body"><p class="row__title">${esc(m.name)}</p><p class="row__sub">${esc(sub)}${sched ? ' · ' + esc(sched) : ''}</p></div>
-          <button class="check ${taken ? 'check--done' : ''}" type="button" aria-label="Отметить приём">${CHECK_SVG}</button>
+    screen.appendChild(header());
+
+    if (!meds.length) {
+      const empty = el(`
+        <section class="med-empty">
+          <span class="med-empty__icon" aria-hidden="true">${homeIcon('med')}</span>
+          <h2 class="med-empty__title">Лекарств пока нет</h2>
+          <p class="med-empty__text">Добавьте препарат и укажите расписание приёма.</p>
+          <button class="btn-primary btn-primary--brand med-empty__add" type="button">${homeIcon('plus')}<span>Добавить лекарство</span></button>
+        </section>
+      `);
+      $('.med-empty__add', empty).addEventListener('click', () => { location.hash = '#/med/new'; });
+      screen.appendChild(empty);
+      screen.appendChild(el('<p class="med-hint">Здесь можно отмечать приём лекарств и видеть историю по дням.</p>'));
+    } else {
+      const head = el(`
+        <div class="med-head">
+          <p class="med-sum"></p>
+          <button class="med-add" type="button" aria-label="Добавить лекарство">${homeIcon('plus')}<span>Добавить</span></button>
         </div>
       `);
-      $('.check', row).addEventListener('click', async () => { await Storage.toggleMedTaken(m.name); await paint(); });
-      box.appendChild(row);
-    });
-    screen.appendChild(list);
-    screen.appendChild(el('<p class="empty">Отметьте «принял сегодня» галочкой. История приёма сохраняется по дням.</p>'));
+      $('.med-sum', head).textContent = summaryText();
+      $('.med-add', head).addEventListener('click', () => { location.hash = '#/med/new'; });
+      screen.appendChild(head);
+      const list = el('<div class="med-list"></div>');
+      /* завершённые курсы (дата окончания прошла) — отдельным свёрнутым блоком, новые сверху */
+      const ended = meds.filter((m) => medStatusOn(m, today) === 'ended').sort((a, b) => String(b.end).localeCompare(String(a.end)));
+      meds.filter((m) => !ended.includes(m)).map((m, i) => ({ m, i, r: medRank(m, today) }))
+        .sort((a, b) => a.r[0] - b.r[0] || a.r[1].localeCompare(b.r[1]) || a.i - b.i)
+        .forEach(({ m }) => list.appendChild(renderCard(m)));
+      screen.appendChild(list);
+      if (ended.length) {
+        const box = el(`
+          <details class="med-history med-ended"${endedOpen ? ' open' : ''}>
+            <summary class="med-history__head">Завершённые курсы <small>${ended.length}</small></summary>
+            <div class="med-list"></div>
+          </details>
+        `);
+        box.addEventListener('toggle', () => { endedOpen = box.open; });
+        ended.forEach((m) => $('.med-list', box).appendChild(renderCard(m)));
+        screen.appendChild(box);
+      }
+    }
+
+    const hist = el(`
+      <details class="med-history" hidden${historyOpen ? ' open' : ''}>
+        <summary class="med-history__head">История приёма <small>14 дней</small></summary>
+        <ul class="med-history__list"></ul>
+      </details>
+    `);
+    hist.addEventListener('toggle', () => { historyOpen = hist.open; });
+    screen.appendChild(hist);
+    await paintHistory();
   }
   await paint();
+  return screen;
+}
+
+/* Форма лекарства: название (обязательно), дозировка, режим приёма, дни, времена, комментарий */
+async function MedFormScreen(id) {
+  const existing = id ? await Storage.getMed(id) : null;
+  const screen = el('<div class="med-form"></div>');
+  const leave = () => goBack('meds');
+  screen.appendChild(backHeader(id ? 'Редактировать' : 'Новое лекарство', { onBack: leave }));
+  if (id && !existing) {
+    screen.appendChild(el('<div class="empty">Лекарство не найдено</div>'));
+    return screen;
+  }
+  const sched = existing ? medSchedule(existing) : { mode: 'daily', days: [], times: [] };
+  const state = { mode: sched.mode, days: new Set(sched.days), times: sched.times.slice() };
+  const MODES = [['daily', 'Каждый день'], ['days', 'По выбранным дням'], ['asNeeded', 'По необходимости']];
+
+  const form = el(`
+    <form class="med-form__form" novalidate>
+      <div class="input-card">
+        <div class="field">
+          <label class="field__label" for="mf-name">Название препарата</label>
+          <input class="input" id="mf-name" type="text" maxlength="${MED_NAME_MAX}" autocomplete="off" autocapitalize="sentences"
+            placeholder="Например, Витамин D" aria-required="true" aria-describedby="mf-name-err" enterkeyhint="next">
+          <p class="med-form__err" id="mf-name-err" role="alert" hidden></p>
+        </div>
+        <div class="field med-form__last">
+          <label class="field__label" for="mf-dose">Дозировка <span class="med-form__opt">· необязательно</span></label>
+          <input class="input" id="mf-dose" type="text" maxlength="${MED_DOSE_MAX}" autocomplete="off" placeholder="Например, 10 мг или 1 таблетка" enterkeyhint="done">
+        </div>
+      </div>
+
+      <div class="input-card">
+        <fieldset class="med-form__set">
+          <legend class="field__label">Режим приёма</legend>
+          <div class="med-modes">
+            ${MODES.map(([v, t]) => `<label class="med-mode"><input type="radio" name="mf-mode" value="${v}"${state.mode === v ? ' checked' : ''}><span class="med-mode__dot" aria-hidden="true"></span><span>${t}</span></label>`).join('')}
+          </div>
+        </fieldset>
+        <fieldset class="med-form__set" data-part="days">
+          <legend class="field__label">Дни приёма</legend>
+          <div class="med-days" aria-describedby="mf-days-err">
+            ${WEEKDAYS.map((w) => `<button class="med-day" type="button" data-day="${w.day}" aria-pressed="${state.days.has(w.day)}" aria-label="${w.name}">${w.short}</button>`).join('')}
+          </div>
+          <p class="med-form__err" id="mf-days-err" role="alert" hidden></p>
+        </fieldset>
+        <fieldset class="med-form__set med-form__last" data-part="times">
+          <legend class="field__label">Время приёма</legend>
+          <div class="med-times"></div>
+          <button class="med-times__add" type="button">${homeIcon('plus')}<span>Добавить время</span></button>
+          <p class="med-form__hint" data-part="times-hint">Без времени — одна отметка в день.</p>
+        </fieldset>
+        ${existing && existing.every_days && existing.start ? `<p class="med-form__hint">Курс «раз в ${esc(existing.every_days)} дн.» с ${esc(fmtDate(existing.start))} сохраняется: приёмы — только в дни курса.</p>` : ''}
+      </div>
+
+      <div class="input-card">
+        <div class="field med-form__last">
+          <label class="field__label" for="mf-note">Комментарий <span class="med-form__opt">· необязательно</span></label>
+          <input class="input" id="mf-note" type="text" maxlength="${MED_NOTE_MAX}" autocomplete="off" placeholder="Например, после еды" enterkeyhint="done">
+        </div>
+      </div>
+
+      <div class="med-form__actions">
+        <button class="btn-primary btn-primary--brand" type="submit">Сохранить</button>
+        <button class="btn-ghost med-form__cancel" type="button">Отмена</button>
+      </div>
+    </form>
+  `);
+  const nameIn = $('#mf-name', form);
+  nameIn.value = existing ? existing.name || '' : '';
+  $('#mf-dose', form).value = existing ? existing.dose || '' : '';
+  $('#mf-note', form).value = existing ? existing.note || '' : '';
+  const timesBox = $('.med-times', form);
+  const nameErr = $('#mf-name-err', form);
+  const daysErr = $('#mf-days-err', form);
+
+  const syncTimes = () => { state.times = $$('.med-time__input', timesBox).map((i) => i.value).filter(Boolean); };
+  function paintTimes() {
+    timesBox.innerHTML = '';
+    state.times.forEach((t, i) => {
+      const row = el(`
+        <div class="med-time">
+          <label class="sr-only" for="mf-t${i}">Время приёма ${i + 1}</label>
+          <input class="input med-time__input" type="time" id="mf-t${i}" value="${esc(t)}">
+          <button class="med-time__del" type="button" aria-label="Удалить время ${esc(t)}">×</button>
+        </div>
+      `);
+      $('.med-time__del', row).addEventListener('click', () => { syncTimes(); state.times.splice(i, 1); paintTimes(); $('.med-times__add', form).focus(); });
+      timesBox.appendChild(row);
+    });
+    $('.med-times__add', form).hidden = state.times.length >= MED_TIMES_MAX;
+    $('[data-part="times-hint"]', form).hidden = state.times.length > 0;
+  }
+  function paintMode() {
+    $('[data-part="days"]', form).hidden = state.mode !== 'days';
+    $('[data-part="times"]', form).hidden = state.mode === 'asNeeded';
+  }
+  $$('input[name="mf-mode"]', form).forEach((r) => r.addEventListener('change', () => { state.mode = r.value; daysErr.hidden = true; paintMode(); }));
+  $$('.med-day', form).forEach((b) => b.addEventListener('click', () => {
+    const d = Number(b.dataset.day);
+    if (state.days.has(d)) state.days.delete(d); else state.days.add(d);
+    b.setAttribute('aria-pressed', String(state.days.has(d)));
+    if (state.days.size) daysErr.hidden = true;
+  }));
+  $('.med-times__add', form).addEventListener('click', () => {
+    syncTimes();
+    const next = ['08:00', '20:00', '14:00', '12:00', '22:00', '10:00', '18:00', '16:00'].find((t) => !state.times.includes(t)) || '12:00';
+    state.times.push(next);
+    paintTimes();
+    const inputs = $$('.med-time__input', timesBox);
+    inputs[inputs.length - 1].focus();
+  });
+  nameIn.addEventListener('input', () => { if (nameIn.value.trim()) { nameErr.hidden = true; nameIn.removeAttribute('aria-invalid'); } });
+  $('.med-form__cancel', form).addEventListener('click', leave);
+
+  let saving = false;
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (saving) return;
+    syncTimes();
+    const r = normalizeMedInput({
+      name: nameIn.value, dose: $('#mf-dose', form).value, note: $('#mf-note', form).value,
+      mode: state.mode, days: [...state.days], times: state.times,
+    });
+    nameErr.hidden = !r.errors.name;
+    nameErr.textContent = r.errors.name || '';
+    if (r.errors.name) nameIn.setAttribute('aria-invalid', 'true'); else nameIn.removeAttribute('aria-invalid');
+    daysErr.hidden = !r.errors.days;
+    daysErr.textContent = r.errors.days || '';
+    if (!r.ok) {
+      (r.errors.name ? nameIn : $('.med-day', form)).focus();
+      return;
+    }
+    saving = true;
+    const btn = $('button[type="submit"]', form);
+    btn.classList.add('is-busy');
+    try {
+      if (id) await Storage.updateMed(id, r.value);
+      else await Storage.addMed(r.value);
+    } catch {
+      saving = false;
+      btn.classList.remove('is-busy');
+      flash('Не удалось сохранить');
+      return;
+    }
+    flash('Сохранено ✓');
+    goBackTo('meds');
+  });
+
+  screen.appendChild(form);
+  paintTimes();
+  paintMode();
+  return screen;
+}
+
+/* =========================================================
+   Сон (#/sleep): последний сон · аналитика за неделю/месяц/год · история по месяцам.
+   Запись — #/sleep/new (#/sleep/new/<дата>), #/sleep/<id>; настройки — #/sleep/settings.
+   Модель и расчёты — services/sleep.js, хранение — Storage (sleep_log, sleep_settings).
+   ========================================================= */
+/* выбранный период аналитики и месяц истории живут, пока открыт LexLife (возврат из формы — туда же) */
+const sleepUi = { kind: 'month', anchor: null, histMonth: null };
+/* черновик формы: возврат в приложение (visibilitychange → render) не теряет введённое */
+let sleepDraft = null;
+
+const capFirst = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+const sleepTimes = (e) => `${stampTime(e.sleepStart)} → ${stampTime(e.sleepEnd)}`;
+const awakeningsText = (n) => (n ? `${n} ${plural(n, 'пробуждение', 'пробуждения', 'пробуждений')}` : 'без пробуждений');
+function sleepDayMonth(iso, today = dateKey()) {
+  const d = new Date(`${iso}T00:00:00`);
+  const sameYear = iso.slice(0, 4) === today.slice(0, 4);
+  return d.toLocaleDateString(RU, sameYear ? { day: 'numeric', month: 'long' } : { day: 'numeric', month: 'long', year: 'numeric' }).replace(/\s*г\.$/, '');
+}
+function sleepDayWord(iso, today = dateKey()) {
+  if (iso === today) return 'Сегодня';
+  if (iso === sleepAddDays(today, -1)) return 'Вчера';
+  return capFirst(sleepDayMonth(iso, today));
+}
+/* мелкая строка карточки: пробуждения · дневной сон */
+function sleepMeta(e) {
+  const parts = [];
+  if (e.awakenings != null) parts.push(awakeningsText(e.awakenings));
+  const nap = napMinutes(e);
+  if (nap) parts.push(`Дневной сон: ${formatSleepDuration(nap)}`);
+  return parts.join(' · ');
+}
+const SLEEP_MONTHS = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн', 'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек'];
+const SLEEP_WD = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+const SLEEP_KINDS = [['week', 'Неделя'], ['month', 'Месяц'], ['year', 'Год']];
+const SLEEP_PREV = { week: 'прошлой неделей', month: 'прошлым месяцем', year: 'прошлым годом' };
+const monthTitleOf = (ym) => { const [y, m] = ym.split('-').map(Number); return capFirst(new Date(y, m - 1, 1).toLocaleDateString(RU, { month: 'long', year: 'numeric' }).replace(/\s*г\.$/, '')); };
+function sleepPeriodTitle(b) {
+  if (b.kind === 'year') return b.start.slice(0, 4);
+  if (b.kind === 'month') return monthTitleOf(b.start.slice(0, 7));
+  const f = (iso) => new Date(`${iso}T00:00:00`).toLocaleDateString(RU, { day: 'numeric', month: 'short' });
+  return `${f(b.start)} – ${f(b.end)}`;
+}
+/* время суток → часы от полудня (ось графика режима: вечер и ночь идут подряд, без разрыва в полночь) */
+const clockHoursFromNoon = (hhmm) => (((Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5)) - 720) + 1440) % 1440) / 60;
+const hoursFromNoonClock = (h) => minutesToClock(h * 60 + 720);
+
+async function SleepScreen() {
+  const screen = el('<div class="sleep"></div>');
+  const today = dateKey();
+  const [entries, settings] = await Promise.all([Storage.getSleepEntries(), Storage.getSleepSettings()]);
+  const goal = settings.goalMinutes;
+  if (!sleepUi.anchor || sleepUi.anchor > today) sleepUi.anchor = today;
+  if (!sleepUi.histMonth || sleepUi.histMonth > today.slice(0, 7)) sleepUi.histMonth = today.slice(0, 7);
+
+  const header = el(`
+    <header class="header header--nav sleep-header">
+      <div class="sleep-header__row">
+        <h1 class="header__title">Сон</h1>
+        <a class="sleep-gear" href="#/sleep/settings" aria-label="Настройки сна">${homeIcon('sliders')}</a>
+      </div>
+    </header>
+  `);
+  header.prepend(BackButton({ fallback: 'home' }));
+  screen.appendChild(header);
+
+  if (!entries.length) {
+    const empty = el(`
+      <section class="med-empty sleep-empty">
+        <span class="med-empty__icon sleep-empty__icon" aria-hidden="true">${homeIcon('sleep')}</span>
+        <h2 class="med-empty__title">Здесь появится история вашего сна</h2>
+        <p class="med-empty__text">Добавьте первую запись, чтобы LexLife начал строить аналитику.</p>
+        <a class="btn-primary btn-primary--brand med-empty__add sleep-cta" href="#/sleep/new">${homeIcon('plus')}<span>Добавить сон</span></a>
+      </section>
+    `);
+    screen.appendChild(empty);
+    return screen;
+  }
+
+  screen.appendChild(sleepLastCard(entries, goal, today));
+  const analytics = el('<section class="section sleep-analytics" aria-labelledby="sl-an-title"></section>');
+  const history = el('<section class="section sleep-history" aria-labelledby="sl-hist-title"></section>');
+  screen.append(analytics, history);
+
+  function paintAnalytics() {
+    analytics.innerHTML = '';
+    const b = periodBounds(sleepUi.kind, sleepUi.anchor);
+    const next = shiftPeriod(b, 1);
+    analytics.appendChild(el('<div class="section__head"><h2 class="section__title" id="sl-an-title">Аналитика</h2></div>'));
+    const seg = el(`<div class="st-period" role="group" aria-label="Период аналитики">${SLEEP_KINDS.map(([k, t]) => `<button class="st-period__btn${k === sleepUi.kind ? ' is-active' : ''}" type="button" data-k="${k}" aria-pressed="${k === sleepUi.kind}">${t}</button>`).join('')}</div>`);
+    seg.addEventListener('click', (e) => { const x = e.target.closest('[data-k]'); if (x && x.dataset.k !== sleepUi.kind) { sleepUi.kind = x.dataset.k; sleepUi.anchor = today; paintAnalytics(); } });
+    const nav = el(`
+      <div class="sleep-nav">
+        <button class="cal-nav__btn sleep-nav__btn" type="button" data-d="-1" aria-label="Предыдущий период">‹</button>
+        <span class="sleep-nav__title" aria-live="polite">${esc(sleepPeriodTitle(b))}</span>
+        <button class="cal-nav__btn sleep-nav__btn" type="button" data-d="1" aria-label="Следующий период"${next.start > today ? ' disabled' : ''}>›</button>
+      </div>
+    `);
+    nav.addEventListener('click', (e) => {
+      const x = e.target.closest('[data-d]');
+      if (!x || x.disabled) return;
+      sleepUi.anchor = shiftPeriod(b, Number(x.dataset.d)).start;
+      paintAnalytics();
+    });
+    analytics.append(seg, nav);
+
+    const cur = entriesInRange(entries, b.start, b.end);
+    if (cur.length < 2) {
+      analytics.appendChild(el(`
+        <div class="card st-empty sleep-wait">
+          <p class="st-empty__title">${cur.length ? 'Нужно несколько дней данных, чтобы показать тенденции' : 'За этот период записей нет'}</p>
+          <p class="st-empty__sub">${cur.length ? `Пока одна запись: ${esc(sleepDayMonth(cur[0].date, today))} · ${esc(formatSleepDuration(cur[0].durationMinutes))}. Графики появятся со второй.` : 'Выберите другой период или добавьте запись сна.'}</p>
+        </div>
+      `));
+      return;
+    }
+    const prev = shiftPeriod(b, -1);
+    analytics.appendChild(durationCard(b, cur, entriesInRange(entries, prev.start, prev.end)));
+    analytics.appendChild(regimeCard(b, cur));
+    analytics.appendChild(qualityCard(b, cur));
+    const nap = napCard(cur);
+    if (nap) analytics.appendChild(nap);
+    const ins = insightsCard(entries);
+    if (ins) analytics.appendChild(ins);
+  }
+
+  /* 1. Продолжительность: средний сон, сравнение, столбцы по дням / месяцам, цель и серии */
+  function durationCard(b, cur, prevList) {
+    const avg = averageSleep(cur);
+    const cmp = comparePeriods(cur, prevList);
+    const card = el(`
+      <div class="card st-card sleep-card">
+        <p class="sleep-kpi__label">Средний сон</p>
+        <p class="sleep-kpi__val">${esc(formatSleepDuration(avg))}</p>
+        ${cmp ? `<p class="sleep-kpi__sub">${esc(formatSleepDelta(cmp.delta))} по сравнению с ${SLEEP_PREV[b.kind]}</p>` : ''}
+      </div>
+    `);
+    const range = { start: dayNum(b.start), end: dayNum(b.end) };
+    let bars, xLabels;
+    if (b.kind === 'year') {
+      bars = aggregateByYear(entries, b.start).map((m) => ({ start: dayNum(m.start), end: dayNum(m.end), value: m.minutes == null ? null : m.minutes / 60, month: m }));
+      xLabels = bars.map((x, i) => ({ day: x.start + 14, label: SLEEP_MONTHS[i] }));
+    } else {
+      const slots = b.kind === 'week' ? aggregateByWeek(entries, b.start) : aggregateByMonth(entries, b.start);
+      bars = slots.map((s) => ({ start: dayNum(s.date), end: dayNum(s.date), value: s.minutes == null ? null : s.minutes / 60, slot: s }));
+      xLabels = b.kind === 'week'
+        ? slots.map((s, i) => ({ day: dayNum(s.date), label: SLEEP_WD[i] }))
+        : slots.filter((s) => [1, 5, 10, 15, 20, 25, 30].includes(Number(s.date.slice(8)))).map((s) => ({ day: dayNum(s.date), label: String(Number(s.date.slice(8))) }));
+    }
+    const metOf = (v) => v != null && v * 60 >= goal;
+    card.appendChild(svgBarChart({
+      range, bars, fit: false, xLabels,
+      goal: { value: goal / 60, label: `цель ${formatSleepDuration(goal)}` },
+      minSpan: 2,
+      yFormat: (v) => `${fmtN(v)} ч`,
+      barColor: (x) => (metOf(x.value) ? 'var(--viz-1)' : 'var(--sleep-below)'),
+      legendExtra: '<span class="chart__key"><i class="chart__swatch sleep-swatch"></i>цель выполнена</span><span class="chart__key"><i class="chart__swatch sleep-swatch sleep-swatch--below"></i>меньше цели</span>',
+      ariaLabel: `Продолжительность сна, ${sleepPeriodTitle(b)}: в среднем ${formatSleepDuration(avg)}, цель ${formatSleepDuration(goal)}. Выберите столбец, чтобы увидеть значение.`,
+      readout: (x) => {
+        if (x.month) {
+          const name = capFirst(new Date(`${x.month.start}T00:00:00`).toLocaleDateString(RU, { month: 'long' }));
+          if (x.value == null) return `<span class="chart__rv chart__rv--muted">нет записей</span><span class="chart__rd">${esc(name)}</span>`;
+          return `<span class="chart__rv">${esc(formatSleepDuration(x.month.minutes))} <small>в среднем</small></span><span class="chart__rd">${esc(name)} · ${x.month.count} ${plural(x.month.count, 'запись', 'записи', 'записей')}</span>`;
+        }
+        const s = x.slot;
+        const day = capFirst(new Date(`${s.date}T00:00:00`).toLocaleDateString(RU, { weekday: 'short', day: 'numeric', month: 'short' }));
+        if (!s.entry) return `<span class="chart__rv chart__rv--muted">нет записи</span><span class="chart__rd">${esc(day)}</span>`;
+        const diff = s.minutes - goal;
+        const st = diff >= 0 ? 'цель выполнена' : `на ${formatSleepDuration(-diff)} меньше цели`;
+        return `<span class="chart__rv">${esc(formatSleepDuration(s.minutes))}</span><span class="chart__rd">${esc(day)} · ${esc(sleepTimes(s.entry))} · ${esc(st)}</span>`;
+      },
+    }));
+    const rate = sleepGoalRate(cur, goal);
+    const cs = currentSleepStreak(entries, goal, today);
+    const bs = bestSleepStreak(entries, goal);
+    card.appendChild(el(`
+      <div class="sgrid sleep-grid">
+        <div class="sgrid__item"><div class="sgrid__label">Цель сна выполнена</div><div class="sgrid__val">${rate.rate == null ? '—' : `${Math.round(rate.rate * 100)}%`}</div><div class="sgrid__sub">${rate.met} из ${rate.total} ${plural(rate.total, 'дня', 'дней', 'дней')} с записью</div></div>
+        <div class="sgrid__item"><div class="sgrid__label">Цель</div><div class="sgrid__val">${esc(formatSleepDuration(goal))}</div><div class="sgrid__sub"><a href="#/sleep/settings">изменить</a></div></div>
+        <div class="sgrid__item"><div class="sgrid__label">Текущая серия</div><div class="sgrid__val">${cs} ${daysWord(cs)}</div><div class="sgrid__sub">подряд с целью</div></div>
+        <div class="sgrid__item"><div class="sgrid__label">Лучшая серия</div><div class="sgrid__val">${bs} ${daysWord(bs)}</div><div class="sgrid__sub">за всё время</div></div>
+      </div>
+    `));
+    card.appendChild(el('<p class="st-note">День без записи не считается ни выполненным, ни пропущенным: проценты и средние — только по записанным ночам. Серия — ночной сон не меньше цели подряд по сегодня (пока сегодня не записано — по вчера).</p>'));
+    return card;
+  }
+
+  /* 2. Режим сна: обычное время, стабильность, график времени отхода ко сну и подъёма */
+  function regimeCard(b, cur) {
+    const bed = averageBedtime(cur), wake = averageWakeTime(cur);
+    const cons = sleepConsistency(cur);
+    const card = el(`
+      <div class="card st-card sleep-card">
+        <h3 class="sleep-card__title">Режим сна</h3>
+        <div class="sleep-regime">
+          <div><p class="sleep-kpi__label">Обычно ложитесь</p><p class="sleep-kpi__val sleep-kpi__val--sm">${bed == null ? '—' : minutesToClock(bed)}</p></div>
+          <div><p class="sleep-kpi__label">Обычно просыпаетесь</p><p class="sleep-kpi__val sleep-kpi__val--sm">${wake == null ? '—' : minutesToClock(wake)}</p></div>
+        </div>
+        <div class="sleep-cons">
+          <div class="sleep-cons__head">
+            <span class="sleep-kpi__label">Стабильность режима</span>
+            <button class="sleep-info" type="button" aria-label="Что такое стабильность режима">?</button>
+            <b class="sleep-cons__val">${cons == null ? '—' : `${cons}%`}</b>
+          </div>
+          ${cons == null ? '<p class="sleep-kpi__sub">Нужно не меньше 3 записей за период.</p>' : `<div class="sleep-bar" role="progressbar" aria-label="Стабильность режима" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${cons}"><span style="width:${cons}%"></span></div>`}
+        </div>
+      </div>
+    `);
+    $('.sleep-info', card).addEventListener('click', () => showDialog({
+      title: 'Стабильность режима',
+      body: `<p>Показывает, насколько одинаковым было время сна и пробуждения в выбранный период.</p><p class="dialog__muted">Считается среднее отклонение времени отхода ко сну и подъёма от обычного для вас времени (по кругу суток, без скачка в полночь): 0 минут — 100%, 2 часа и больше — 0%. Это не медицинский показатель.</p>`,
+      actions: [{ label: 'Понятно', value: true, kind: 'primary' }],
+    }));
+    const bedPts = cur.map((e) => ({ day: dayNum(e.date), value: clockHoursFromNoon(stampTime(e.sleepStart)), e }));
+    const wakePts = cur.map((e) => ({ day: dayNum(e.date), value: clockHoursFromNoon(stampTime(e.sleepEnd)), e }));
+    card.appendChild(lineChart({
+      range: { start: dayNum(b.start), end: dayNum(b.end) }, fit: false,
+      xLabels: b.kind === 'year' ? SLEEP_MONTHS.map((m, i) => ({ day: dayNum(`${b.start.slice(0, 4)}-${String(i + 1).padStart(2, '0')}-15`), label: m })) : null,
+      series: [
+        { key: 'bed', label: 'отход ко сну', color: 'var(--viz-1)', points: bedPts },
+        { key: 'wake', label: 'подъём', color: 'var(--viz-2)', points: wakePts },
+      ],
+      goals: [{ value: clockHoursFromNoon(settings.bedtime), label: settings.bedtime }, { value: clockHoursFromNoon(settings.wakeTime), label: settings.wakeTime }],
+      goalLegend: `желаемое время ${settings.bedtime} и ${settings.wakeTime}`,
+      minSpan: 2,
+      yStep: (() => { const v = [...bedPts, ...wakePts].map((p) => p.value); return Math.max(...v) - Math.min(...v) > 10 ? 4 : 2; })(),
+      yFormat: (v) => hoursFromNoonClock(v),
+      ariaLabel: `Время отхода ко сну и подъёма, ${sleepPeriodTitle(b)}: обычно ${bed == null ? '—' : minutesToClock(bed)} и ${wake == null ? '—' : minutesToClock(wake)}`,
+      readout: (day) => {
+        const p = bedPts.find((q) => q.day === day);
+        const d = capFirst(new Date(`${p.e.date}T00:00:00`).toLocaleDateString(RU, { weekday: 'short', day: 'numeric', month: 'short' }));
+        return `<span class="chart__rv">${esc(sleepTimes(p.e))}</span><span class="chart__rd">${esc(d)} · легли → проснулись</span>`;
+      },
+    }));
+    return card;
+  }
+
+  /* 3. Качество: среднее и динамика (год — средние по месяцам) */
+  function qualityCard(b, cur) {
+    const avg = averageQuality(cur);
+    const rated = cur.filter((e) => e.quality != null);
+    const card = el(`
+      <div class="card st-card sleep-card">
+        <h3 class="sleep-card__title">Качество сна</h3>
+        <p class="sleep-kpi__label">Среднее качество</p>
+        <p class="sleep-kpi__val">${avg == null ? '—' : `${fmtN(avg, 1)} <small>/ 5</small>`}</p>
+        <p class="sleep-kpi__sub">${rated.length ? `по ${rated.length} ${plural(rated.length, 'оценённой ночи', 'оценённым ночам', 'оценённым ночам')}` : 'В этом периоде нет оценок качества.'}</p>
+      </div>
+    `);
+    let pts;
+    if (b.kind === 'year') {
+      pts = aggregateByYear(entries, b.start).filter((m) => m.quality != null).map((m) => ({ day: dayNum(m.start) + 14, value: m.quality, label: capFirst(new Date(`${m.start}T00:00:00`).toLocaleDateString(RU, { month: 'long' })), month: true }));
+    } else {
+      pts = rated.map((e) => ({ day: dayNum(e.date), value: e.quality, label: capFirst(new Date(`${e.date}T00:00:00`).toLocaleDateString(RU, { weekday: 'short', day: 'numeric', month: 'short' })) }));
+    }
+    if (pts.length >= 2) {
+      card.appendChild(lineChart({
+        range: { start: dayNum(b.start), end: dayNum(b.end) }, fit: false,
+        xLabels: b.kind === 'year' ? SLEEP_MONTHS.map((m, i) => ({ day: dayNum(`${b.start.slice(0, 4)}-${String(i + 1).padStart(2, '0')}-15`), label: m })) : null,
+        series: [{ key: 'q', label: 'качество', color: 'var(--viz-1)', points: pts }],
+        domain: { lo: 1, hi: 5 }, minSpan: 4,
+        yFormat: (v) => (Number.isInteger(v) ? String(v) : ''),
+        ariaLabel: `Качество сна по шкале 1–5, ${sleepPeriodTitle(b)}: в среднем ${avg == null ? '—' : fmtN(avg, 1)}`,
+        readout: (day) => {
+          const p = pts.find((q) => q.day === day);
+          const qi = qualityInfo(Math.round(p.value));
+          return `<span class="chart__rv">${p.month ? `${esc(fmtN(p.value, 1))} <small>/ 5 в среднем</small>` : `${qi ? `${qi.emoji} ` : ''}${esc(qi ? qi.label : '')}`}</span><span class="chart__rd">${esc(p.label)}</span>`;
+        },
+      }));
+    }
+    return card;
+  }
+
+  /* 4. Дневной сон — отдельно от ночного; общий сон за сутки — с подписью */
+  function napCard(cur) {
+    const withNap = cur.filter((e) => napMinutes(e) > 0);
+    if (!withNap.length) return null;
+    const avgNap = Math.round(withNap.reduce((s, e) => s + napMinutes(e), 0) / withNap.length);
+    const total = Math.round(cur.reduce((s, e) => s + totalDayMinutes(e), 0) / cur.length);
+    return el(`
+      <div class="card st-card sleep-card">
+        <h3 class="sleep-card__title">Дневной сон</h3>
+        <div class="sgrid sleep-grid">
+          <div class="sgrid__item"><div class="sgrid__label">Дней с дневным сном</div><div class="sgrid__val">${withNap.length}</div><div class="sgrid__sub">в среднем ${esc(formatSleepDuration(avgNap))}</div></div>
+          <div class="sgrid__item"><div class="sgrid__label">Общий сон за сутки</div><div class="sgrid__val">${esc(formatSleepDuration(total))}</div><div class="sgrid__sub">ночной + дневной, в среднем</div></div>
+        </div>
+        <p class="st-note">Средний сон, цель и серии считаются только по ночному сну.</p>
+      </div>
+    `);
+  }
+
+  /* 5. Что связано с вашим сном — по всем записям, только простые наблюдения */
+  function insightsCard(all) {
+    const list = factorInsights(all);
+    const anyTags = all.some((e) => Array.isArray(e.tags) && e.tags.length);
+    if (!list.length && !anyTags) return null;
+    const card = el(`
+      <div class="card st-card sleep-card">
+        <h3 class="sleep-card__title">Что связано с вашим сном</h3>
+        ${list.length ? `<ul class="sleep-insights">${list.slice(0, 5).map((x) => `<li><span aria-hidden="true">${tagInfo(x.key).emoji}</span><span>${esc(insightText(x))}</span></li>`).join('')}</ul>` : ''}
+        <p class="st-note">${list.length ? 'Это наблюдения по вашим записям за всё время, а не медицинские выводы: совпадение не означает причину.' : `Наблюдения появятся, когда будет не меньше ${INSIGHT_MIN_DAYS} дней с фактором и ${INSIGHT_MIN_DAYS} без него.`}</p>
+      </div>
+    `);
+    return card;
+  }
+
+  /* История: месяц, новые сверху; карточка → запись */
+  function paintHistory() {
+    history.innerHTML = '';
+    const curMonth = today.slice(0, 7);
+    const ym = sleepUi.histMonth;
+    const [y, m] = ym.split('-').map(Number);
+    const shift = (d) => { const x = new Date(y, m - 1 + d, 1); return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}`; };
+    const head = el(`
+      <div class="section__head sleep-history__head">
+        <h2 class="section__title" id="sl-hist-title">История</h2>
+        <a class="med-add" href="#/sleep/new" aria-label="Добавить запись сна">${homeIcon('plus')}<span>Добавить</span></a>
+      </div>
+    `);
+    const nav = el(`
+      <div class="sleep-nav">
+        <button class="cal-nav__btn sleep-nav__btn" type="button" data-d="-1" aria-label="Предыдущий месяц">‹</button>
+        <span class="sleep-nav__title" aria-live="polite">${esc(monthTitleOf(ym))}</span>
+        ${ym < curMonth ? '<button class="sleep-today" type="button" data-today>Сегодня</button>' : ''}
+        <button class="cal-nav__btn sleep-nav__btn" type="button" data-d="1" aria-label="Следующий месяц"${ym >= curMonth ? ' disabled' : ''}>›</button>
+      </div>
+    `);
+    nav.addEventListener('click', (e) => {
+      const x = e.target.closest('button');
+      if (!x || x.disabled) return;
+      sleepUi.histMonth = x.hasAttribute('data-today') ? curMonth : shift(Number(x.dataset.d));
+      paintHistory();
+    });
+    history.append(head, nav);
+    const list = entries.filter((e) => e.date.startsWith(`${ym}-`));
+    if (!list.length) { history.appendChild(el('<div class="list-card"><div class="empty">В этом месяце записей сна нет.</div></div>')); return; }
+    const box = el('<div class="list-card sleep-list"></div>');
+    list.forEach((e) => {
+      const q = qualityInfo(e.quality);
+      const meta = sleepMeta(e);
+      const row = el(`
+        <a class="row sleep-row" href="#/sleep/${encodeURIComponent(e.id)}">
+          <div class="row__body">
+            <p class="sleep-row__date"></p>
+            <p class="sleep-row__main"><b class="sleep-row__dur"></b><span class="sleep-row__times"></span></p>
+            ${meta ? '<p class="sleep-row__meta"></p>' : ''}
+          </div>
+          ${q ? `<span class="sleep-row__q"><span aria-hidden="true">${q.emoji}</span> ${esc(q.label)}</span>` : ''}
+          <span class="row__chevron" aria-hidden="true">›</span>
+        </a>
+      `);
+      const wd = new Date(`${e.date}T00:00:00`).toLocaleDateString(RU, { weekday: 'short' });
+      $('.sleep-row__date', row).textContent = `${capFirst(sleepDayMonth(e.date, today))} · ${wd}`;
+      $('.sleep-row__dur', row).textContent = formatSleepDuration(e.durationMinutes);
+      $('.sleep-row__times', row).textContent = sleepTimes(e);
+      if (meta) $('.sleep-row__meta', row).textContent = meta;
+      row.setAttribute('aria-label', `${sleepDayMonth(e.date, today)}: ${formatSleepDuration(e.durationMinutes)}, ${sleepTimes(e)}${q ? `, ${q.label}` : ''}${meta ? `, ${meta}` : ''}. Открыть запись`);
+      box.appendChild(row);
+    });
+    history.appendChild(box);
+  }
+
+  paintAnalytics();
+  paintHistory();
+  return screen;
+}
+
+/* Карточка «Последний сон»: сегодня записан — итог дня; нет — приглашение записать */
+function sleepLastCard(entries, goal, today) {
+  const e = getSleepForDate(entries, today);
+  if (!e) {
+    const last = entries[0];
+    const card = el(`
+      <section class="card sleep-last sleep-last--none" aria-label="Сон сегодня">
+        <p class="sleep-last__when">Сегодня</p>
+        <p class="sleep-last__title">Сегодня сон ещё не записан</p>
+        <a class="btn-primary btn-primary--brand sleep-cta" href="#/sleep/new">${homeIcon('plus')}<span>Добавить сон</span></a>
+        ${last ? `<a class="sleep-last__prev" href="#/sleep/${encodeURIComponent(last.id)}"><span>Последняя запись · ${esc(sleepDayWord(last.date, today).toLowerCase())}: <b>${esc(formatSleepDuration(last.durationMinutes))}</b></span>${homeIcon('chevron', 'sleep-last__chev')}</a>` : ''}
+      </section>
+    `);
+    return card;
+  }
+  const q = qualityInfo(e.quality);
+  const pct = Math.round((e.durationMinutes / goal) * 100);
+  const met = e.durationMinutes >= goal;
+  const meta = sleepMeta(e);
+  const card = el(`
+    <a class="card sleep-last" href="#/sleep/${encodeURIComponent(e.id)}">
+      <p class="sleep-last__when">Сегодня</p>
+      <p class="sleep-last__dur">${esc(formatSleepDuration(e.durationMinutes))}</p>
+      <p class="sleep-last__times">${esc(sleepTimes(e))}</p>
+      ${q ? `<p class="sleep-last__q"><span aria-hidden="true">${q.emoji}</span> ${esc(q.sleep)}</p>` : ''}
+      <div class="sleep-bar" role="progressbar" aria-label="Сон от цели" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.min(pct, 100)}"><span style="width:${Math.min(pct, 100)}%"></span></div>
+      <p class="sleep-last__goal">${met ? `${homeIcon('check', 'sleep-last__ok')}Цель выполнена` : `${pct}% от цели`} · цель ${esc(formatSleepDuration(goal))}</p>
+      ${meta ? `<p class="sleep-last__meta">${esc(meta)}</p>` : ''}
+    </a>
+  `);
+  card.setAttribute('aria-label', `Сон сегодня: ${formatSleepDuration(e.durationMinutes)}, ${sleepTimes(e)}${q ? `, ${q.sleep.toLowerCase()}` : ''}, ${met ? 'цель выполнена' : `${pct}% от цели`}. Открыть запись`);
+  return card;
+}
+
+/* Форма записи сна: новая (#/sleep/new[/<дата пробуждения>]) или правка (#/sleep/<id>) */
+async function SleepFormScreen(id, presetDate = null) {
+  const today = dateKey();
+  const [existing, settings] = await Promise.all([id ? Storage.getSleepEntry(id) : null, Storage.getSleepSettings()]);
+  const screen = el('<div class="med-form sleep-form"></div>');
+  const route = location.hash;
+  const leave = () => { sleepDraft = null; goBack('sleep'); };
+  screen.appendChild(backHeader(id ? 'Запись сна' : 'Новая запись сна', { onBack: leave }));
+  if (id && !existing) {
+    screen.appendChild(el('<div class="empty">Запись сна не найдена — возможно, она удалена.</div>'));
+    return screen;
+  }
+  const wake0 = presetDate && /^\d{4}-\d{2}-\d{2}$/.test(presetDate) && presetDate <= today ? presetDate : today;
+  let st = existing ? {
+    bedDate: stampDay(existing.sleepStart), bedTime: stampTime(existing.sleepStart),
+    wakeDate: existing.date, wakeTime: stampTime(existing.sleepEnd),
+    quality: existing.quality ?? null, awakenings: existing.awakenings ?? 0,
+    napEnabled: napMinutes(existing) > 0, napMinutes: napMinutes(existing) || 30,
+    tags: new Set(existing.tags || []), note: existing.note || '', bedManual: true,
+  } : {
+    bedDate: inferBedDate(wake0, settings.bedtime, settings.wakeTime), bedTime: settings.bedtime,
+    wakeDate: wake0, wakeTime: settings.wakeTime,
+    quality: null, awakenings: 0, napEnabled: false, napMinutes: 30, tags: new Set(), note: '', bedManual: false,
+  };
+  if (sleepDraft && sleepDraft.route === route && Date.now() - sleepDraft.at < 30 * 60000) st = { ...sleepDraft.state, tags: new Set(sleepDraft.state.tags) };
+  const saveDraft = () => { sleepDraft = { route, at: Date.now(), state: { ...st, tags: [...st.tags] } }; };
+
+  const form = el(`
+    <form class="med-form__form" novalidate>
+      <div class="input-card">
+        <fieldset class="med-form__set">
+          <legend class="field__label">Лёг спать</legend>
+          <div class="sleep-when">
+            <input class="input sleep-when__date" id="sf-bed-date" type="date" aria-label="Дата, когда легли спать" required>
+            <input class="input sleep-when__time" id="sf-bed-time" type="time" aria-label="Время, когда легли спать" required>
+          </div>
+        </fieldset>
+        <fieldset class="med-form__set">
+          <legend class="field__label">Проснулся</legend>
+          <div class="sleep-when">
+            <input class="input sleep-when__date" id="sf-wake-date" type="date" max="${today}" aria-label="Дата пробуждения" aria-describedby="sf-day-hint" required>
+            <input class="input sleep-when__time" id="sf-wake-time" type="time" aria-label="Время пробуждения" required>
+          </div>
+          <p class="med-form__hint" id="sf-day-hint"></p>
+        </fieldset>
+        <div class="sleep-dur">
+          <span class="sleep-dur__label">Продолжительность</span>
+          <b class="sleep-dur__val" aria-live="polite"></b>
+        </div>
+        <p class="med-form__err" id="sf-time-err" role="alert" hidden></p>
+      </div>
+
+      <div class="input-card">
+        <fieldset class="med-form__set">
+          <legend class="field__label">Качество сна <span class="med-form__opt">· необязательно</span></legend>
+          <div class="sleep-quality" role="radiogroup" aria-label="Качество сна">
+            ${SLEEP_QUALITY.map((q) => `<button class="sleep-q" type="button" role="radio" data-q="${q.value}" aria-checked="false" aria-label="${q.value} из 5: ${q.label}"><span class="sleep-q__emoji" aria-hidden="true">${q.emoji}</span><span class="sleep-q__label" aria-hidden="true">${q.label}</span></button>`).join('')}
+          </div>
+        </fieldset>
+        <div class="sleep-step-row med-form__last">
+          <span class="field__label" id="sf-aw-label">Пробуждения ночью</span>
+          <div class="sleep-stepper" role="group" aria-labelledby="sf-aw-label">
+            <button class="sleep-stepper__btn" type="button" data-aw="-1" aria-label="Меньше пробуждений">−</button>
+            <output class="sleep-stepper__val" id="sf-aw" aria-live="polite"></output>
+            <button class="sleep-stepper__btn" type="button" data-aw="1" aria-label="Больше пробуждений">+</button>
+          </div>
+        </div>
+        <p class="med-form__err" id="sf-aw-err" role="alert" hidden></p>
+      </div>
+
+      <div class="input-card">
+        <div class="rs-row sleep-nap-row">
+          <div><div class="field__label sleep-nap-row__title" id="sf-nap-label">Дневной сон</div><div class="sleep-nap-row__sub">Есть дневной сон</div></div>
+          <button class="rs-toggle" id="sf-nap" type="button" role="switch" aria-labelledby="sf-nap-label" aria-checked="false"><span class="rs-toggle__knob"></span></button>
+        </div>
+        <div class="sleep-step-row" data-part="nap">
+          <label class="field__label" for="sf-nap-min">Длительность, мин</label>
+          <div class="sleep-stepper">
+            <button class="sleep-stepper__btn" type="button" data-nap="-10" aria-label="Меньше на 10 минут">−</button>
+            <input class="input sleep-stepper__input" id="sf-nap-min" type="number" inputmode="numeric" min="1" max="${NAP_MAX_MINUTES}" step="5">
+            <button class="sleep-stepper__btn" type="button" data-nap="10" aria-label="Больше на 10 минут">+</button>
+          </div>
+        </div>
+        <p class="med-form__err" id="sf-nap-err" role="alert" hidden></p>
+      </div>
+
+      <div class="input-card">
+        <fieldset class="med-form__set med-form__last">
+          <legend class="field__label">Что могло повлиять на сон? <span class="med-form__opt">· необязательно</span></legend>
+          <div class="sleep-tags">
+            ${SLEEP_TAGS.map((t) => `<button class="sleep-tag" type="button" data-tag="${t.key}" aria-pressed="false"><span aria-hidden="true">${t.emoji}</span> ${esc(t.label)}</button>`).join('')}
+          </div>
+        </fieldset>
+      </div>
+
+      <div class="input-card">
+        <div class="field med-form__last">
+          <label class="field__label" for="sf-note">Заметка <span class="med-form__opt">· необязательно</span></label>
+          <textarea class="input sleep-note" id="sf-note" rows="3" maxlength="${SLEEP_NOTE_MAX}" placeholder="Например, долго не мог заснуть, проснулся около 4 утра"></textarea>
+        </div>
+      </div>
+
+      <div class="med-form__actions">
+        <button class="btn-primary btn-primary--brand" type="submit">Сохранить</button>
+        <button class="btn-ghost med-form__cancel" type="button">Отмена</button>
+        ${existing ? '<button class="btn-ghost sleep-delete" type="button">Удалить запись</button>' : ''}
+      </div>
+    </form>
+  `);
+  const bedDate = $('#sf-bed-date', form), bedTime = $('#sf-bed-time', form);
+  const wakeDate = $('#sf-wake-date', form), wakeTime = $('#sf-wake-time', form);
+  const durVal = $('.sleep-dur__val', form), timeErr = $('#sf-time-err', form);
+  const napMin = $('#sf-nap-min', form);
+  bedDate.value = st.bedDate; bedTime.value = st.bedTime; wakeDate.value = st.wakeDate; wakeTime.value = st.wakeTime;
+  napMin.value = String(st.napMinutes);
+  $('#sf-note', form).value = st.note;
+
+  const input = () => ({ ...st, tags: [...st.tags] });
+  function paintTime() {
+    const r = normalizeSleepInput(input(), { today });
+    const terr = r.errors.start || r.errors.end || r.errors.duration;
+    const dur = calculateDuration(makeStamp(st.bedDate, st.bedTime), makeStamp(st.wakeDate, st.wakeTime));
+    durVal.textContent = terr ? '—' : formatSleepDuration(dur);
+    $('#sf-day-hint', form).textContent = st.wakeDate ? `Запись относится к дню пробуждения: ${sleepDayMonth(st.wakeDate, today)}` : '';
+    return terr;
+  }
+  function showTimeErr(msg) {
+    timeErr.hidden = !msg;
+    timeErr.textContent = msg || '';
+    [bedDate, bedTime, wakeDate, wakeTime].forEach((x) => (msg ? x.setAttribute('aria-invalid', 'true') : x.removeAttribute('aria-invalid')));
+  }
+  const onTime = () => {
+    st.bedTime = bedTime.value; st.wakeTime = wakeTime.value; st.wakeDate = wakeDate.value;
+    /* дата засыпания подстраивается, пока её не меняли вручную: 23:40 → накануне, 00:30 → тот же день */
+    if (!st.bedManual && st.wakeDate) { st.bedDate = inferBedDate(st.wakeDate, st.bedTime, st.wakeTime); bedDate.value = st.bedDate; }
+    const err = paintTime();
+    if (!timeErr.hidden) showTimeErr(err);
+    saveDraft();
+  };
+  [bedTime, wakeTime, wakeDate].forEach((x) => { x.addEventListener('input', onTime); x.addEventListener('change', onTime); });
+  const onBedDate = () => { st.bedDate = bedDate.value; st.bedManual = true; const err = paintTime(); if (!timeErr.hidden) showTimeErr(err); saveDraft(); };
+  bedDate.addEventListener('input', onBedDate);
+  bedDate.addEventListener('change', onBedDate);
+
+  const paintQuality = () => $$('.sleep-q', form).forEach((b) => {
+    const on = Number(b.dataset.q) === st.quality;
+    b.setAttribute('aria-checked', String(on));
+    b.tabIndex = on || (st.quality == null && b.dataset.q === '1') ? 0 : -1;
+  });
+  $('.sleep-quality', form).addEventListener('click', (e) => {
+    const b = e.target.closest('.sleep-q');
+    if (!b) return;
+    const q = Number(b.dataset.q);
+    st.quality = st.quality === q ? null : q; // повторное касание снимает оценку
+    paintQuality(); saveDraft();
+  });
+  $('.sleep-quality', form).addEventListener('keydown', (e) => {
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return;
+    e.preventDefault();
+    const d = e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 1;
+    st.quality = Math.min(5, Math.max(1, (st.quality || (d > 0 ? 0 : 6)) + d));
+    paintQuality(); saveDraft();
+    $(`.sleep-q[data-q="${st.quality}"]`, form).focus();
+  });
+
+  const paintAw = () => {
+    $('#sf-aw', form).textContent = String(st.awakenings);
+    $('[data-aw="-1"]', form).disabled = st.awakenings <= 0;
+    $('[data-aw="1"]', form).disabled = st.awakenings >= AWAKENINGS_MAX;
+  };
+  $$('[data-aw]', form).forEach((b) => b.addEventListener('click', () => {
+    st.awakenings = Math.min(AWAKENINGS_MAX, Math.max(0, st.awakenings + Number(b.dataset.aw)));
+    paintAw(); saveDraft();
+  }));
+
+  const napToggle = $('#sf-nap', form);
+  const paintNap = () => {
+    napToggle.classList.toggle('is-on', st.napEnabled);
+    napToggle.setAttribute('aria-checked', String(st.napEnabled));
+    $('[data-part="nap"]', form).hidden = !st.napEnabled;
+    if (!st.napEnabled) $('#sf-nap-err', form).hidden = true;
+  };
+  napToggle.addEventListener('click', () => { st.napEnabled = !st.napEnabled; paintNap(); saveDraft(); });
+  /* вся строка — зона касания переключателя (сам он 48×28) */
+  $('.sleep-nap-row', form).addEventListener('click', (e) => { if (!e.target.closest('#sf-nap')) napToggle.click(); });
+  napMin.addEventListener('input', () => { st.napMinutes = napMin.value === '' ? '' : Number(napMin.value); saveDraft(); });
+  $$('[data-nap]', form).forEach((b) => b.addEventListener('click', () => {
+    const cur = Number(st.napMinutes) || 0;
+    st.napMinutes = Math.min(NAP_MAX_MINUTES, Math.max(10, Math.round((cur + Number(b.dataset.nap)) / 5) * 5));
+    napMin.value = String(st.napMinutes);
+    saveDraft();
+  }));
+
+  const paintTags = () => $$('.sleep-tag', form).forEach((b) => b.setAttribute('aria-pressed', String(st.tags.has(b.dataset.tag))));
+  $('.sleep-tags', form).addEventListener('click', (e) => {
+    const b = e.target.closest('.sleep-tag');
+    if (!b) return;
+    if (st.tags.has(b.dataset.tag)) st.tags.delete(b.dataset.tag); else st.tags.add(b.dataset.tag);
+    paintTags(); saveDraft();
+  });
+  $('#sf-note', form).addEventListener('input', (e) => { st.note = e.target.value; saveDraft(); });
+  $('.med-form__cancel', form).addEventListener('click', leave);
+
+  async function openDuplicate(dup) {
+    const go = await showDialog({
+      title: `За ${sleepDayMonth(dup.date, today)} сон уже записан`,
+      body: `<p class="dialog__muted">Одна дата пробуждения — одна запись: ${esc(formatSleepDuration(dup.durationMinutes))}, ${esc(sleepTimes(dup))}. Откройте её, чтобы изменить, или выберите другую дату.</p>`,
+      actions: [{ label: 'Отмена', value: false }, { label: 'Открыть запись', value: true, kind: 'primary' }],
+    });
+    if (go) { sleepDraft = null; replaceRoute(`sleep/${encodeURIComponent(dup.id)}`); }
+  }
+
+  let saving = false;
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (saving) return;
+    const r = normalizeSleepInput(input(), { today });
+    showTimeErr(r.errors.start || r.errors.end || r.errors.duration);
+    const awErr = $('#sf-aw-err', form), napErr = $('#sf-nap-err', form);
+    awErr.hidden = !r.errors.awakenings; awErr.textContent = r.errors.awakenings || '';
+    napErr.hidden = !r.errors.nap; napErr.textContent = r.errors.nap || '';
+    if (r.errors.nap) napMin.setAttribute('aria-invalid', 'true'); else napMin.removeAttribute('aria-invalid');
+    if (!r.ok) {
+      const first = r.errors.start ? bedTime : r.errors.end || r.errors.duration ? wakeTime : r.errors.nap ? napMin : null;
+      if (first) first.focus();
+      return;
+    }
+    saving = true;
+    const btn = $('button[type="submit"]', form);
+    btn.classList.add('is-busy');
+    try {
+      if (existing) await Storage.updateSleepEntry(existing.id, r.value);
+      else await Storage.addSleepEntry(r.value);
+    } catch (err) {
+      saving = false;
+      btn.classList.remove('is-busy');
+      if (err instanceof SleepStoreError && err.code === 'DUPLICATE_DATE' && err.existing) { await openDuplicate(err.existing); return; }
+      flash(err instanceof SleepStoreError && err.code !== 'INVALID' ? err.message : 'Не удалось сохранить запись сна');
+      return;
+    }
+    sleepDraft = null;
+    flash('Сохранено ✓');
+    goBackTo('sleep');
+  });
+
+  const del = $('.sleep-delete', form);
+  if (del) del.addEventListener('click', async () => {
+    const ok = await showDialog({
+      title: `Удалить запись сна за ${sleepDayMonth(existing.date, today)}?`,
+      body: `<p class="dialog__muted">${esc(formatSleepDuration(existing.durationMinutes))}, ${esc(sleepTimes(existing))}. Аналитика пересчитается без этой ночи.</p>`,
+      actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+    });
+    if (!ok) return;
+    try { await Storage.removeSleepEntry(existing.id); } catch { flash('Не удалось удалить'); return; }
+    sleepDraft = null;
+    flash('Удалено');
+    goBackTo('sleep');
+  });
+
+  screen.appendChild(form);
+  paintTime(); paintQuality(); paintAw(); paintNap(); paintTags();
+  return screen;
+}
+
+/* Настройки сна: цель (4–12 ч, шаг 15 мин), желаемое время сна и подъёма */
+async function SleepSettingsScreen() {
+  const s = await Storage.getSleepSettings();
+  const screen = el('<div class="med-form sleep-form"></div>');
+  const leave = () => goBack('sleep');
+  screen.appendChild(backHeader('Настройки сна', { onBack: leave }));
+  let goal = s.goalMinutes;
+  const form = el(`
+    <form class="med-form__form" novalidate>
+      <div class="input-card">
+        <div class="sleep-step-row sleep-step-row--stack med-form__last">
+          <span class="field__label" id="ss-goal-label">Целевая продолжительность</span>
+          <div class="sleep-stepper sleep-stepper--wide" role="group" aria-labelledby="ss-goal-label">
+            <button class="sleep-stepper__btn" type="button" data-g="-1" aria-label="Меньше на 15 минут">−</button>
+            <output class="sleep-stepper__val" id="ss-goal" aria-live="polite"></output>
+            <button class="sleep-stepper__btn" type="button" data-g="1" aria-label="Больше на 15 минут">+</button>
+          </div>
+        </div>
+        <p class="med-form__hint">От ${SLEEP_GOAL_MIN / 60} до ${SLEEP_GOAL_MAX / 60} часов, шаг ${SLEEP_GOAL_STEP} минут. Цель — для ночного сна: по ней считаются выполнение и серии.</p>
+      </div>
+      <div class="input-card">
+        <div class="rs-row"><label class="field__label" for="ss-bed" style="margin:0">Желаемое время сна</label><input class="input sleep-set-time" id="ss-bed" type="time" required></div>
+        <div class="rs-row"><label class="field__label" for="ss-wake" style="margin:0">Желаемое время подъёма</label><input class="input sleep-set-time" id="ss-wake" type="time" required></div>
+        <p class="med-form__hint">Подставляется в новую запись и показывается на графике режима. Напоминания «Пора готовиться ко сну» и «Записать сон» появятся в одном из следующих обновлений.</p>
+      </div>
+      <div class="med-form__actions">
+        <button class="btn-primary btn-primary--brand" type="submit">Сохранить</button>
+        <button class="btn-ghost med-form__cancel" type="button">Отмена</button>
+      </div>
+    </form>
+  `);
+  const paintGoal = () => {
+    $('#ss-goal', form).textContent = formatSleepDuration(goal);
+    $('[data-g="-1"]', form).disabled = goal <= SLEEP_GOAL_MIN;
+    $('[data-g="1"]', form).disabled = goal >= SLEEP_GOAL_MAX;
+  };
+  $$('[data-g]', form).forEach((b) => b.addEventListener('click', () => { goal = clampSleepGoal(goal + Number(b.dataset.g) * SLEEP_GOAL_STEP); paintGoal(); }));
+  $('#ss-bed', form).value = s.bedtime;
+  $('#ss-wake', form).value = s.wakeTime;
+  $('.med-form__cancel', form).addEventListener('click', leave);
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const bedtime = $('#ss-bed', form).value, wakeTime = $('#ss-wake', form).value;
+    if (!/^\d{2}:\d{2}$/.test(bedtime) || !/^\d{2}:\d{2}$/.test(wakeTime)) { flash('Укажите время сна и подъёма'); return; }
+    try { await Storage.updateSleepSettings({ goalMinutes: goal, bedtime, wakeTime }); } catch { flash('Не удалось сохранить'); return; }
+    flash('Сохранено ✓');
+    goBackTo('sleep');
+  });
+  screen.appendChild(form);
+  paintGoal();
   return screen;
 }
 
@@ -1030,8 +2203,8 @@ async function openTestDocument(meta) {
 }
 
 /* «Документ анализа» поверх приложения (js/ui/docViewer.js): PDF целиком, фото с масштабом */
-function openDocViewer(file) {
-  return showDocViewer(file, { lockScroll: lockPageScroll, unlockScroll: unlockPageScroll });
+function openDocViewer(file, title) {
+  return showDocViewer(file, { lockScroll: lockPageScroll, unlockScroll: unlockPageScroll, ...(title ? { title } : {}) });
 }
 
 /* Состояние журнала между переходами: фильтр года, подсветка только что добавленной записи */
@@ -1195,7 +2368,6 @@ async function TestsScreen() {
   }
 
   await paint();
-  screen.restoreScroll = true;
   return screen;
 }
 
@@ -1204,12 +2376,11 @@ async function TestDetailScreen(id) {
   const screen = el('<div class="tv"></div>');
   const tests = await Storage.getTests();
   const t = tests.find((x) => x.id === id);
-  const back = () => goBackOr('tests');
   if (!t) {
-    screen.appendChild(backHeader('Анализ', { label: 'Назад', onBack: back }));
+    screen.appendChild(backHeader('Анализ', { fallback: 'tests' }));
     screen.appendChild(el('<div class="empty">Анализ не найден — возможно, он был удалён.</div>'));
     const b = el('<button class="btn-ghost" type="button">К списку анализов</button>');
-    b.addEventListener('click', () => { location.replace('#/tests'); });
+    b.addEventListener('click', () => { goBackTo('tests'); });
     screen.appendChild(b);
     return screen;
   }
@@ -1217,7 +2388,7 @@ async function TestDetailScreen(id) {
   const sections = testSections(t);
   const count = sections.reduce((n, s) => n + s.rows.length, 0);
 
-  screen.appendChild(backHeader(`Анализ от ${fmtTestDate(t.date)}`, { label: 'Назад', onBack: back }));
+  screen.appendChild(backHeader(`Анализ от ${fmtTestDate(t.date)}`, { fallback: 'tests' }));
   const sub = [sameDay > 1 ? `Анализ № ${no} из ${sameDay} за этот день` : '', count ? indicatorsWord(count) : ''].filter(Boolean).join(' · ');
   if (sub) screen.appendChild(el(`<p class="tv-sub">${esc(sub)}</p>`));
   if (t.note) screen.appendChild(el(`<p class="tv-note">${esc(t.note)}</p>`));
@@ -1284,11 +2455,10 @@ async function TestDetailScreen(id) {
       await alertDialog('Не удалось удалить', `<p>${esc((err && err.message) || 'Попробуйте ещё раз.')}</p>`);
       return;
     }
-    goBackOr('tests');
+    goBack('tests');
     flash('Анализ удалён');
   });
   screen.appendChild(actions);
-  screen.restoreScroll = true;
   return screen;
 }
 
@@ -1296,7 +2466,7 @@ async function TestDetailScreen(id) {
 async function TestHistoryScreen(key) {
   const screen = el('<div></div>');
   const h = indicatorHistory(await Storage.getTests(), key);
-  screen.appendChild(backHeader(h.title, { label: 'Назад', onBack: () => goBackOr('tests') }));
+  screen.appendChild(backHeader(h.title, { fallback: 'tests' }));
   if (!h.entries.length) { screen.appendChild(el('<div class="empty">Нет записей этого показателя</div>')); return screen; }
   screen.appendChild(el(`<p class="tv-sub">${h.entries.length} ${plural(h.entries.length, 'значение', 'значения', 'значений')}${h.unit ? ` · ${esc(h.unit)}` : ''}</p>`));
 
@@ -1346,8 +2516,8 @@ async function TestHistoryScreen(key) {
 async function TestFormScreen(id) {
   const screen = el('<div></div>');
   const existing = id ? await Storage.getTest(id) : null;
-  const done = () => goBackOr(existing ? `test/${encodeURIComponent(existing.id)}` : 'tests');
-  screen.appendChild(backHeader(existing ? 'Изменить анализ' : 'Новый анализ', { label: 'Отмена', onBack: done }));
+  const done = () => goBack(existing ? `test/${encodeURIComponent(existing.id)}` : 'tests');
+  screen.appendChild(backHeader(existing ? 'Изменить анализ' : 'Новый анализ', { onBack: done }));
   if (id && !existing) {
     screen.appendChild(el('<div class="empty">Анализ не найден — возможно, он был удалён.</div>'));
     return screen;
@@ -1436,7 +2606,7 @@ async function TestFormScreen(id) {
     try {
       if (existing) {
         const upd = await Storage.updateTest(existing.id, { date, note: $('#f-note', form).value.trim(), ...values });
-        if (!upd) { await alertDialog('Анализ не найден', '<p>Запись была удалена. Ничего не изменено.</p>'); location.replace('#/tests'); return; }
+        if (!upd) { await alertDialog('Анализ не найден', '<p>Запись была удалена. Ничего не изменено.</p>'); replaceRoute('tests'); return; }
       } else {
         const entry = { date, note: $('#f-note', form).value.trim() };
         Object.entries(values).forEach(([k, v]) => { if (v !== undefined) entry[k] = v; });
@@ -1471,7 +2641,7 @@ async function ProfileScreen() {
   async function paint() {
     const p = await Storage.getProfile();
     screen.innerHTML = '';
-    screen.appendChild(backHeader('Профиль', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(backHeader('Профиль'));
     const avatar = p.photo ? `<img class="profile-avatar" src="${esc(p.photo)}" alt="">` : `<div class="profile-avatar profile-avatar--ph">👤</div>`;
     const card = el(`
       <div class="input-card" style="text-align:center">
@@ -1551,7 +2721,7 @@ async function saveBackupFile(content, fileName) {
 
 async function ExportScreen() {
   const screen = el('<div></div>');
-  screen.appendChild(backHeader('Резервная копия', { label: 'Назад', onBack: goBack }));
+  screen.appendChild(backHeader('Резервная копия'));
 
   const lastCard = el('<div class="input-card"><p class="backup-last"></p></div>');
   async function paintLast() {
@@ -1567,7 +2737,7 @@ async function ExportScreen() {
     <div class="input-card">
       <p class="backup-note">Резервная копия — один JSON-файл со всеми данными LexLife: показатели и их история, вода, лекарства, анализы, врачи и визиты, уведомления, цели, профиль и настройки.</p>
       <p class="backup-note">С помощью этого файла данные можно восстановить на этом или другом устройстве.</p>
-      <p class="backup-note"><b>PDF и фото анализов</b> входят только в «Полную резервную копию с документами» — один ZIP-файл с теми же данными и всеми документами. Восстанавливаются оба вида копий одной кнопкой «Восстановить из копии».</p>
+      <p class="backup-note"><b>PDF и фото анализов и медицинских записей</b> входят только в «Полную резервную копию с документами» — один ZIP-файл с теми же данными и всеми документами. Восстанавливаются оба вида копий одной кнопкой «Восстановить из копии».</p>
     </div>
   `));
   screen.appendChild(el(`
@@ -1625,7 +2795,7 @@ async function ExportScreen() {
     try {
       let b;
       try {
-        b = await createFullBackup(Storage, Attachments.store);
+        b = await createFullBackup(Storage, Attachments.store, { visitStore: VisitFiles.store });
       } catch (err) {
         await alertDialog('Не удалось создать копию', `<p>${esc(err instanceof AttachmentError ? err.message : 'Попробуйте ещё раз.')}</p>`);
         return;
@@ -1647,7 +2817,7 @@ async function ExportScreen() {
         res = await new Promise((resolve) => {
           showDialog({
             title: 'Полная копия готова',
-            body: `<p>${esc(b.fileName)}</p><p class="dialog__muted">${b.attachments} ${plural(b.attachments, 'документ', 'документа', 'документов')} · ${esc(formatBytes(b.bytes))}. Нажмите «Сохранить», затем «Сохранить в Файлы».</p>`,
+            body: `<p>${esc(b.fileName)}</p><p class="dialog__muted">${b.attachments + (b.visitAttachments || 0)} ${plural(b.attachments + (b.visitAttachments || 0), 'документ', 'документа', 'документов')} · ${esc(formatBytes(b.bytes))}. Нажмите «Сохранить», затем «Сохранить в Файлы».</p>`,
             actions: [
               { label: 'Отмена', value: 'cancelled' },
               { label: 'Сохранить', kind: 'primary', value: null, onClick: () => { saveBackupFile(b.blob, b.fileName).then(resolve); } },
@@ -1658,7 +2828,7 @@ async function ExportScreen() {
       if (res === 'shared' || res === 'downloaded') {
         await Storage.markBackupCreated(b.createdAt);
         await paintLast();
-        flash(`Полная копия создана ✓ (${b.attachments} док.)`);
+        flash(`Полная копия создана ✓ (${b.attachments + (b.visitAttachments || 0)} док.)`);
       }
     } finally {
       fullBtn.classList.remove('is-busy');
@@ -1718,8 +2888,9 @@ async function restoreFlow(file) {
     ['Визиты', summary.visits],
     ['Уведомления', summary.notifications],
     ['Дни активности', summary.activityDays],
+    ['Сон', `${summary.sleep || 0} ${plural(summary.sleep || 0, 'запись', 'записи', 'записей')}`],
   ];
-  if (full) rows.push(['Документы анализов (PDF/фото)', full.attachments.length]);
+  if (full) rows.push(['Документы анализов (PDF/фото)', full.attachments.length], ['Документы врачей и визитов', (full.visitAttachments || []).length]);
   const schemaLine = info.migrated ? `${info.schemaVersion} → будет обновлена до ${CURRENT_SCHEMA_VERSION}` : String(info.schemaVersion);
   const skipped = prepared.ignoredKeys.length + prepared.strippedKeys;
   const body = `
@@ -1745,7 +2916,7 @@ async function restoreFlow(file) {
   if (!go) { flash('Восстановление отменено'); return; }
 
   try {
-    if (full) await applyFullRestore(Storage, Attachments, full);
+    if (full) await applyFullRestore(Storage, Attachments, full, { visitService: VisitFiles });
     else await Storage.restoreBackup(prepared);
   } catch (err) {
     await showDialog({
@@ -1816,7 +2987,7 @@ async function backupBeforeImport(cancelled = 'Импорт отменён') {
 
 async function WaterImportScreen() {
   const screen = el('<div></div>');
-  screen.appendChild(backHeader('Импорт истории воды', { label: 'Назад', onBack: goBack }));
+  screen.appendChild(backHeader('Импорт истории воды', { fallback: 'settings' }));
 
   screen.appendChild(el(`
     <div class="input-card">
@@ -1992,6 +3163,158 @@ async function WaterImportScreen() {
 }
 
 /* =========================================================
+   Импорт медицинской истории (#/history-import) — services/historyImport.js.
+   Файл JSON читается локально. Сначала проверка без записи (dry-run): сколько записей,
+   что уже есть, что будет добавлено, что пропускается как дубль или требует уточнения.
+   Затем — резервная копия текущих данных и только добавление новых записей
+   в «Врачи и визиты» и «Лекарства». Повторный импорт того же файла добавляет 0.
+   ========================================================= */
+async function HistoryImportScreen() {
+  const screen = el('<div></div>');
+  screen.appendChild(backHeader('Импорт медицинской истории', { fallback: 'settings' }));
+  screen.appendChild(el(`
+    <div class="input-card">
+      <p class="backup-note">Перенос прошлых визитов, процедур, обследований и курсов лекарств из подготовленного файла (JSON). Файл читается только на этом устройстве.</p>
+      <p class="backup-note">Сначала LexLife показывает, что будет добавлено, а что уже есть. Существующие записи не изменяются и не удаляются; результаты анализов этот импорт не добавляет. Перед переносом создаётся резервная копия. Повторный импорт того же файла не создаёт дублей.</p>
+    </div>
+  `));
+  const pickCard = el('<div class="input-card"></div>');
+  const pickLabel = el('<label class="btn-ghost">Выбрать файл истории (JSON)<input type="file" accept=".json,application/json" hidden></label>');
+  const fileInput = $('input', pickLabel);
+  pickCard.appendChild(pickLabel);
+  const fileNameEl = el('<p class="backup-note" style="margin-top:8px"></p>');
+  pickCard.appendChild(fileNameEl);
+  screen.appendChild(pickCard);
+  const previewHost = el('<div></div>');
+  screen.appendChild(previewHost);
+
+  const STATUS = [
+    ['add', 'Будут добавлены', true],
+    ['duplicate', 'Уже есть в LexLife — пропуск', false],
+    ['conflict', 'Требуют уточнения — пропуск', true],
+    ['imported', 'Импортированы ранее', false],
+  ];
+  let parsed = null;
+
+  const itemLine = (p, isMed) => {
+    const it = p.item;
+    const when = isMed ? `${fmtDate(it.start)}${it.end ? ` – ${fmtDate(it.end)}` : ''}` : `${fmtDate(it.date)}${it.time ? ` · ${it.time}` : ''}`;
+    const title = isMed ? `💊 ${it.name}` : `${visitIcon(it)} ${it.title}`;
+    return `<li class="hist-item"><span class="hist-item__when">${esc(when)}</span><span class="hist-item__title">${esc(title)}</span>${p.reason ? `<small class="hist-item__why">${esc(p.reason)}</small>` : ''}</li>`;
+  };
+
+  async function computePlan() {
+    const [visits, meds, tests] = await Promise.all([Storage.getVisits(), Storage.getMeds({ includeDeleted: true }), Storage.getTests()]);
+    return buildHistoryImportPlan(parsed, { visits, meds, tests });
+  }
+
+  function renderPreview(plan, { justImported = false } = {}) {
+    previewHost.innerHTML = '';
+    const c = plan.counts;
+    const card = el(`
+      <div class="input-card">
+        <ul class="dialog__list">
+          <li><span>Записей в файле</span><span>${plan.eventsTotal + plan.medsTotal}</span></li>
+          <li><span>— событий истории</span><span>${plan.eventsTotal}</span></li>
+          <li><span>— курсов лекарств</span><span>${plan.medsTotal}</span></li>
+          <li><span>Будет добавлено</span><span>${c.add}${c.add ? ` (${plan.eventsAdd} соб. · ${plan.medsAdd} курс.)` : ''}</span></li>
+          <li><span>Уже есть в LexLife (дубли)</span><span>${c.duplicate}</span></li>
+          <li><span>Требуют уточнения</span><span>${c.conflict}</span></li>
+          <li><span>Импортированы ранее</span><span>${c.imported}</span></li>
+          <li><span>Ошибки проверки</span><span>0</span></li>
+        </ul>
+        ${justImported ? `<p class="backup-note" style="margin-top:8px">Повторная проверка после импорта: к добавлению — <b>${c.add}</b>.</p>` : ''}
+      </div>
+    `);
+    previewHost.appendChild(card);
+    STATUS.forEach(([st, label, open]) => {
+      const evs = plan.events.filter((p) => p.status === st);
+      const ms = plan.meds.filter((p) => p.status === st);
+      if (!evs.length && !ms.length) return;
+      const det = el(`<details class="med-history hist-group"${open && evs.length + ms.length <= 60 ? ' open' : ''}><summary class="med-history__head">${esc(label)} <small>${evs.length + ms.length}</small></summary><ul class="hist-list">${ms.map((p) => itemLine(p, true)).join('')}${evs.map((p) => itemLine(p, false)).join('')}</ul></details>`);
+      previewHost.appendChild(det);
+    });
+
+    const actions = el('<div class="backup-actions"></div>');
+    const btn = el('<button class="btn-primary" type="button"></button>');
+    btn.textContent = c.add ? `Создать копию и импортировать (${c.add})` : 'Нечего импортировать';
+    btn.disabled = !c.add;
+    btn.addEventListener('click', async () => {
+      const go = await showDialog({
+        title: 'Импорт медицинской истории',
+        body: `
+          <p>Будет добавлено: <b>${plan.eventsAdd}</b> ${plural(plan.eventsAdd, 'событие', 'события', 'событий')} в «Врачи и визиты» и <b>${plan.medsAdd}</b> ${plural(plan.medsAdd, 'курс', 'курса', 'курсов')} в «Лекарства».</p>
+          ${c.duplicate + c.imported ? `<p class="dialog__muted">${c.duplicate + c.imported} ${plural(c.duplicate + c.imported, 'запись уже есть', 'записи уже есть', 'записей уже есть')} — будут пропущены.</p>` : ''}
+          ${c.conflict ? `<p class="dialog__warn">${c.conflict} ${plural(c.conflict, 'запись требует', 'записи требуют', 'записей требуют')} уточнения и не импортируются.</p>` : ''}
+          <p class="dialog__muted">Перед импортом будет создана резервная копия текущих данных.</p>
+        `,
+        actions: [{ label: 'Отмена', value: false }, { label: 'Создать копию и импортировать', value: true, kind: 'primary' }],
+      });
+      if (!go) return;
+      btn.classList.add('is-busy');
+      try {
+        if (!(await backupBeforeImport())) return;
+        const fresh = await computePlan(); // данные могли измениться, пока открыт диалог
+        const res = await applyHistoryImportPlan(Storage, fresh);
+        const again = await computePlan();
+        await showDialog({
+          title: 'Импорт завершён',
+          body: `
+            <ul class="dialog__list">
+              <li><span>Добавлено событий</span><span>${res.visitsAdded}</span></li>
+              <li><span>Добавлено курсов лекарств</span><span>${res.medsAdded}</span></li>
+              <li><span>Пропущено как дубли</span><span>${fresh.counts.duplicate + fresh.counts.imported}</span></li>
+              <li><span>Требуют уточнения</span><span>${fresh.counts.conflict}</span></li>
+              <li><span>Повторная проверка: к добавлению</span><span>${again.counts.add}</span></li>
+              <li><span>Визиты: было → стало</span><span>${res.before.visits} → ${res.after.visits}</span></li>
+              <li><span>Лекарства: было → стало</span><span>${res.before.meds} → ${res.after.meds}</span></li>
+            </ul>
+            <p class="dialog__muted">Все прежние записи проверены: на месте и не изменены.</p>
+          `,
+          actions: [{ label: 'Готово', value: true, kind: 'primary' }],
+        });
+        flash('Импорт завершён ✓');
+        renderPreview(again, { justImported: true });
+      } catch (err) {
+        await showDialog({ title: 'Не удалось импортировать', body: `<p>${esc((err && err.message) || 'Попробуйте ещё раз.')}</p><p class="dialog__muted">Существующие данные не изменены.</p>`, actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+      } finally {
+        btn.classList.remove('is-busy');
+      }
+    });
+    actions.appendChild(btn);
+    previewHost.appendChild(actions);
+    const link = el('<section class="section"><div class="list-card"><div class="row" role="button" data-route="visits"><span class="row__icon">🩺</span><div class="row__body"><p class="row__title">Врачи и визиты</p><p class="row__sub">Импортированные события — в разделе «Прошедшие»</p></div><span class="row__chevron">›</span></div></div></section>');
+    link.addEventListener('click', onRouteClick);
+    previewHost.appendChild(link);
+  }
+
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files && fileInput.files[0];
+    fileInput.value = '';
+    if (!file) return;
+    fileNameEl.textContent = file.name;
+    pickLabel.classList.add('is-busy');
+    previewHost.innerHTML = '';
+    try {
+      try {
+        parsed = parseMedicalHistory(await file.text());
+      } catch (err) {
+        parsed = null;
+        const list = err instanceof HistoryImportError && err.errors.length
+          ? `<ul class="dialog__list">${err.errors.slice(0, 8).map((x) => `<li><span>${esc(x)}</span></li>`).join('')}</ul>${err.errors.length > 8 ? `<p class="dialog__muted">…и ещё ${err.errors.length - 8}</p>` : ''}`
+          : '';
+        await showDialog({ title: 'Файл не принят', body: `<p>${esc(err instanceof HistoryImportError ? err.message : 'Не удалось прочитать файл.')}</p>${list}<p class="dialog__muted">Данные LexLife не изменены.</p>`, actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+        return;
+      }
+      renderPreview(await computePlan());
+    } finally {
+      pickLabel.classList.remove('is-busy');
+    }
+  });
+  return screen;
+}
+
+/* =========================================================
    Журнал воды (#/water-log[/ГГГГ-ММ | /ГГГГ-ММ-ДД]): все записи за все даты по месяцам,
    сгруппированы по дням с итогом дня. Добавить запись (дата/время/объём), изменить
    (в т.ч. перенести на другую дату), удалить. Правки адресуют запись по дню + индексу +
@@ -2025,7 +3348,7 @@ async function WaterLogScreen(param) {
   const go = (m, d = null) => {
     month = m;
     focusDay = d;
-    history.replaceState(null, '', `#/water-log/${d || m}`);
+    replaceUrl(`water-log/${d || m}`);
     paint();
   };
 
@@ -2035,7 +3358,7 @@ async function WaterLogScreen(param) {
     const monthEntries = days.reduce((s, d) => s + (log[d].entries || []).length, 0);
     const monthTotal = days.reduce((s, d) => s + (log[d].total || 0), 0);
     screen.innerHTML = '';
-    screen.appendChild(backHeader('Журнал воды', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(backHeader('Журнал воды', { fallback: 'metric/water' }));
 
     const ctrl = el(`
       <div class="input-card">
@@ -2214,7 +3537,7 @@ async function ThemeScreen() {
   function paint() {
     const t = getTheme();
     screen.innerHTML = '';
-    screen.appendChild(backHeader('Тема оформления', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(backHeader('Тема оформления'));
     const list = el('<section class="section" style="margin-top:8px"><div class="list-card"></div></section>');
     const box = $('.list-card', list);
     [['dark', '🌙 Тёмная'], ['light', '☀️ Светлая']].forEach(([val, label]) => {
@@ -2230,13 +3553,14 @@ async function ThemeScreen() {
 
 async function SettingsScreen() {
   const screen = el('<div></div>');
-  screen.appendChild(backHeader('Настройки', { label: 'Назад', onBack: goBack }));
+  screen.appendChild(backHeader('Настройки'));
   const list = el('<section class="section" style="margin-top:8px"><div class="list-card"></div></section>');
   const box = $('.list-card', list);
   [
     { route: 'theme', icon: '🌙', title: 'Тема оформления' },
     { route: 'export', icon: '💾', title: 'Резервная копия' },
     { route: 'water-import', icon: '📥', title: 'Импорт истории воды' },
+    { route: 'history-import', icon: '🗂️', title: 'Импорт медицинской истории' },
     { route: 'security', icon: '🔒', title: 'Безопасность' },
   ].forEach((m) => {
     const row = el(`<div class="row" role="button" data-route="${m.route}"><span class="row__icon">${m.icon}</span><div class="row__body"><p class="row__title">${esc(m.title)}</p></div><span class="row__chevron">›</span></div>`);
@@ -2309,7 +3633,7 @@ async function ActivityScreen() {
     const cur = today || {};
     intensity = cur.bikeIntensity || intensity;
     screen.innerHTML = '';
-    screen.appendChild(backHeader('Активность', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(backHeader('Активность'));
     const stats = el(`
       <div class="stat-row">
         <div class="stat"><div class="stat__num">${streak} 🔥</div><div class="stat__label">дней подряд</div></div>
@@ -2358,26 +3682,39 @@ async function ActivityScreen() {
 async function VisitsScreen() {
   const visits = await Storage.getVisits();
   const screen = el('<div></div>');
-  screen.appendChild(backHeader('Врачи и визиты', { label: 'Назад', onBack: goBack }));
+  screen.appendChild(backHeader('Врачи и визиты'));
+
+  const search = el(`
+    <div class="search-box">
+      <span class="search-box__icon" aria-hidden="true">🔍</span>
+      <input class="search-box__input" type="text" inputmode="search" enterkeyhint="search" placeholder="Поиск" aria-label="Поиск по визитам и врачам">
+      <button class="search-box__clear" type="button" aria-label="Очистить поиск" hidden>✕</button>
+    </div>
+  `);
+  const searchInput = $('.search-box__input', search);
+  const clearBtn = $('.search-box__clear', search);
+  screen.appendChild(search);
 
   const add = el('<button class="btn-ghost" type="button" style="margin:8px 0 4px">+ Добавить визит</button>');
   add.addEventListener('click', () => { location.hash = '#/visit/new'; });
   screen.appendChild(add);
 
-  const planned = visits.filter((v) => v.status === 'planned').sort((a, b) => a.date.localeCompare(b.date));
-  const done = visits.filter((v) => v.status !== 'planned');
+  const list = el('<div></div>');
+  screen.appendChild(list);
 
   const group = (title, arr) => {
     if (!arr.length) return;
     const sec = el(`<section class="section" style="margin-top:14px"><div class="section__head"><h2 class="section__title">${esc(title)}</h2></div><div class="list-card"></div></section>`);
     const box = $('.list-card', sec);
     arr.forEach((v) => {
+      const rel = relativeVisitLabel(v.date);
       const row = el(`
         <div class="row" role="button" data-id="${esc(v.id)}" style="align-items:flex-start">
-          <span class="row__icon">🩺</span>
+          <span class="row__icon">${visitIcon(v)}</span>
           <div class="row__body">
-            <p class="row__title">${esc(v.doctor || 'Визит')}</p>
-            <p class="row__sub">${esc([v.specialty, v.clinic].filter(Boolean).join(' · ') || v.conclusion || '')}</p>
+            <p class="row__title">${esc(visitTitle(v))}</p>
+            <p class="row__sub">${esc(visitSub(v) || v.conclusion || '')}</p>
+            ${rel ? `<p class="row__meta">${esc(rel)}</p>` : ''}
           </div>
           <span class="row__trailing">${esc(fmtDate(v.date))}<br><span class="row__chevron">›</span></span>
         </div>
@@ -2385,30 +3722,52 @@ async function VisitsScreen() {
       box.appendChild(row);
     });
     sec.addEventListener('click', (e) => { const r = e.target.closest('[data-id]'); if (r) location.hash = `#/visit/${r.dataset.id}`; });
-    screen.appendChild(sec);
+    list.appendChild(sec);
   };
-  group('Запланированные', planned);
-  group('Прошедшие', done);
-  if (!visits.length) screen.appendChild(el('<div class="empty">Пока нет визитов</div>'));
+
+  function render(query) {
+    list.innerHTML = '';
+    const filtered = query ? visits.filter((v) => visitMatchesQuery(v, query)) : visits;
+    const planned = filtered.filter((v) => v.status === 'planned').sort((a, b) => a.date.localeCompare(b.date) || (visitTime(a) || '').localeCompare(visitTime(b) || ''));
+    /* прошедшие — новые сверху; в один день — позднее время выше */
+    const done = filtered.filter((v) => v.status !== 'planned').sort((a, b) => b.date.localeCompare(a.date) || (visitTime(b) || '').localeCompare(visitTime(a) || ''));
+    group('Запланированные', planned);
+    /* прошедшие — по годам: после импорта истории список длинный */
+    const years = [...new Set(done.map((v) => v.date.slice(0, 4)))];
+    years.forEach((y) => group(years.length > 1 ? `Прошедшие · ${y}` : 'Прошедшие', done.filter((v) => v.date.startsWith(y))));
+    if (!filtered.length) list.appendChild(el(`<div class="empty">${query ? 'Ничего не найдено' : 'Пока нет визитов'}</div>`));
+  }
+
+  searchInput.addEventListener('input', () => {
+    clearBtn.hidden = !searchInput.value;
+    render(searchInput.value);
+  });
+  clearBtn.addEventListener('click', () => {
+    searchInput.value = '';
+    clearBtn.hidden = true;
+    render('');
+    searchInput.focus();
+  });
+
+  render('');
   return screen;
 }
 
 async function VisitDetailScreen(id) {
-  const [visit, tests, meds] = await Promise.all([Storage.getVisit(id), Storage.getTests(), Storage.getMeds()]);
+  const [visit, tests, meds] = await Promise.all([Storage.getVisit(id), Storage.getTests(), Storage.getMeds({ includeDeleted: true })]);
   const screen = el('<div></div>');
-  if (!visit) { screen.appendChild(backHeader('Визит', { label: 'Визиты', onBack: () => { location.hash = '#/visits'; } })); screen.appendChild(el('<div class="empty">Визит не найден</div>')); return screen; }
-  screen.appendChild(backHeader('Визит', { label: 'Визиты', onBack: () => { location.hash = '#/visits'; } }));
+  if (!visit) { screen.appendChild(backHeader('Визит', { fallback: 'visits' })); screen.appendChild(el('<div class="empty">Визит не найден</div>')); return screen; }
+  screen.appendChild(backHeader('Визит', { fallback: 'visits' }));
 
-  const statusChip = visit.status === 'planned'
-    ? '<span class="vchip vchip--planned">запланирован</span>'
-    : '<span class="vchip vchip--done">выполнен</span>';
+  const chip = visitStatusChip(visit);
+  const statusChip = chip ? `<span class="vchip vchip--${chip.cls}">${esc(chip.text)}</span>` : '';
   screen.appendChild(el(`
     <div class="visit-head">
-      <span class="visit-head__icon">🩺</span>
+      <span class="visit-head__icon">${visitIcon(visit)}</span>
       <div>
-        <div class="visit-head__name">${esc(visit.doctor || 'Визит')}</div>
-        <div class="visit-head__sub">${esc([visit.specialty, visit.clinic].filter(Boolean).join(' · '))}</div>
-        <div style="margin-top:6px"><span class="visit-head__date">${esc(fmtDate(visit.date))}</span> ${statusChip}</div>
+        <div class="visit-head__name">${esc(visitTitle(visit))}</div>
+        <div class="visit-head__sub">${esc(visitSub(visit) || (visit.kind ? visitKindLabel(visit) : ''))}</div>
+        <div style="margin-top:6px"><span class="visit-head__date">${esc(fmtDate(visit.date))}${visitTime(visit) ? ` · ${esc(visitTime(visit))}` : ''}</span> ${statusChip}</div>
       </div>
     </div>
   `));
@@ -2440,31 +3799,152 @@ async function VisitDetailScreen(id) {
   chips('Связанные анализы', linkedTests, (t) => `🧪 ${esc(fmtDate(t.date))}`);
   chips('Связанные лекарства', linkedMeds, (m) => `💊 ${esc(m.name)}`);
 
-  const att = el('<section class="section"><div class="section__head"><h2 class="section__title" style="font-size:15px">Вложения</h2></div><div class="list-card" id="attbox"></div></section>');
-  const abox = $('#attbox', att);
-  if (!(visit.attachments || []).length) abox.appendChild(el('<div class="empty">Нет вложений</div>'));
-  else visit.attachments.forEach((a) => abox.appendChild(el(`<div class="row"><span class="row__icon">${a.kind === 'pdf' ? '📄' : '🖼️'}</span><div class="row__body"><p class="row__title">${esc(a.name)}</p><p class="row__sub">${a.size ? Math.round(a.size / 1024) + ' КБ' : ''} · файл подключим позже</p></div></div>`)));
-  screen.appendChild(att);
+  screen.appendChild(await visitDocsSection(visit));
 
   const actions = el('<div style="display:flex; gap:10px; margin-top:16px"></div>');
   const edit = el('<button class="btn-ghost" type="button" style="margin:0">Редактировать</button>');
   edit.addEventListener('click', () => { location.hash = `#/visit/${id}/edit`; });
   const del = el('<button class="btn-ghost" type="button" style="margin:0; color:var(--red)">Удалить</button>');
-  del.addEventListener('click', async () => { if (confirm('Удалить визит?')) { await Storage.removeVisit(id); location.hash = '#/visits'; } });
+  del.addEventListener('click', async () => {
+    const n = visitDocsOf(visit).length;
+    if (!confirm(n ? `Удалить запись вместе с документами (${n})?` : 'Удалить визит?')) return;
+    try { await VisitFiles.deleteVisit(id); } catch { await Storage.removeVisit(id); }
+    goBackTo('visits');
+  });
   actions.append(edit, del);
   screen.appendChild(actions);
   return screen;
 }
 
+/* «Документы» медицинской записи: PDF и фото (несколько), миниатюры, просмотр тем же
+   просмотрщиком, что у анализов; удаление одного документа запись не удаляет. */
+const fmtAddedAt = (iso) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString(RU, { day: 'numeric', month: 'short', year: 'numeric' }).replace(/\s*г\.$/, ''); };
+let visitThumbUrls = [];
+function revokeVisitThumbs() { visitThumbUrls.splice(0).forEach((u) => URL.revokeObjectURL(u)); }
+window.addEventListener('hashchange', revokeVisitThumbs);
+
+async function openVisitDocument(meta) {
+  let file = null;
+  try { file = await VisitFiles.getFile(meta); } catch (err) {
+    await alertDialog('Документ недоступен', `<p>${esc(err instanceof AttachmentError ? err.message : 'Не удалось прочитать документ.')}</p>`);
+    return null;
+  }
+  if (!file) { await alertDialog('Документ не найден', '<p>Файла нет на этом устройстве.</p><p class="dialog__muted">Так бывает после восстановления из обычной резервной копии (она не содержит PDF и фото) или на другом устройстве. Запись сохранена; прикрепите файл заново или восстановите полную резервную копию с документами.</p>'); return null; }
+  return openDocViewer(file, 'Документ записи');
+}
+
+async function visitDocsSection(visit) {
+  const sec = el(`
+    <section class="section vdocs">
+      <div class="section__head"><h2 class="section__title" style="font-size:15px">Документы</h2></div>
+      <div class="list-card vdocs__list"></div>
+      <label class="btn-ghost vdocs__add">Добавить файл<input type="file" multiple accept="${esc(ATTACHMENT_ACCEPT)}" hidden></label>
+      <p class="vdocs__hint">PDF или фото (JPG, PNG, HEIC) — из «Файлов» или медиатеки, можно несколько сразу, до 15 МБ каждый.</p>
+    </section>
+  `);
+  const box = $('.vdocs__list', sec);
+  const label = $('.vdocs__add', sec);
+  const input = $('input', label);
+
+  async function paint() {
+    revokeVisitThumbs();
+    const cur = (await Storage.getVisit(visit.id)) || visit;
+    const docs = visitDocsOf(cur);
+    const legacy = (cur.attachments || []).filter((a) => a && !a.attachmentId); // каркас старых версий: только имя
+    box.innerHTML = '';
+    if (!docs.length && !legacy.length) box.appendChild(el('<div class="empty">Нет документов</div>'));
+    docs.forEach((a) => {
+      const kind = docKind(a.type);
+      const row = el(`
+        <div class="row vdoc" role="button" tabindex="0">
+          <span class="vdoc__thumb vdoc__thumb--${kind}" aria-hidden="true">${kind === 'pdf' ? '<b>PDF</b>' : DOC_ICON.image}</span>
+          <div class="row__body">
+            <p class="row__title vdoc__name"></p>
+            <p class="row__sub"></p>
+          </div>
+          <button class="vdoc__more" type="button">${MED_MORE_SVG}</button>
+        </div>
+      `);
+      $('.vdoc__name', row).textContent = a.name || 'Документ';
+      $('.row__sub', row).textContent = [docLabel(a.type), formatBytes(a.size), a.addedAt ? `добавлен ${fmtAddedAt(a.addedAt)}` : ''].filter(Boolean).join(' · ');
+      $('.vdoc__more', row).setAttribute('aria-label', `Действия: ${a.name || 'документ'}`);
+      row.setAttribute('aria-label', `Открыть ${a.name || 'документ'}`);
+      row.addEventListener('click', (e) => { if (!e.target.closest('.vdoc__more')) openVisitDocument(a); });
+      row.addEventListener('keydown', (e) => { if (e.key === 'Enter') openVisitDocument(a); });
+      $('.vdoc__more', row).addEventListener('click', () => docActions(a));
+      box.appendChild(row);
+      if (kind === 'image') {
+        VisitFiles.getFile(a).then((f) => {
+          if (!f) return;
+          const url = URL.createObjectURL(f);
+          visitThumbUrls.push(url);
+          const img = new Image();
+          img.alt = '';
+          img.onload = () => { const t = $('.vdoc__thumb', row); t.textContent = ''; t.appendChild(img); };
+          img.onerror = () => {}; // HEIC без поддержки в браузере — остаётся значок
+          img.src = url;
+        }).catch(() => {});
+      }
+    });
+    legacy.forEach((a) => box.appendChild(el(`<div class="row"><span class="row__icon">📎</span><div class="row__body"><p class="row__title">${esc(a.name || 'Вложение')}</p><p class="row__sub">файла нет на устройстве</p></div></div>`)));
+  }
+
+  async function docActions(a) {
+    const act = await showDialog({
+      title: a.name || 'Документ', stack: true, cancelValue: null,
+      actions: [
+        { label: 'Открыть', value: 'open' },
+        { label: 'Удалить документ', value: 'delete', kind: 'destructive' },
+        { label: 'Отмена', value: null },
+      ],
+    });
+    if (act === 'open') { openVisitDocument(a); return; }
+    if (act !== 'delete') return;
+    const ok = await showDialog({
+      title: 'Удалить документ?',
+      body: `<p>${esc(a.name || 'Документ')}</p><p class="dialog__muted">Удаляется только этот файл. Сама запись и другие документы остаются.</p>`,
+      actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+    });
+    if (!ok) return;
+    try { await VisitFiles.removeFromVisit(visit.id, a.attachmentId); } catch { flash('Не удалось удалить'); return; }
+    flash('Документ удалён');
+    await paint();
+  }
+
+  input.addEventListener('change', async () => {
+    const files = [...(input.files || [])];
+    input.value = ''; // тот же файл можно выбрать снова
+    if (!files.length) return;
+    label.classList.add('is-busy');
+    try {
+      const res = await VisitFiles.attachToVisit(visit.id, files);
+      if (res.errors.length) {
+        await alertDialog(res.added.length ? 'Часть файлов не добавлена' : 'Файлы не добавлены', `<ul class="dialog__list">${res.errors.map((x) => `<li><span>${esc(x.name)}</span></li><li><span class="dialog__muted">${esc(x.message)}</span></li>`).join('')}</ul>`);
+      }
+      if (res.added.length) flash(res.added.length === 1 ? 'Документ добавлен ✓' : `Добавлено документов: ${res.added.length} ✓`);
+    } catch (err) {
+      await alertDialog('Не удалось добавить', `<p>${esc(err instanceof AttachmentError ? err.message : 'Попробуйте ещё раз.')}</p>`);
+    } finally {
+      label.classList.remove('is-busy');
+      await paint();
+    }
+  });
+  await paint();
+  return sec;
+}
+
 async function VisitFormScreen(id) {
-  const [existing, tests, meds] = await Promise.all([id ? Storage.getVisit(id) : null, Storage.getTests(), Storage.getMeds()]);
+  const [existing, tests, allMeds] = await Promise.all([id ? Storage.getVisit(id) : null, Storage.getTests(), Storage.getMeds({ includeDeleted: true })]);
+  /* удалённое лекарство остаётся в выборе, только если визит уже на него ссылается — связь не теряется при сохранении */
+  const meds = allMeds.filter((m) => !m.deletedAt || (existing?.links?.medIds || []).includes(m.id));
   const v = existing || { date: dateKey(), status: 'done', links: { testIds: [], medIds: [], reminderIds: [] }, attachments: [] };
   const screen = el('<div></div>');
-  screen.appendChild(backHeader(id ? 'Редактировать визит' : 'Новый визит', { label: 'Назад', onBack: goBack }));
+  screen.appendChild(backHeader(id ? 'Редактировать визит' : 'Новый визит', { fallback: id ? `visit/${id}` : 'visits' }));
   const form = el('<div class="input-card"></div>');
   const fld = (label, html) => `<div class="field"><label class="field__label">${esc(label)}</label>${html}</div>`;
   form.innerHTML = `
     ${fld('Дата', `<input class="input" type="date" id="f-date" value="${esc(v.date)}">`)}
+    ${fld('Название (необязательно)', `<input class="input" type="text" id="f-title" value="${esc(v.title || '')}" placeholder="напр. УЗИ сосудов шеи">`)}
     ${fld('Врач', `<input class="input" type="text" id="f-doctor" value="${esc(v.doctor || '')}" placeholder="напр. Dr. Ivanov">`)}
     ${fld('Специальность', `<input class="input" type="text" id="f-spec" value="${esc(v.specialty || '')}" placeholder="напр. Кардиолог">`)}
     ${fld('Клиника', `<input class="input" type="text" id="f-clinic" value="${esc(v.clinic || '')}">`)}
@@ -2495,6 +3975,7 @@ async function VisitFormScreen(id) {
   save.addEventListener('click', async () => {
     const data = {
       date: $('#f-date', form).value || dateKey(),
+      title: $('#f-title', form).value.trim(),
       doctor: $('#f-doctor', form).value.trim(),
       specialty: $('#f-spec', form).value.trim(),
       clinic: $('#f-clinic', form).value.trim(),
@@ -2505,8 +3986,9 @@ async function VisitFormScreen(id) {
       status: $('#f-status', form).value,
       links: { testIds: getTestIds(), medIds: getMedIds(), reminderIds: v.links?.reminderIds || [] },
     };
-    if (id) { await Storage.updateVisit(id, data); location.hash = `#/visit/${id}`; }
-    else { const created = await Storage.addVisit(data); location.hash = `#/visit/${created.id}`; }
+    /* правка — на карточку визита (она перечитает данные); новый визит — карточка вместо формы; без дублей в истории */
+    if (id) { await Storage.updateVisit(id, data); goBackTo(`visit/${id}`); }
+    else { const created = await Storage.addVisit(data); replaceRoute(`visit/${created.id}`); }
     flash('Сохранено ✓');
   });
   screen.appendChild(save);
@@ -2647,7 +4129,7 @@ async function NotificationsScreen() {
   async function paint() {
     const list = await Storage.getNotifications();
     screen.innerHTML = '';
-    screen.appendChild(backHeader('Уведомления', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(backHeader('Уведомления'));
 
     screen.appendChild(await statusPanel());
 
@@ -2816,21 +4298,21 @@ async function NotificationsScreen() {
 const CAL_WD = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 
 async function loadCalendarData() {
-  const [visits, tests, meds, notifs, waterGoal] = await Promise.all([
-    Storage.getVisits(), Storage.getTests(), Storage.getMeds(), Storage.getNotifications(), Storage.getWaterGoal(),
+  const [visits, tests, meds, notifs, waterGoal, sleep] = await Promise.all([
+    Storage.getVisits(), Storage.getTests(), Storage.getMeds(), Storage.getNotifications(), Storage.getWaterGoal(), Storage.getSleepEntries(),
   ]);
   const nextDoses = meds
     .filter((m) => m.active && m.every_days)
     .map((m) => ({ med: m, date: nextDose(m) }))
     .filter((x) => x.date);
-  return { visits, tests, meds, notifs, waterGoal, nextDoses };
+  return { visits, tests, meds, notifs, waterGoal, nextDoses, sleep };
 }
 
 /* разовые события конкретной даты — они же дают точку на сетке месяца/недели */
 function dayPointEvents(dateStr, data) {
   const ev = [];
   data.visits.forEach((v) => {
-    if (v.date === dateStr) ev.push({ icon: '🩺', title: v.doctor || 'Визит', sub: [v.specialty, v.clinic].filter(Boolean).join(' · ') || 'Визит к врачу', time: null, route: `visit/${v.id}` });
+    if (v.date === dateStr) ev.push({ icon: visitIcon(v), title: visitTitle(v), sub: visitSub(v) || visitKindLabel(v), time: visitTime(v), route: `visit/${v.id}` });
     if (v.nextDate === dateStr) ev.push({ icon: '📅', title: 'Следующий визит', sub: v.doctor || '', time: null, route: `visit/${v.id}` });
   });
   data.tests.forEach((t) => { if (t.date === dateStr) ev.push({ icon: '🧪', title: 'Анализ крови', sub: t.note || 'Результаты внесены', time: null, route: `test/${encodeURIComponent(t.id)}` }); });
@@ -2841,10 +4323,14 @@ function dayPointEvents(dateStr, data) {
 function dayHasDot(dateStr, data) {
   return dayPointEvents(dateStr, data).length > 0;
 }
-/* полная повестка дня: разовые события + ежедневные (лекарства, цель воды) — для панели дня */
+/* полная повестка дня: разовые события + ежедневные (сон, лекарства, цель воды) — для панели дня.
+   Сон — запись за день пробуждения (строится из sleep_log, отдельно не хранится); точку на сетке
+   не ставит, как и другие ежедневные записи, иначе точки визитов и анализов потеряются. */
 function dayAgendaEvents(dateStr, data) {
   const ev = dayPointEvents(dateStr, data).slice();
-  data.meds.forEach((m) => { if (m.active && m.reminder_time) ev.push({ icon: '💊', title: m.name, sub: 'Приём лекарства', time: m.reminder_time, route: 'meds' }); });
+  const sl = getSleepForDate(data.sleep || [], dateStr);
+  if (sl) ev.push({ icon: '😴', title: `Сон · ${formatSleepDuration(sl.durationMinutes)}`, sub: `${stampTime(sl.sleepStart)} → ${stampTime(sl.sleepEnd)}${sl.quality ? ` · ${qualityInfo(sl.quality).label}` : ''}`, time: null, route: `sleep/${encodeURIComponent(sl.id)}` });
+  data.meds.forEach((m) => medOccurrences(m, dateStr).forEach(({ time }) => { if (time) ev.push({ icon: '💊', title: m.name, sub: 'Приём лекарства', time, route: 'meds' }); }));
   ev.push({ icon: '💧', title: `Цель воды: ${fmtNum(data.waterGoal / 1000)} л`, sub: 'Ежедневная цель', time: null, route: 'metric/water' });
   ev.sort((a, b) => (a.time || '99:99').localeCompare(b.time || '99:99'));
   return ev;
@@ -2865,10 +4351,18 @@ async function CalendarScreen() {
   let mode = 'month';
   let cursor = new Date(); cursor.setHours(0, 0, 0, 0);
   let selected = dateKey(cursor);
+  /* вид, период и выбранный день — из записи истории («Назад» с карточки визита) */
+  const ui = readEntryUi('calendar');
+  if (ui && ['month', 'week', 'list'].includes(ui.mode) && /^\d{4}-\d{2}-\d{2}$/.test(ui.cursor) && /^\d{4}-\d{2}-\d{2}$/.test(ui.selected)) {
+    mode = ui.mode;
+    cursor = new Date(`${ui.cursor}T00:00:00`);
+    selected = ui.selected;
+  }
 
   async function paint() {
+    saveEntryUi('calendar', { mode, cursor: dateKey(cursor), selected });
     screen.innerHTML = '';
-    screen.appendChild(backHeader('Календарь', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(backHeader('Календарь'));
 
     const seg = el(`
       <div class="seg" style="margin-top:8px">
@@ -3035,11 +4529,11 @@ function lastLabel(point, today) {
 const pressureTxt = (s, d) => (s && d ? `${fmtN(s, 0)}/${fmtN(d, 0)}` : '—');
 
 async function StatsScreen() {
-  const [metricsLog, metricsConfig, activityDays, activityGoals, tests, medLog, meds] = await Promise.all([
+  const [metricsLog, metricsConfig, activityDays, activityGoals, tests, medLog, meds, medIntakes] = await Promise.all([
     Storage.getMetricsLog(), Storage.getMetricsConfig(), Storage.getAllActivity(), Storage.getGoals(),
-    Storage.getTests(), Storage.getAllMedLog(), Storage.getMeds(),
+    Storage.getTests(), Storage.getAllMedLog(), Storage.getMeds(), Storage.getAllMedIntakes(),
   ]);
-  const engine = createStatsEngine({ metricsLog, metricsConfig, activityDays, activityGoals, tests, medLog, meds, testFields: TEST_FIELDS }, dateKey());
+  const engine = createStatsEngine({ metricsLog, metricsConfig, activityDays, activityGoals, tests, medLog, medIntakes, meds, testFields: TEST_FIELDS }, dateKey());
   const screen = el('<div class="stats"></div>');
   let period = loadStatsPeriod();
   let actMode = null;
@@ -3055,7 +4549,7 @@ async function StatsScreen() {
   function paint() {
     const m = engine.forPeriod(period);
     screen.innerHTML = '';
-    screen.appendChild(backHeader('Статистика', { label: 'Назад', onBack: goBack }));
+    screen.appendChild(backHeader('Статистика'));
     screen.appendChild(el(`
       <div class="st-period" role="tablist" aria-label="Период">
         ${PERIODS.map((p) => `<button class="st-period__btn ${p.key === period ? 'is-active' : ''}" type="button" role="tab" aria-selected="${p.key === period}" data-period="${p.key}" title="${esc(p.title)}">${esc(p.label)}</button>`).join('')}
@@ -3498,7 +4992,7 @@ async function StatsScreen() {
 /* заглушка */
 function Stub(emoji, title) {
   const screen = el('<div></div>');
-  screen.appendChild(backHeader(title, { label: 'Назад', onBack: goBack }));
+  screen.appendChild(backHeader(title));
   screen.appendChild(el(`<div class="placeholder"><div class="placeholder__emoji">${emoji}</div><h2>${esc(title)}</h2><p>Раздел в разработке — скоро.</p></div>`));
   return screen;
 }
@@ -3508,23 +5002,25 @@ function onRouteClick(e) {
   const nav = e.target.closest('[data-route]');
   if (nav) location.hash = `#/${nav.getAttribute('data-route')}`;
 }
-function backHeader(title, { label = 'Назад', onBack } = {}) {
-  const h = el(`<header class="header"><button class="back-btn" type="button">‹ ${esc(label)}</button><h1 class="header__title">${esc(title)}</h1></header>`);
-  $('.back-btn', h).addEventListener('click', onBack || goBack);
+/* Шапка внутреннего экрана: круглая кнопка «Назад» (js/ui/backNav.js) + заголовок.
+   fallback — куда вернуться, если экран открыт напрямую (нет истории LexLife) */
+function backHeader(title, { fallback = 'home', onBack } = {}) {
+  const h = el(`<header class="header header--nav"><h1 class="header__title">${esc(title)}</h1></header>`);
+  h.prepend(BackButton({ fallback, onBack }));
   return h;
 }
-function goBack() { if (history.length > 1) history.back(); else location.hash = '#/home'; }
 
 /* Модальный диалог: body — готовый HTML (данные экранируются вызывающим через esc).
    actions: [{ label, value, kind: 'primary'|'danger', onClick }] — onClick вызывается
    синхронно в обработчике касания (нужно для Share Sheet на iOS). → Promise<value> */
-function showDialog({ title, body = '', actions }) {
+function showDialog({ title, body = '', actions, stack = false, cancelValue }) {
   return new Promise((resolve) => {
-    const wrap = el('<div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-title"><div class="dialog__card"><h2 class="dialog__title" id="dlg-title"></h2><div class="dialog__body"></div><div class="dialog__actions"></div></div></div>');
+    const wrap = el(`<div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-title"><div class="dialog__card"><h2 class="dialog__title" id="dlg-title"></h2><div class="dialog__body"></div><div class="dialog__actions${stack ? ' dialog__actions--stack' : ''}"></div></div></div>`);
     $('.dialog__title', wrap).textContent = title;
     $('.dialog__body', wrap).innerHTML = body;
     const close = (v) => { document.removeEventListener('keydown', onKey); wrap.remove(); resolve(v); };
-    const onKey = (e) => { if (e.key === 'Escape') close(actions[0].value); };
+    /* stack — действия столбцом (меню); cancelValue — что вернуть по Escape, если не первое действие */
+    const onKey = (e) => { if (e.key === 'Escape') close(cancelValue !== undefined ? cancelValue : actions[0].value); };
     actions.forEach((a) => {
       const b = el(`<button type="button" class="dialog__btn${a.kind ? ` dialog__btn--${a.kind}` : ''}"></button>`);
       b.textContent = a.label;
@@ -3563,7 +5059,7 @@ function flash(text) {
 async function MoveScreen() {
   const screen = el('<div></div>');
   const mode = migrationMode();
-  screen.appendChild(backHeader(mode === 'export' ? 'Перенос LexLife' : mode === 'import' ? 'Перенос из старой версии' : 'Перенос', { label: 'Назад', onBack: goBack }));
+  screen.appendChild(backHeader(mode === 'export' ? 'Перенос LexLife' : mode === 'import' ? 'Перенос из старой версии' : 'Перенос'));
   if (!mode) { screen.appendChild(el('<div class="empty">Перенос сейчас не требуется</div>')); return screen; }
   const url = esc(NEW_HOME_URL);
   const steps = mode === 'export' ? [
@@ -3604,6 +5100,7 @@ const DRAWER_SECTIONS = [
   ],
   [
     { route: 'activity', icon: '🏃', title: 'Активность' },
+    { route: 'sleep', icon: '😴', title: 'Сон' },
     { route: 'metric/water', icon: '💧', title: 'Вода' },
     { route: 'visits', icon: '🩺', title: 'Врачи и визиты' },
   ],
@@ -3627,6 +5124,7 @@ async function buildDrawer() {
     </button>
   `);
   drawer.appendChild(head);
+  paintAvatarBtn(p);
   const scroller = el('<div class="drawer-scroll"></div>');
   drawer.appendChild(scroller);
   const mode = migrationMode();
@@ -3653,6 +5151,16 @@ async function buildDrawer() {
     const it = e.target.closest('[data-route]');
     if (it) { closeDrawer(); location.hash = `#/${it.getAttribute('data-route')}`; }
   });
+}
+/* Аватар в шапке — кнопка Drawer: фото профиля, без фото — инициалы или силуэт.
+   Обновляется вместе с шапкой Drawer (buildDrawer вызывается и после сохранения профиля). */
+const AVATAR_PH_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="9" r="4"/><path d="M4.5 20.5c1.2-3.6 4.1-5.5 7.5-5.5s6.3 1.9 7.5 5.5"/></svg>';
+function paintAvatarBtn(p) {
+  const box = $('#avatar-btn-img');
+  const initials = String(p.name || '').trim().split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join('');
+  box.classList.toggle('avatar-btn__img--ph', !p.photo);
+  box.innerHTML = p.photo ? `<img src="${esc(p.photo)}" alt="" decoding="async">`
+    : initials ? `<span class="avatar-btn__initials">${esc(initials)}</span>` : AVATAR_PH_SVG;
 }
 function openDrawer() { lockPageScroll(); $('#drawer').classList.add('open'); $('#scrim').classList.add('open'); }
 function closeDrawer() { $('#drawer').classList.remove('open'); $('#scrim').classList.remove('open'); unlockPageScroll(); }
@@ -3700,7 +5208,7 @@ const TAB_ROUTES = ['home', 'metrics', 'meds', 'tests'];
 const SCREENS = {
   home: HomeScreen, metrics: MetricsScreen, meds: MedsScreen, tests: TestsScreen,
   profile: ProfileScreen, activity: ActivityScreen, visits: VisitsScreen,
-  settings: SettingsScreen, export: ExportScreen, 'water-import': WaterImportScreen, theme: ThemeScreen,
+  settings: SettingsScreen, export: ExportScreen, 'water-import': WaterImportScreen, 'history-import': HistoryImportScreen, theme: ThemeScreen,
   notifications: NotificationsScreen, goals: () => Stub('🎯', 'Цели'),
   calendar: CalendarScreen, stats: StatsScreen,
   security: () => Stub('🔒', 'Безопасность'),
@@ -3715,6 +5223,12 @@ function resolve() {
     if (rest.endsWith('/edit')) return { fn: () => VisitFormScreen(rest.slice(0, -5)), tab: null, main: false };
     return { fn: () => VisitDetailScreen(rest), tab: null, main: false };
   }
+  if (h === 'sleep') return { fn: SleepScreen, tab: null, main: false };
+  if (h === 'sleep/settings') return { fn: SleepSettingsScreen, tab: null, main: false };
+  if (h === 'sleep/new' || h.startsWith('sleep/new/')) return { fn: () => SleepFormScreen(null, h.slice(10) || null), tab: null, main: false };
+  if (h.startsWith('sleep/')) return { fn: () => SleepFormScreen(safeDecode(h.slice(6))), tab: null, main: false };
+  if (h === 'med/new') return { fn: () => MedFormScreen(null), tab: 'meds', main: false };
+  if (h.startsWith('med/') && h.endsWith('/edit')) return { fn: () => MedFormScreen(safeDecode(h.slice(4, -5))), tab: 'meds', main: false };
   if (h === 'test/new') return { fn: () => TestFormScreen(null), tab: 'tests', main: false };
   if (h.startsWith('test/')) {
     const rest = h.slice(5);
@@ -3735,23 +5249,19 @@ function resolve() {
 const safeDecode = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
 
 /* Место прокрутки хранится в записи истории браузера (history.state.y): «Назад» возвращает
-   экран туда, где он был, новый переход открывает экран сверху. Применяется к экранам
-   с node.restoreScroll = true (журнал анализов, полный анализ). */
+   экран туда, где он был, новый переход открывает экран сверху. Для всех экранов
+   (вкладки/период/дата экрана — там же, history.state.ui, см. js/ui/backNav.js). */
 let scrollSaveTimer = 0;
 function saveScrollState() {
   clearTimeout(scrollSaveTimer);
   const y = lockedScrollY ?? window.scrollY;
   try { history.replaceState({ ...(history.state || {}), y }, ''); } catch { /* Safari: лимит частоты replaceState */ }
 }
-/* Вернуться на предыдущий экран; открыт напрямую (истории нет) — на route */
-function goBackOr(route) {
-  if (history.length > 1) history.back();
-  else location.replace(`#/${route}`);
-}
 
 let renderToken = 0;
 let currentRoute = null;
 async function render() {
+  stopHomeMarkerTimer(); // уходим с текущего экрана (в т.ч. повторно на Главную) — старый таймер не должен жить дальше
   clearTimeout(scrollSaveTimer); // отложенное сохранение не должно попасть в запись нового экрана
   const { fn, tab, main } = resolve();
   const route = location.hash.replace(/^#\/?/, '');
@@ -3760,21 +5270,21 @@ async function render() {
   const token = ++renderToken;
   closeDrawer();
   setActiveTab($('#tab-bar'), tab);
-  $('#menu-btn').classList.toggle('hidden', !main);
+  $('#avatar-btn').classList.toggle('hidden', !main);
   const node = await fn();
   if (token !== renderToken) return;
   const mount = $('#screen');
   mount.innerHTML = '';
   mount.appendChild(node);
   mount.scrollTop = 0;
-  if (routeChanged && node.restoreScroll) {
+  if (routeChanged) {
     const y = history.state && typeof history.state.y === 'number' ? history.state.y : 0;
     window.scrollTo(0, y);
   }
 }
 
 function initChrome() {
-  $('#menu-btn').addEventListener('click', openDrawer);
+  $('#avatar-btn').addEventListener('click', openDrawer);
   $('#scrim').addEventListener('click', closeDrawer);
   /* затемнение не пропускает жест прокрутки на страницу (тап по-прежнему закрывает) */
   $('#scrim').addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
@@ -3795,7 +5305,9 @@ applyTheme(getTheme());
 async function boot() {
   await Storage.init();
   initChrome();
+  initBottomNav($('#tab-bar'));
   await buildDrawer();
+  initNavHistory(); // до роутера: глубина записи истории должна быть известна к render()
   window.addEventListener('hashchange', render);
   window.addEventListener('scroll', () => { clearTimeout(scrollSaveTimer); scrollSaveTimer = setTimeout(saveScrollState, 250); }, { passive: true });
   document.addEventListener('click', saveScrollState, true); // до перехода по ссылке/кнопке
@@ -3810,5 +5322,6 @@ async function boot() {
   if (occurrences) occurrences.prune().catch(() => {});
   /* «висячие» документы (анализ удалён/заменён при восстановлении) — фоном, безопасно */
   if (IdbAttachmentStore.available()) Attachments.cleanupOrphans().catch((err) => console.warn('[attachments] очистка пропущена', err && err.name));
+  if (IdbAttachmentStore.available()) VisitFiles.cleanupOrphans().catch((err) => console.warn('[visit files] очистка пропущена', err && err.name));
 }
 boot();
