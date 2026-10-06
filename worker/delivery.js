@@ -5,6 +5,7 @@
    ========================================================= */
 
 import { sendWebPush, topicFor } from './webpush.js';
+import { endpointHost } from './log.js';
 
 export const MAX_TRANSIENT_FAILURES = 10; // подряд: 429/5xx/сеть
 export const MAX_PERMANENT_FAILURES = 3;  // подряд: прочие 4xx (403 VAPID, 400 …)
@@ -34,7 +35,8 @@ export async function dropSubscription(db, sub, now) {
 }
 
 /* Отправить payload активной подписке устройства.
-   → { kind: 'ok'|'gone'|'retry'|'error'|'no_subscription', status } */
+   → { kind: 'ok'|'gone'|'retry'|'error'|'no_subscription', status, host }
+   host — только хост push-сервиса (для логов), не endpoint. */
 export async function pushToDevice(env, deviceId, payload, { now = Date.now(), fetchImpl = fetch, ttl } = {}) {
   const vapid = vapidFromEnv(env);
   const db = env.DB;
@@ -52,5 +54,5 @@ export async function pushToDevice(env, deviceId, payload, { now = Date.now(), f
     if (count >= limit) await dropSubscription(db, sub, now);
     else await db.prepare('UPDATE push_subscriptions SET failure_count = ?, last_failure_at = ?, updated_at = ? WHERE id = ?').bind(count, now, now, sub.id).run();
   }
-  return { kind: r.kind, status: r.status };
+  return { kind: r.kind, status: r.status, host: endpointHost(sub.endpoint) };
 }

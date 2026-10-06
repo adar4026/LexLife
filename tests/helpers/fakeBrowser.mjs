@@ -51,12 +51,17 @@ export async function createFakePushManager({ endpointHost = 'https://web.push.a
 /* sw.js в изолированном контексте: push / notificationclick / install / activate / message.
    clients — окна (matchAll), в них можно положить свои объекты с postMessage/navigate;
    timeScale < 1 ускоряет таймеры SW (ожидание ответа вкладки) в тестах. */
-export function loadServiceWorker({ caches = createFakeCaches(), scope = 'https://lexlife.test/', timeScale = 1 } = {}) {
+export function loadServiceWorker({ caches = createFakeCaches(), scope = 'https://lexlife.test/', timeScale = 1, fetchImpl = () => {} } = {}) {
   const listeners = {}; const shown = []; const opened = []; const clients = [];
   const calls = { claim: 0, skipWaiting: 0, matchAll: [] };
   const self = {
     addEventListener: (t, fn) => { listeners[t] = fn; },
-    registration: { scope, showNotification: async (title, opts) => { shown.push({ title, opts }); } },
+    /* видимые уведомления: close() убирает из списка (как Notification.close()) */
+    registration: {
+      scope,
+      showNotification: async (title, opts) => { const n = { title, opts, data: opts && opts.data, closed: false }; n.close = () => { n.closed = true; }; shown.push(n); },
+      getNotifications: async () => shown.filter((n) => !n.closed),
+    },
     clients: {
       matchAll: async (opts) => { calls.matchAll.push(opts); return clients; },
       openWindow: async (u) => { opened.push(u); },
@@ -67,7 +72,7 @@ export function loadServiceWorker({ caches = createFakeCaches(), scope = 'https:
   class Request { constructor(url, opts = {}) { this.url = String(url); this.cache = opts.cache; } }
   const timers = { setTimeout: (fn, ms) => setTimeout(fn, Math.round((ms || 0) * timeScale)), clearTimeout };
   vm.runInNewContext(readFileSync(new URL('../../sw.js', import.meta.url), 'utf8'), {
-    self, caches, fetch: () => {}, URL, Request, Response, Date, JSON, String, encodeURIComponent, MessageChannel, Promise, ...timers,
+    self, caches, fetch: fetchImpl, URL, Request, Response, Date, JSON, String, encodeURIComponent, MessageChannel, Promise, ...timers,
   });
   const fire = async (type, ev) => { const waits = []; listeners[type]({ ...ev, waitUntil: (p) => waits.push(p) }); await Promise.all(waits); };
   const pushJson = (obj) => fire('push', { data: { json: () => obj, text: () => JSON.stringify(obj) } });

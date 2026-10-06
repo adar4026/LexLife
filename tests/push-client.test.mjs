@@ -28,6 +28,11 @@ import { describeNotifyState } from '../js/services/notifier.js';
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
+/* структурированные логи Worker'а (worker/log.js) — не засоряют вывод тестов */
+for (const k of ['log', 'warn']) {
+  const orig = console[k].bind(console);
+  console[k] = (...x) => { if (!(typeof x[0] === 'string' && x[0].startsWith('{"evt"'))) orig(...x); };
+}
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
 const L = (y, mo, d, h = 0, mi = 0) => new Date(y, mo - 1, d, h, mi);
 const VAPID = await generateVapidKeys();
@@ -326,6 +331,68 @@ test('push не пришёл: при активном push локальный п
   const sw = loadServiceWorker({ caches });
   await sw.pushJson({ occurrenceId: shown[0], type: 'water', title: 'LexLife', body: 'Пора выпить воду', target: '#/metric/water' });
   assert.equal(sw.shown[0].opts.tag, shown[0]);
+});
+
+test('открытие приложения после пропуска: push ушёл (sent) → локально НЕ показывается; не ушёл (failed) → один запасной показ', async () => {
+  const server = createServer(); const dev = await createDevice(server);
+  await dev.client.enable();
+  const water = await onlyRule(dev, 'water', { repeat: 'interval', intervalMinutes: 60, startTime: '09:00', endTime: '20:00' }, L(2031, 3, 10, 8, 0));
+  await dev.client.sync();
+  /* 09:00: сервер отправил, iPhone «держит» push (SW не запускался — журнал occurrence пуст) */
+  assert.equal((await server.cron(L(2031, 3, 10, 9, 0).getTime())).sent, 1);
+  const caches = createFakeCaches();
+  const occ = createOccurrenceStore({ cachesApi: caches, base: 'https://lexlife.test/' });
+  let t = L(2031, 3, 10, 9, 6);
+  server.clock = t.getTime();
+  const shown = [];
+  const notifier = createNotifier({
+    storage: dev.storage, show: async (r, at, id) => shown.push(id), permission: () => 'granted', now: () => t, occurrences: occ,
+    deferMs: async () => ((await dev.client.isServerPrimary()) ? SERVER_FALLBACK_MS : 0),
+    serverCheck: (id) => dev.client.occurrenceStatus(id),
+  });
+  await notifier.check(); await notifier.check();
+  assert.deepEqual(shown, [], 'push уже у iPhone: второго «💧 Вода» нет');
+  assert.equal(new Date((await ruleOf(dev, 'water')).lastFiredAt).getTime(), L(2031, 3, 10, 9, 0).getTime());
+  assert.ok(await occ.has(`${water.id}@2031-03-10T09:00`), 'отмечено как доставленное сервером');
+  /* 10:00: push-сервис отказал (403) → сервер записал failed → запасной локальный показ, один */
+  server.push.set(() => 403);
+  await server.cron(L(2031, 3, 10, 10, 0).getTime());
+  t = L(2031, 3, 10, 10, 4); server.clock = t.getTime();
+  await notifier.check(); await notifier.check();
+  assert.deepEqual(shown, [`${water.id}@2031-03-10T10:00`]);
+  /* 11:00: сервер ещё повторяет (retry) → ждём; нет сети → iPhone push не получил → запасной показ */
+  server.push.set(() => 503);
+  await server.cron(L(2031, 3, 10, 11, 0).getTime());
+  t = L(2031, 3, 10, 11, 2, 30); server.clock = t.getTime();
+  await notifier.check();
+  assert.equal(shown.length, 1, 'retry на сервере — локально не показываем');
+  dev.net.online = false;
+  t = L(2031, 3, 10, 11, 3); server.clock = t.getTime();
+  await notifier.check();
+  assert.deepEqual(shown.slice(1), [`${water.id}@2031-03-10T11:00`]);
+  /* через 10 мин после срабатывания — уже ничего (старое не догоняется) */
+  dev.net.online = true;
+  t = L(2031, 3, 10, 12, 11); server.clock = t.getTime();
+  await notifier.check();
+  assert.equal(shown.length, 2);
+});
+
+test('checkSubscription при запуске: сервер снял подписку (410 / удалённая установка) → подписка отправляется снова, правила возвращаются', async () => {
+  const server = createServer(); const dev = await createDevice(server);
+  await dev.client.enable();
+  await onlyRule(dev, 'meds', { time: '09:00' }, L(2031, 3, 10, 8, 0));
+  await dev.client.sync();
+  assert.equal((await dev.client.checkSubscription()).state, 'ok');
+  assert.ok(server.db.q('SELECT last_seen_at FROM devices')[0].last_seen_at, 'запуск отмечен на сервере');
+  server.db.raw.prepare('DELETE FROM push_subscriptions').run();
+  server.db.raw.prepare('UPDATE notification_rules SET next_fire_at = NULL').run();
+  server.clock = L(2031, 3, 10, 12, 0).getTime();
+  assert.equal((await dev.client.checkSubscription()).state, 'healed');
+  assert.deepEqual(server.db.q('SELECT endpoint FROM push_subscriptions').map((r) => r.endpoint), [dev.current().endpoint]);
+  assert.equal(server.db.q("SELECT next_fire_at FROM notification_rules WHERE enabled = 1")[0].next_fire_at, L(2031, 3, 11, 9, 0).getTime());
+  /* без сети — просто ok, без лишних действий */
+  dev.net.online = false;
+  assert.equal((await dev.client.checkSubscription()).state, 'ok');
 });
 
 test('push выключен: локальный планировщик показывает сразу (как раньше)', async () => {

@@ -9,6 +9,7 @@
 import { handleApi } from './api.js';
 import { runCron } from './cron.js';
 import { withSecurityHeaders } from './headers.js';
+import { logCron } from './log.js';
 
 async function serveAsset(request, env) {
   if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -37,9 +38,13 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
+    const startedAt = Date.now();
     ctx.waitUntil(runCron(env, event.scheduledTime).then((s) => {
-      /* только счётчики — без device_id, endpoint и типов правил */
-      if (s.due || s.retried) console.log('[cron]', JSON.stringify(s));
+      /* итог запуска: только счётчики (подробности — по строке на доставку, worker/log.js) */
+      if (s.due || s.retried) logCron(s, event.scheduledTime, startedAt);
+    }).catch((err) => {
+      console.error(JSON.stringify({ evt: 'cron_error', scheduled_at: new Date(event.scheduledTime).toISOString(), error: err && err.name, message: String(err && err.message || '').slice(0, 200) }));
+      throw err;
     }));
   },
 };

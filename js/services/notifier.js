@@ -27,8 +27,12 @@ export const isSafeRoute = (r) => typeof r === 'string' && /^#\/[\w\-/]*$/.test(
    occurrences: { has(id), mark(id, via) } — общий с SW журнал показанного:
      срабатывание, уже пришедшее push'ем, локально не показывается.
    deferMs(rule): пока фоновый push — основной канал, локальный показ
-     откладывается на это время (ждём push), затем — запасной показ. */
-export function createNotifier({ storage, show, permission, now = () => new Date(), onError = () => {}, occurrences = null, deferMs = null }) {
+     откладывается на это время (ждём push), затем — запасной показ.
+   serverCheck(occId) → 'delivered' | 'pending' | 'undelivered': пока push — основной
+     канал, запасной показ только если сервер подтвердил, что push НЕ ушёл.
+     Иначе при открытии приложения после сна iPhone локальное «💧 Вода» и
+     задержанный системой push «LexLife» приходили вместе — пачкой и дублями. */
+export function createNotifier({ storage, show, permission, now = () => new Date(), onError = () => {}, occurrences = null, deferMs = null, serverCheck = null }) {
   let running = null;
   async function run() {
     if (permission() !== 'granted') return [];
@@ -44,6 +48,15 @@ export function createNotifier({ storage, show, permission, now = () => new Date
         continue;
       }
       if (wait && t - due < wait) continue; // серверный push ещё может прийти
+      if (wait && serverCheck) {
+        const verdict = await serverCheck(occ);
+        if (verdict === 'pending') continue; // сервер ещё повторяет — проверим позже
+        if (verdict === 'delivered') { // push ушёл на iPhone: дубль не показываем
+          await storage.updateNotification(rule.id, { lastFiredAt: due.toISOString() });
+          if (occurrences) await occurrences.mark(occ, 'server');
+          continue;
+        }
+      }
       /* сначала фиксируем срабатывание — повторная/параллельная проверка его уже не покажет */
       await storage.updateNotification(rule.id, { lastFiredAt: due.toISOString() });
       if (occurrences) await occurrences.mark(occ, 'local');

@@ -14,7 +14,7 @@
 
 import assert from 'node:assert/strict';
 import { handleApi } from '../worker/api.js';
-import { runCron, maintenance, MAX_ATTEMPTS, STUCK_CLAIM_MS } from '../worker/cron.js';
+import { runCron, maintenance, MAX_ATTEMPTS, STUCK_CLAIM_MS, GHOST_AFTER_MS, GHOST_MIN_SENT } from '../worker/cron.js';
 import { generateVapidKeys } from '../worker/webpush.js';
 import { sha256Hex } from '../worker/auth.js';
 import worker from '../worker/index.js';
@@ -25,6 +25,14 @@ import { makeUserAgent, decrypt, verifyVapid, createPushServer } from './helpers
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
+
+/* Структурированные логи Worker'а (одна JSON-строка на событие) собираются
+   здесь, а не печатаются: тесты проверяют их содержимое */
+const LOGS = [];
+for (const k of ['log', 'warn', 'error']) {
+  const orig = console[k].bind(console);
+  console[k] = (...a) => { if (typeof a[0] === 'string' && a[0].startsWith('{"evt"')) LOGS.push(JSON.parse(a[0])); else orig(...a); };
+}
 
 const TZ = 'Europe/Madrid';
 const M = (y, mo, d, h = 0, mi = 0) => zonedToUtc(y, mo, d, h, mi, TZ); // локальное время Мадрида → UTC мс
@@ -249,7 +257,8 @@ test('cron: ежедневное правило — ровно один push в 
   await cronEveryMinute(s, M(2031, 3, 10, 8, 55), M(2031, 3, 10, 9, 10));
   const p = await sentPayloads(s, ua);
   assert.equal(p.length, 1);
-  assert.deepEqual(Object.keys(p[0]).sort(), ['body', 'occurrenceId', 'scheduledAt', 'target', 'title', 'type', 'v']);
+  assert.deepEqual(Object.keys(p[0]).sort(), ['ack', 'body', 'occurrenceId', 'scheduledAt', 'target', 'title', 'type', 'v']);
+  assert.ok(Number.isSafeInteger(p[0].ack.d) && /^[A-Za-z0-9_-]{22}$/.test(p[0].ack.k), 'ack: id доставки + случайный ключ');
   assert.equal(p[0].body, 'Проверьте напоминание LexLife'); assert.equal(p[0].target, '#/meds');
   assert.equal(p[0].occurrenceId, 'm1@2031-03-10T09:00'); assert.equal(p[0].scheduledAt, new Date(M(2031, 3, 10, 9, 0)).toISOString());
   assert.ok(!JSON.stringify(p).includes('Метформин'));
@@ -504,6 +513,202 @@ test('GET /api/status: D1 и VAPID → ok + сборка; без VAPID → 503; 
   const brokenDb = await handleApi(new Request('https://lexlife.test/api/status'), { ...s.env, DB: { prepare() { throw new Error('d1 down'); } } }, { now: Date.now() });
   assert.equal(brokenDb.status, 503); assert.equal((await brokenDb.json()).db, 'error');
   assert.equal((await s.call('POST', '/api/status', { body: {} })).status, 405);
+});
+
+/* ---------- аудит доставки 2026-10-06: сценарии хаотичной доставки ---------- */
+const AT = (ua, s) => sentPayloads(s, ua);
+const ackOf = async (s, ua, i = -1) => (await AT(ua, s)).at(i).ack;
+
+test('одно уведомление: вода каждые 90 мин 07:30–23:30 за сутки — ровно по одному push на слот, вовремя (≤ 1 мин)', async () => {
+  const s = await setup();
+  const { auth, ua } = await s.subscribed();
+  await s.sync(auth, [R({ id: 'w', type: 'water', repeat: 'interval', intervalMinutes: 90, startTime: '07:30', endTime: '23:30' })], { now: M(2031, 3, 10, 0, 0) });
+  await cronEveryMinute(s, M(2031, 3, 10, 0, 0), M(2031, 3, 11, 0, 0));
+  const p = await AT(ua, s);
+  const slots = ['07:30', '09:00', '10:30', '12:00', '13:30', '15:00', '16:30', '18:00', '19:30', '21:00', '22:30'];
+  assert.deepEqual(p.map((x) => x.occurrenceId.split('T')[1]), slots);
+  assert.equal(new Set(p.map((x) => x.occurrenceId)).size, slots.length, 'без дублей');
+  for (const d of s.db.q('SELECT * FROM notification_deliveries')) assert.ok(d.sent_at - d.scheduled_fire_at < MIN, 'отправлено в ту же минуту');
+});
+
+test('повтор cron: тот же scheduledTime трижды, параллельно и с опозданием на 30 с — один push, остальные lost_race в логе', async () => {
+  const s = await setup();
+  const { auth } = await s.subscribed();
+  await s.sync(auth, [R({ id: 'p', type: 'pressure', time: '09:00' })]);
+  LOGS.length = 0;
+  const t = M(2031, 3, 10, 9, 0);
+  await Promise.all([s.cron(t), s.cron(t), s.cron(t)]);
+  await s.cron(t + 30000); await s.cron(t);
+  assert.equal(s.push.log.length, 1);
+  assert.equal(LOGS.filter((l) => l.decision === 'sent').length, 1);
+  assert.equal(LOGS.filter((l) => l.decision === 'lost_race').length, 2, 'параллельные запуски видны в логе');
+});
+
+test('две подписки одного устройства (iOS сменил endpoint, повторный subscribe, гонка двух вкладок) → одна активная, один push', async () => {
+  const s = await setup();
+  const { auth, ua } = await s.subscribed();
+  const ua2 = await makeUserAgent();
+  const second = `https://web.push.apple.com/QH${crypto.randomUUID()}`;
+  await Promise.all([
+    s.call('POST', '/api/push/subscribe', { auth, body: { endpoint: second, keys: { p256dh: ua2.p256dh, auth: ua2.auth } } }),
+    s.call('POST', '/api/push/subscribe', { auth, body: { endpoint: second, keys: { p256dh: ua2.p256dh, auth: ua2.auth } } }),
+  ]);
+  assert.deepEqual(s.db.q('SELECT endpoint FROM push_subscriptions').map((r) => r.endpoint), [second]);
+  await s.sync(auth, [R({ id: 'm', time: '09:00' })]);
+  await cronEveryMinute(s, M(2031, 3, 10, 8, 59), M(2031, 3, 10, 9, 3));
+  assert.equal(s.push.log.length, 1);
+  assert.equal(s.push.log[0].url, second, 'только новая подписка');
+  await assert.rejects(decrypt(ua, s.push.log[0].body), 'старые ключи не подходят');
+  assert.equal((await decrypt(ua2, s.push.log[0].body)).occurrenceId, 'm@2031-03-10T09:00');
+});
+
+test('офлайн/временная ошибка: 503 → повторы в пределах 10 мин с тем же ack; push-сервис недоступен дольше окна → failed, без пачки потом', async () => {
+  let down = true;
+  const s = await setup({ responder: () => (down ? 503 : 201) });
+  const { auth, ua } = await s.subscribed();
+  await s.sync(auth, [R({ id: 'w', type: 'water', repeat: 'interval', intervalMinutes: 60, startTime: '09:00', endTime: '12:00' })]);
+  await cronEveryMinute(s, M(2031, 3, 10, 9, 0), M(2031, 3, 10, 9, 2));
+  down = false;
+  await cronEveryMinute(s, M(2031, 3, 10, 9, 2), M(2031, 3, 10, 9, 5));
+  const ok = s.push.log.filter((x) => x.status === 201);
+  assert.equal(ok.length, 1, 'доставлено один раз после сбоя');
+  const d9 = s.db.q("SELECT * FROM notification_deliveries WHERE occurrence_id LIKE '%T09:00'")[0];
+  assert.equal(d9.status, 'sent'); assert.equal(d9.attempts, 3, '9:00 503 → 9:01 503 → 9:03 201');
+  assert.equal((await decrypt(ua, ok[0].body)).ack.k, d9.ack_key, 'повтор несёт ключ той же доставки');
+  /* 10:00 и 11:00: push-сервис недоступен весь час → не больше MAX_ATTEMPTS, затем failed */
+  down = true;
+  await cronEveryMinute(s, M(2031, 3, 10, 9, 5), M(2031, 3, 10, 11, 30));
+  down = false;
+  await cronEveryMinute(s, M(2031, 3, 10, 11, 30), M(2031, 3, 10, 11, 59));
+  assert.equal(s.push.log.filter((x) => x.status === 201).length, 1, 'после восстановления сети старые 10:00/11:00 не отправляются');
+  for (const d of s.db.q("SELECT * FROM notification_deliveries WHERE occurrence_id NOT LIKE '%T09:00'")) {
+    assert.equal(d.status, 'failed'); assert.ok(d.attempts <= MAX_ATTEMPTS);
+  }
+  /* TTL каждого push ≤ остатка окна 10 мин: push-сервис не доставит его через час */
+  for (const x of s.push.log) assert.ok(Number(x.headers.TTL) <= NOTIF_GRACE_MS / 1000, x.headers.TTL);
+  await cronEveryMinute(s, M(2031, 3, 10, 11, 59), M(2031, 3, 10, 12, 2));
+  assert.equal(s.push.log.filter((x) => x.status === 201).length, 2, 'следующий слот 12:00 — по расписанию');
+});
+
+test('открытие приложения после пропуска: status/sync/subscribe не отправляют старое, следующий push — по расписанию', async () => {
+  const s = await setup();
+  const { auth, ua, endpoint } = await s.subscribed();
+  await s.sync(auth, [R({ id: 'w', type: 'water', repeat: 'interval', intervalMinutes: 60, startTime: '08:00', endTime: '22:00' })], { now: M(2031, 3, 10, 7, 0) });
+  /* cron «стоял» 3 часа (инцидент Cloudflare), приложение не открывалось */
+  await s.cron(M(2031, 3, 10, 11, 20));
+  assert.equal(s.push.log.length, 0, 'опоздавшие слоты не отправлены');
+  assert.equal(s.db.q("SELECT COUNT(*) n FROM notification_deliveries WHERE status = 'skipped' AND error_code = 'late'")[0].n, 1, 'пропуск записан с причиной');
+  /* пользователь открывает приложение: запуск (status), синхронизация, переподписка */
+  const now = M(2031, 3, 10, 11, 25);
+  await s.call('GET', '/api/push/status', { auth, now });
+  await s.sync(auth, [R({ id: 'w', type: 'water', repeat: 'interval', intervalMinutes: 60, startTime: '08:00', endTime: '22:00' })], { now });
+  await s.call('POST', '/api/push/subscribe', { auth, now, body: { endpoint, keys: { p256dh: ua.p256dh, auth: ua.auth } } });
+  await cronEveryMinute(s, now, M(2031, 3, 10, 12, 0));
+  assert.equal(s.push.log.length, 0, 'открытие приложения не вызывает пачку');
+  await cronEveryMinute(s, M(2031, 3, 10, 12, 0), M(2031, 3, 10, 12, 2));
+  assert.deepEqual((await AT(ua, s)).map((p) => p.occurrenceId), ['w@2031-03-10T12:00']);
+  assert.ok(s.db.q('SELECT last_seen_at FROM devices')[0].last_seen_at === now, 'запуск отмечен (last_seen_at)');
+});
+
+test('переход летнее/зимнее время (Europe/Madrid 2031): вода каждый час 00:00–04:00 — весной 4 push (02:00 нет), осенью 5 (02:00 один раз)', async () => {
+  const s = await setup();
+  const { auth, ua } = await s.subscribed();
+  await s.sync(auth, [R({ id: 'n', type: 'water', repeat: 'interval', intervalMinutes: 60, startTime: '00:00', endTime: '04:00' })], { now: M(2031, 3, 29, 12, 0) });
+  await cronEveryMinute(s, M(2031, 3, 29, 23, 0), M(2031, 3, 30, 5, 0));
+  let p = await AT(ua, s);
+  assert.deepEqual(p.map((x) => x.occurrenceId.split('@')[1]), ['2031-03-30T00:00', '2031-03-30T01:00', '2031-03-30T03:00', '2031-03-30T04:00']);
+  const before = p.length;
+  await cronEveryMinute(s, M(2031, 10, 25, 23, 0), M(2031, 10, 26, 5, 0));
+  p = (await AT(ua, s)).slice(before);
+  assert.deepEqual(p.map((x) => x.occurrenceId.split('@')[1]), ['2031-10-26T00:00', '2031-10-26T01:00', '2031-10-26T02:00', '2031-10-26T03:00', '2031-10-26T04:00']);
+  const times = p.map((x) => Date.parse(x.scheduledAt));
+  assert.equal(times[3] - times[2], 2 * 60 * MIN, '02:00 (первое, CEST) → 03:00 CET: между ними 2 часа, повторного 02:00 нет');
+});
+
+test('ack: SW подтверждает показ → shown_at/acked_at, last_ack_at; неверный ключ → 404; повтор ack не меняет время; журнал без ключей', async () => {
+  const s = await setup();
+  const { auth, ua } = await s.subscribed();
+  await s.sync(auth, [R({ id: 'm', time: '09:00' })]);
+  await s.cron(M(2031, 3, 10, 9, 0));
+  const ack = await ackOf(s, ua);
+  assert.equal((await s.call('POST', '/api/push/ack', { body: { d: ack.d, k: 'A'.repeat(22) } })).status, 404, 'чужой ключ');
+  assert.equal((await s.call('POST', '/api/push/ack', { body: { d: ack.d, k: 'short' } })).status, 400);
+  assert.equal((await s.call('POST', '/api/push/ack', { body: { d: ack.d, k: ack.k }, ct: 'text/plain' })).status, 415);
+  LOGS.length = 0;
+  const shownAt = M(2031, 3, 10, 9, 47); // iPhone «держал» push 47 минут
+  const r = await s.call('POST', '/api/push/ack', { now: M(2031, 3, 10, 9, 47, 2), body: { d: ack.d, k: ack.k, shownAt } });
+  assert.equal(r.status, 200);
+  await s.call('POST', '/api/push/ack', { now: M(2031, 3, 10, 10, 0), body: { d: ack.d, k: ack.k, shownAt: M(2031, 3, 10, 10, 0) } });
+  const d = s.db.q('SELECT * FROM notification_deliveries')[0];
+  assert.equal(d.shown_at, shownAt); assert.equal(d.acked_at, M(2031, 3, 10, 9, 47, 2));
+  assert.ok(s.db.q('SELECT last_ack_at FROM push_subscriptions')[0].last_ack_at);
+  const ackLog = LOGS.find((l) => l.evt === 'ack');
+  assert.equal(ackLog.shown_lag_s, 47 * 60, 'лог показывает, что задержка — на стороне iPhone');
+  assert.equal(ackLog.sent_lag_s, 0);
+  /* журнал доставки устройства: причина и время показа, без ack_key/endpoint */
+  const j = await s.call('GET', '/api/push/deliveries', { auth });
+  assert.equal(j.status, 200);
+  assert.deepEqual(Object.keys(j.data.deliveries[0]).sort(), ['ackedAt', 'attempts', 'errorCode', 'occurrenceId', 'reason', 'scheduledAt', 'sentAt', 'shownAt', 'status', 'type']);
+  assert.equal(j.data.deliveries[0].shownAt, new Date(shownAt).toISOString());
+  assert.ok(!/web\.push|p256dh|ack_key|"k"|token/.test(JSON.stringify(j.data)));
+  const one = await s.call('GET', '/api/push/deliveries?occurrence=' + encodeURIComponent('m@2031-03-10T09:00'), { auth });
+  assert.equal(one.data.delivery.status, 'sent');
+  assert.equal((await s.call('GET', '/api/push/deliveries?occurrence=nope', { auth })).data.delivery, null);
+  /* чужое устройство не видит этот журнал */
+  const other = await s.device();
+  assert.equal((await s.call('GET', '/api/push/deliveries?occurrence=' + encodeURIComponent('m@2031-03-10T09:00'), { auth: other })).data.delivery, null);
+});
+
+test('структурированные логи: rule_id, device, scheduled_at, actual_at, lag_s, decision, status, host — без endpoint и ключей', async () => {
+  const s = await setup({ responder: (url, n) => (n === 0 ? 500 : 201) });
+  const { auth, endpoint, ua } = await s.subscribed();
+  await s.sync(auth, [R({ id: 'm', time: '09:00' })]);
+  LOGS.length = 0;
+  await cronEveryMinute(s, M(2031, 3, 10, 9, 0), M(2031, 3, 10, 9, 3));
+  const [retry, sent] = LOGS.filter((l) => l.evt === 'push');
+  assert.equal(retry.decision, 'retry'); assert.equal(retry.status, 500); assert.match(retry.reason, /next_attempt_at/);
+  assert.equal(sent.decision, 'sent'); assert.equal(sent.attempt, 2); assert.equal(sent.lag_s, 60);
+  for (const k of ['rule_id', 'device', 'scheduled_at', 'actual_at', 'type', 'occurrence', 'host']) assert.ok(sent[k] != null, k);
+  assert.equal(sent.host, 'web.push.apple.com'); assert.equal(sent.device.length, 8);
+  const raw = JSON.stringify(LOGS);
+  assert.ok(!raw.includes(new URL(endpoint).pathname), 'нет пути endpoint');
+  for (const secret of [ua.p256dh, ua.auth, VAPID.privateKey, auth.token, auth.deviceId]) assert.ok(!raw.includes(secret));
+  const ackKey = s.db.q('SELECT ack_key FROM notification_deliveries')[0].ack_key;
+  assert.ok(!raw.includes(ackKey), 'ack-ключ не в логах');
+});
+
+test('подписка удалённой установки PWA (Apple отвечает 201): снимается через 7 дней без запусков и ack; живая — остаётся', async () => {
+  const s = await setup();
+  const live = await s.subscribed();
+  const ghost = await s.subscribed({ now: M(2031, 3, 10, 7, 0) });
+  const rules = [R({ id: 'w', type: 'water', repeat: 'interval', intervalMinutes: 120, startTime: '08:00', endTime: '22:00' })];
+  await s.sync(live.auth, rules); await s.sync(ghost.auth, rules);
+  const start = M(2031, 3, 10, 7, 0);
+  /* 8 дней: живая установка открывает приложение по утрам, но её SW ack не шлёт (худший случай) */
+  for (let day = 0; day < 8; day++) {
+    const d0 = start + day * 86400000;
+    await s.call('GET', '/api/push/status', { auth: live.auth, now: d0 + 60 * MIN });
+    for (let h = 0; h <= 15; h++) {
+      const t = d0 + h * 60 * MIN;
+      await s.cron(t);
+      if (new Date(t).getUTCMinutes() === 0) await maintenance(s.db, t);
+    }
+  }
+  const active = s.db.q('SELECT device_id FROM push_subscriptions WHERE active = 1').map((r) => r.device_id);
+  assert.deepEqual(active, [live.auth.deviceId], 'призрачная подписка снята, живая — нет');
+  assert.ok(s.db.q('SELECT COUNT(*) n FROM notification_deliveries')[0].n >= GHOST_MIN_SENT);
+  assert.ok(LOGS.some((l) => l.decision === 'ghost_dropped'));
+  /* устройство без запусков, но с подтверждёнными push — тоже живое */
+  const s2 = await setup();
+  const quiet = await s2.subscribed({ now: start });
+  await s2.sync(quiet.auth, rules, { now: start });
+  for (let t = start; t < start + GHOST_AFTER_MS + 86400000; t += 60 * MIN) {
+    await s2.cron(t);
+    const last = (await AT(quiet.ua, s2)).at(-1);
+    if (last && last.ack) await s2.call('POST', '/api/push/ack', { now: t, body: { d: last.ack.d, k: last.ack.k, shownAt: t } });
+    if (new Date(t).getUTCMinutes() === 0) await maintenance(s2.db, t);
+  }
+  assert.equal(s2.db.q('SELECT COUNT(*) n FROM push_subscriptions WHERE active = 1')[0].n, 1);
 });
 
 let passed = 0; let failed = 0;

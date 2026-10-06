@@ -244,7 +244,28 @@ export function createPushClient({
       const r = await sendSubscription(sub);
       return { state: r.ok ? 'updated' : 'error' };
     }
+    /* Сервер тоже знает эту подписку? (отметка запуска last_seen_at; подписку могли
+       снять 404/410 или очистка удалённых установок) — нет → отправляем снова */
+    const s = await api('GET', 'push/status');
+    if ((s.ok && s.data.subscription !== 'active') || s.status === 401) {
+      const r = await sendSubscription(sub);
+      return { state: r.ok ? 'healed' : 'error' };
+    }
     return { state: 'ok' };
+  }
+
+  /* Судьба одного срабатывания на сервере → решение локального планировщика:
+     'delivered' — push принят push-сервисом (не дублировать),
+     'pending'   — сервер ещё отправляет/повторяет,
+     'undelivered' — не ушёл (ошибка, пропуск, нет записи) или сервер недоступен
+                     (без сети iPhone push тоже не получил). */
+  async function occurrenceStatus(occId) {
+    const r = await api('GET', `push/deliveries?occurrence=${encodeURIComponent(occId)}`);
+    const d = r.ok && r.data ? r.data.delivery : null;
+    if (!d) return 'undelivered';
+    if (d.status === 'sent' || d.status === 'unknown') return 'delivered';
+    if (d.status === 'claimed' || d.status === 'retry') return 'pending';
+    return 'undelivered';
   }
 
   const pendingSync = async () => {
@@ -260,9 +281,10 @@ export function createPushClient({
   }
 
   return {
-    serverAllowed, config, ensureDevice, enable, disable, sync, checkSubscription, pendingSync, isServerPrimary,
+    serverAllowed, config, ensureDevice, enable, disable, sync, checkSubscription, pendingSync, isServerPrimary, occurrenceStatus,
     state: readState,
     status: () => api('GET', 'push/status'),
     testPush: () => api('POST', 'notifications/test', {}),
+    deliveries: () => api('GET', 'push/deliveries'),
   };
 }

@@ -297,7 +297,7 @@ const loadSw = () => loadServiceWorker({ scope: 'https://example.test/LexLife/' 
 
 test('sw.js: CACHE_VERSION поднят, новые модули в APP_SHELL, старые кэши удаляются, данные не трогаются', () => {
   const src = readFileSync(new URL('../sw.js', import.meta.url), 'utf8');
-  assert.match(src, /const CACHE_VERSION = 'lexlife-v64';/);
+  assert.match(src, /const CACHE_VERSION = 'lexlife-v65';/);
   for (const m of ['notifySchedule', 'notifier', 'zonedSchedule', 'pushClient', 'occurrenceStore', 'deployment', 'sleep', 'activity']) assert.match(src, new RegExp(`'\\./js/services/${m}\\.js'`), m);
   assert.match(src, /APP_CACHE_RE\.test\(k\) && k !== CACHE_VERSION/); // только кэши оболочки прежних версий (подробно — tests/sw-update.test.mjs)
   assert.match(src, /startsWith\(new URL\(self\.registration\.scope\)\.pathname \+ 'api\/'\)/, 'API не кэшируется SW');
@@ -332,6 +332,43 @@ test('sw.js push (сервер LexLife): tag = occurrenceId, target → route, �
   assert.ok(await occ.match('https://example.test/LexLife/__occ/r1%402031-03-10T09%3A00'), 'журнал в scope приложения (base path /LexLife/)');
   await s.pushJson({ occurrenceId: 'x'.repeat(500), body: 'y'.repeat(1000), target: 'javascript:alert(1)' });
   assert.equal(s.shown[2].opts.tag, 'lexlife-push'); assert.equal(s.shown[2].opts.body.length, 200); assert.equal(s.shown[2].opts.data.route, '#/notifications');
+});
+
+test('sw.js push: уведомление показывается ДО обращения к Cache API и сети (зависшее хранилище не задерживает показ)', async () => {
+  const order = [];
+  const hanging = { open: () => { order.push('caches.open'); return new Promise(() => {}); }, keys: async () => [], match: async () => undefined, delete: async () => true };
+  const s = loadServiceWorker({ caches: hanging, timeScale: 0.001, fetchImpl: () => { order.push('fetch'); return new Promise(() => {}); } });
+  const orig = s.shown.push.bind(s.shown);
+  s.shown.push = (n) => { order.push('show'); return orig(n); };
+  await s.pushJson({ occurrenceId: 'w@2031-03-10T09:00', type: 'water', title: 'LexLife', body: 'Пора выпить воду', target: '#/metric/water', scheduledAt: '2031-03-10T08:00:00.000Z', ack: { d: 7, k: 'A'.repeat(22) } });
+  assert.equal(order[0], 'show', order.join(' → '));
+  assert.equal(s.shown.length, 1, 'waitUntil завершился, хотя Cache API и сеть зависли (тайм-аут шага)');
+});
+
+test('sw.js push: подтверждение показа (ack) уходит на api/push/ack scope; без ack в payload — ни одного запроса', async () => {
+  const reqs = [];
+  const s = loadServiceWorker({ scope: 'https://lexlife.test/', fetchImpl: async (url, init) => { reqs.push({ url, init }); return new Response('{}'); } });
+  const before = Date.now();
+  await s.pushJson({ occurrenceId: 'w@2031-03-10T09:00', title: 'LexLife', body: 'B', scheduledAt: '2031-03-10T08:00:00.000Z', ack: { d: 42, k: 'Abc_-'.repeat(4) + 'zz' } });
+  assert.equal(reqs.length, 1);
+  assert.equal(reqs[0].url, 'https://lexlife.test/api/push/ack');
+  assert.equal(reqs[0].init.method, 'POST'); assert.equal(reqs[0].init.credentials, 'omit');
+  const body = JSON.parse(reqs[0].init.body);
+  assert.equal(body.d, 42); assert.equal(body.k, 'Abc_-'.repeat(4) + 'zz'); assert.ok(body.shownAt >= before);
+  await s.pushJson({ occurrenceId: 'w@2031-03-10T10:00', title: 'LexLife', body: 'B' });
+  await s.pushJson({ occurrenceId: 'w@2031-03-10T11:00', title: 'LexLife', body: 'B', ack: { d: 'x', k: '<script>' } });
+  assert.equal(reqs.length, 1, 'нет ack / мусорный ack → без запроса');
+});
+
+test('sw.js push: iPhone отдал накопленные push пачкой → на экране остаётся одно, последнее уведомление правила', async () => {
+  const s = loadServiceWorker();
+  const p = (h, id = 'w') => ({ occurrenceId: `${id}@2031-03-10T${h}:00`, type: 'water', title: 'LexLife', body: 'Пора выпить воду', scheduledAt: `2031-03-10T${String(Number(h) - 1).padStart(2, '0')}:00:00.000Z` });
+  const visible = () => s.shown.filter((n) => !n.closed).map((n) => n.opts.data.occurrenceId).sort();
+  await s.pushJson(p('10')); await s.pushJson(p('09'));
+  assert.deepEqual(visible(), ['w@2031-03-10T10:00'], 'более старое, пришедшее позже, тоже закрыто');
+  await s.pushJson(p('11')); await s.pushJson(p('09', 'm'));
+  assert.deepEqual(visible(), ['m@2031-03-10T09:00', 'w@2031-03-10T11:00'], 'по одному на правило; другое правило не трогается');
+  assert.equal(s.shown.length, 4, 'каждый push показал уведомление (iOS)');
 });
 
 test('createNotifier: срабатывание, уже показанное push\'ем, локально не показывается; при активном push — ожидание, затем один запасной показ', async () => {

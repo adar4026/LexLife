@@ -72,11 +72,12 @@ Push в любую ветку GitHub НЕ деплоит Cloudflare: Git-инт�
 Медицинские данные (вес, давление, вода, анализы, PDF, заметки, бэкапы) **не покидают устройство**.
 Тексты напоминаний на сервер тоже не уходят — push содержит нейтральную фразу по типу правила.
 
-- `devices` — `id` (UUID), `token_hash` (SHA-256), `timezone`, `rules_rev`, `last_sync_at`, `last_test_push_at`
-- `push_subscriptions` — `endpoint UNIQUE`, `p256dh`, `auth`, `active`, `failure_count`, `last_success_at`, `last_failure_at`
+- `devices` — `id` (UUID), `token_hash` (SHA-256), `timezone`, `rules_rev`, `last_sync_at`, `last_test_push_at`, `last_seen_at` (запуск приложения, 0002)
+- `push_subscriptions` — `endpoint UNIQUE`, `p256dh`, `auth`, `active`, `failure_count`, `last_success_at`, `last_failure_at`, `last_ack_at` (0002)
 - `notification_rules` — `UNIQUE(device_id, client_rule_id)`, `type`, `enabled`, `schedule_type`, `local_time`,
   `days_of_week`, `interval_minutes`, `window_start/end`, `once_date`, `timezone`, `next_fire_at` (UTC мс), `fire_at`, `completed_at`
-- `notification_deliveries` — `UNIQUE(rule_id, scheduled_fire_at)`, `occurrence_id`, `status`, `attempts`, `next_attempt_at`, `sent_at`, `error_code`
+- `notification_deliveries` — `UNIQUE(rule_id, scheduled_fire_at)`, `occurrence_id`, `status`, `attempts`, `next_attempt_at`, `sent_at`, `error_code`,
+  `ack_key` / `shown_at` / `acked_at` (0002: подтверждение показа от SW)
 
 Индексы: частичный `idx_notification_rules_due (next_fire_at) WHERE enabled = 1 AND next_fire_at IS NOT NULL`
 (cron не сканирует таблицу — проверено `EXPLAIN QUERY PLAN`), `device_id`, retry-индекс, `(status, created_at)`.
@@ -96,6 +97,8 @@ Push в любую ветку GitHub НЕ деплоит Cloudflare: Git-инт�
 | `GET /api/push/status` | Bearer | подписка, последняя синхронизация, последний push (без endpoint) |
 | `POST /api/notifications/sync` | Bearer | полное зеркало правил + `rev` (устаревший → 409) |
 | `POST /api/notifications/test` | Bearer | push только своему устройству, не чаще 1 раза в 20 с |
+| `GET /api/push/deliveries` | Bearer | журнал доставки своего устройства (30 последних) или `?occurrence=<id>` — одна запись: статус, причина, `sentAt`, `shownAt` |
+| `POST /api/push/ack` | нет (ключ доставки) | SW показал push: `{d, k, shownAt}`; `k` — 16 случайных байт из зашифрованного payload этой доставки |
 
 `Authorization: Bearer <device_id>.<token>` — токен только в заголовке. `device_id` не является паролем:
 без токена (32 случайных байта; в D1 — только SHA-256) ничего изменить нельзя. POST принимает только
@@ -116,7 +119,29 @@ Push в любую ветку GitHub НЕ деплоит Cloudflare: Git-инт�
 Дальше по цепочке: `Topic` (push-сервис заменяет неотправленный дубль) → `tag = occurrenceId` в SW
 (повтор заменяет уведомление) → журнал occurrence в Cache API → локальный планировщик не показывает то,
 что пришло push'ем. Пока push — основной канал, локальный планировщик (приложение открыто) ждёт 2 минуты и
-только потом показывает запасное уведомление — с тем же tag.
+только потом спрашивает сервер о судьбе этого срабатывания (`/api/push/deliveries?occurrence=`):
+`sent` → запасной показ не нужен (push уже у iPhone, даже если система его ещё держит); `claimed`/`retry` → ждём;
+`failed`/`expired`/`skipped`/нет записи/нет сети → один запасной показ с тем же tag.
+
+### Аудит хаотичной доставки (2026-10-06)
+
+Симптомы: push не приходят, пока не откроешь приложение; после открытия — пачка старых; иногда дубли.
+Production D1 за 3 дня: все 58 доставок `sent`, 201 от Apple, задержка cron ≤ 53 с — **сервер слал вовремя**.
+Найдено в цепочке после сервера:
+
+1. **Две активные подписки** Apple (`74d537c0`, `3a408de6`) с одинаковыми правилами — вторая установка PWA
+   (инцидент 2026-10-04). Apple отвечает 201 и на подписку удалённого PWA, поэтому сервер этого не видел.
+2. **SW ждал Cache API до `showNotification`**: на iPhone SW будится в фоне, и любое ожидание хранилища до показа
+   может отложить уведомление до запуска приложения — тогда накопленные push показываются разом.
+3. **Локальный запасной показ при открытии** не знал, что сервер уже отправил push: через 2 мин после срабатывания
+   показывал «💧 Вода», а затем iOS выдавал задержанный «LexLife» — пачка + дубль.
+
+Исправлено: SW показывает **первым**, затем (с тайм-аутами) журнал occurrence, закрытие более старых уведомлений
+того же правила (после сна на экране остаётся одно) и `ack`; запасной показ сверяется с сервером; подписка
+удалённой установки снимается автоматически (7 дней без запусков приложения и без единого `ack` при ≥ 10
+отправках с ack-ключом); живая установка, снятая по ошибке, переподписывается при запуске
+(`checkSubscription` → `/api/push/status` = `none`). Теперь журнал доставки отличает задержку сервера
+(`sent_at − scheduled`) от задержки iPhone (`shown_at − scheduled`).
 
 ## Синхронизация правил (фронтенд)
 
@@ -246,7 +271,15 @@ npm run db:migrate:remote                            # применить
 
 - Один Cron Trigger `* * * * *` (из `wrangler.jsonc`). Пустая система: 2 запроса чтения D1 в минуту, 0 записей
   (замер 2026-10-03: ~1 440 запусков и ~3 000 прочитанных строк в сутки, CPU ≈ 1,2 мс на запуск).
-- Логи cron — только счётчики, когда что-то было due; endpoint, ключи, токены и данные здоровья не логируются.
+- Логи (Workers Logs, `observability.enabled`) — JSON-строка на событие (`worker/log.js`):
+  `{"evt":"push","decision":"sent|retry|failed|gone|skipped_late|lost_race|expired|no_subscription|ghost_dropped",
+  "rule_id","device"(8 симв.),"type","occurrence","scheduled_at","actual_at","lag_s","attempt","status","host","reason"}`,
+  `{"evt":"ack",...,"sent_lag_s","shown_lag_s"}` — когда iPhone реально показал, и `{"evt":"cron",...}` — итог запуска.
+  Endpoint (кроме хоста), ключи, токены, ack-ключ и данные здоровья не логируются.
+- Почему конкретное уведомление не пришло: приложение → Уведомления → «Журнал доставки (сервер)», или
+  `node scripts/push-diag.mjs [--hours 48]` / `--occurrence '<rule>@ГГГГ-ММ-ДДTЧЧ:ММ'` (только SELECT; устройства,
+  подписки — только хост, правила, журнал с задержками, подозрения: одно правило на нескольких устройствах и т. п.).
+- Сквозная проверка с настоящим push-сервисом: `node tests/e2e/push-delivery.e2e.mjs` (wrangler dev + Chrome + FCM).
 - Здоровье: `GET /api/status` (D1 + VAPID), `npx wrangler tail lexlife --format pretty` (вызовы cron),
   `npx wrangler d1 info lexlife` (запросы/строки за 24 ч).
 - Тестовый push: приложение → Меню → Уведомления → «Проверить фоновый push».

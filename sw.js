@@ -14,7 +14,7 @@
    не ответившая (старый код) — перезагружается здесь, один раз, WindowClient.navigate().
    ========================================================= */
 
-const CACHE_VERSION = 'lexlife-v64';
+const CACHE_VERSION = 'lexlife-v65';
 const FONT_CACHE = 'lexlife-fonts-v1';
 /* Журнал показанных срабатываний (push/локально) — общий со страницей (js/services/occurrenceStore.js) */
 const OCC_CACHE = 'lexlife-occ-v1';
@@ -127,27 +127,68 @@ const safeRoute = (r) => (typeof r === 'string' && r.length <= 80 && /^#\/[\w\-/
 const occKey = (id) => new URL(`__occ/${encodeURIComponent(id)}`, self.registration.scope).href;
 
 /* Web Push с сервера LexLife (Cloudflare Worker, cron раз в минуту).
-   payload: { occurrenceId, type, title, body, target, scheduledAt }.
-   Каждый push обязан показать уведомление (требование iOS). tag = occurrenceId:
-   повтор той же occurrence (retry сервера, локальный показ) заменяет
-   уведомление, а не добавляет второе. */
+   payload: { occurrenceId, type, title, body, target, scheduledAt, ack? }.
+   Каждый push обязан показать уведомление (требование iOS).
+
+   Порядок важен: showNotification — ПЕРВЫМ, до любого обращения к хранилищу
+   или сети. На iPhone SW будится в фоне; ожидание Cache API перед показом
+   может задержать уведомление до открытия приложения (тогда приходит пачка).
+   Потом, без влияния на показ (каждый шаг с тайм-аутом):
+   - журнал occurrence (локальный планировщик не покажет то же второй раз);
+   - старые уведомления того же правила закрываются: после долгого сна iPhone
+     отдаёт накопленные push разом, на экране остаётся одно, последнее
+     (iOS игнорирует замену по tag);
+   - подтверждение серверу (POST api/push/ack): журнал доставки знает,
+     когда iPhone реально показал уведомление. */
+const STEP_MS = 4000;
+function withTimeout(p, ms = STEP_MS) {
+  let timer;
+  const stop = new Promise((r) => { timer = setTimeout(r, ms); });
+  return Promise.race([Promise.resolve(p).catch(() => undefined), stop]).finally(() => clearTimeout(timer));
+}
+const ruleOf = (occ) => (occ && occ.includes('@') ? occ.slice(0, occ.lastIndexOf('@')) : '');
+const validAck = (a) => (a && Number.isSafeInteger(a.d) && a.d > 0 && typeof a.k === 'string' && /^[A-Za-z0-9_-]{22}$/.test(a.k) ? { d: a.d, k: a.k } : null);
+
+async function closeOlderOfRule(occ, scheduledAt) {
+  const rule = ruleOf(occ);
+  if (!rule || !scheduledAt || typeof self.registration.getNotifications !== 'function') return;
+  const same = (await self.registration.getNotifications()).filter((n) => n.data && ruleOf(n.data.occurrenceId) === rule && n.data.scheduledAt);
+  const newest = same.reduce((m, n) => (n.data.scheduledAt > m ? n.data.scheduledAt : m), scheduledAt);
+  /* остаётся только самое позднее срабатывание (пришедшее раньше более старое — тоже закрывается) */
+  for (const n of same) if (n.data.scheduledAt < newest) n.close();
+}
+
 self.addEventListener('push', (event) => {
+  const shownAt = Date.now();
   let p = {};
   try { p = event.data ? event.data.json() : {}; } catch (e) { p = { body: event.data ? event.data.text() : '' }; }
   if (!p || typeof p !== 'object') p = {};
   const occ = typeof p.occurrenceId === 'string' && p.occurrenceId.length <= 120 ? p.occurrenceId : '';
   const route = safeRoute(p.target) || safeRoute(p.route) || '#/notifications';
+  const scheduledAt = typeof p.scheduledAt === 'string' && p.scheduledAt.length <= 40 ? p.scheduledAt : '';
+  const ack = validAck(p.ack);
+  const shown = self.registration.showNotification(String(p.title || 'LexLife').slice(0, 80), {
+    body: String(p.body || 'Напоминание').slice(0, 200),
+    tag: occ || String(p.tag || 'lexlife-push'),
+    icon: 'icons/lexlife-icon-192.png',
+    badge: 'icons/lexlife-icon-192.png',
+    timestamp: Date.parse(scheduledAt) || shownAt,
+    data: { route, occurrenceId: occ, scheduledAt, type: typeof p.type === 'string' ? p.type.slice(0, 20) : '' },
+  });
   event.waitUntil((async () => {
+    await shown;
+    const after = [];
     if (occ) {
-      try { await (await caches.open(OCC_CACHE)).put(occKey(occ), new Response(JSON.stringify({ via: 'push', at: Date.now() }))); } catch (e) { /* журнал не критичен */ }
+      after.push(withTimeout(caches.open(OCC_CACHE).then((c) => c.put(occKey(occ), new Response(JSON.stringify({ via: 'push', at: shownAt }))))));
+      after.push(withTimeout(closeOlderOfRule(occ, scheduledAt)));
     }
-    await self.registration.showNotification(String(p.title || 'LexLife').slice(0, 80), {
-      body: String(p.body || 'Напоминание').slice(0, 200),
-      tag: occ || String(p.tag || 'lexlife-push'),
-      icon: 'icons/lexlife-icon-192.png',
-      badge: 'icons/lexlife-icon-192.png',
-      data: { route, occurrenceId: occ, type: typeof p.type === 'string' ? p.type.slice(0, 20) : '' },
-    });
+    if (ack) {
+      after.push(withTimeout(fetch(new URL('api/push/ack', self.registration.scope).href, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ d: ack.d, k: ack.k, shownAt }),
+        credentials: 'omit', cache: 'no-store', keepalive: true,
+      })));
+    }
+    await Promise.all(after);
   })());
 });
 

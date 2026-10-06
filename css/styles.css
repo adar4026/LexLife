@@ -1389,6 +1389,15 @@ textarea.input { resize: vertical; font-family: inherit; }
 .notif-status__actions .doc-btn:last-child { flex: 0 0 auto; }
 .notif-status__result { margin: 8px 0 0; font-size: 12px; color: var(--text2); line-height: 1.4; }
 .notif-status__result:empty { display: none; }
+/* Журнал доставки push (сервер): по строке на срабатывание */
+.notif-log { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 10px 14px; margin: 0 0 14px; font-size: 13px; }
+.notif-log summary { cursor: pointer; font-weight: 700; color: var(--text); }
+.notif-log__body { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.notif-log__empty { margin: 0; color: var(--text2); }
+.notif-log__row { display: flex; justify-content: space-between; gap: 10px; padding-left: 8px; border-left: 3px solid var(--orange); line-height: 1.35; }
+.notif-log__row span:last-child { color: var(--text2); text-align: right; }
+.notif-log__row--ok { border-left-color: var(--green); }
+.notif-log__row--bad { border-left-color: var(--red); }
 .notif-list { display: flex; flex-direction: column; gap: 10px; }
 .notif-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 12px 14px; }
 .notif-card.is-off { opacity: 0.6; }

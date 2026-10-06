@@ -10,6 +10,9 @@
    GET  /api/push/status            — состояние для экрана уведомлений
    POST /api/notifications/sync     — полное зеркало правил (rev)
    POST /api/notifications/test     — тестовый push этому устройству
+   GET  /api/push/deliveries        — журнал доставки устройства (?occurrence=<id> — одна)
+   POST /api/push/ack               — Service Worker показал push (без авторизации:
+                                      ключ доставки из зашифрованного payload)
 
    Всё, кроме config/register, требует Authorization: Bearer <id>.<token>.
    POST — только application/json (кросс-сайтовая форма не пройдёт).
@@ -20,6 +23,7 @@ import { authenticate, sha256Hex, newToken, UUID_RE } from './auth.js';
 import { normalizeRules, checkTimeZone, rowToRule, scheduleSignature, nextFireFor, RuleError } from './rules.js';
 import { isAllowedEndpoint, validSubscriptionKeys } from './webpush.js';
 import { pushToDevice, activeSubscription, ConfigError } from './delivery.js';
+import { devTag } from './log.js';
 
 export const MAX_BODY = 32 * 1024;
 export const DEFAULT_TEST_INTERVAL_SEC = 20;
@@ -109,8 +113,11 @@ async function unsubscribe(request, env, device, { now }) {
   return json(200, { subscription: 'none' });
 }
 
-async function status(env, device) {
+/* status вызывается и при каждом запуске приложения (pushClient.checkSubscription):
+   last_seen_at отличает живую установку от удалённой (см. cron GHOST_AFTER_MS) */
+async function status(env, device, { now }) {
   const db = env.DB;
+  await db.prepare('UPDATE devices SET last_seen_at = ? WHERE id = ?').bind(now, device.id).run();
   const sub = await activeSubscription(db, device.id);
   const agg = await db.prepare(`SELECT COUNT(*) AS rules, SUM(enabled) AS enabled, MIN(CASE WHEN enabled = 1 THEN next_fire_at END) AS next_fire_at
                                 FROM notification_rules WHERE device_id = ?`).bind(device.id).first();
@@ -118,6 +125,7 @@ async function status(env, device) {
     subscription: sub ? 'active' : 'none',
     lastPushAt: sub && sub.last_success_at ? new Date(sub.last_success_at).toISOString() : null,
     lastFailureAt: sub && sub.last_failure_at ? new Date(sub.last_failure_at).toISOString() : null,
+    lastAckAt: sub && sub.last_ack_at ? new Date(sub.last_ack_at).toISOString() : null,
     lastSyncAt: device.last_sync_at ? new Date(device.last_sync_at).toISOString() : null,
     rulesRev: device.rules_rev,
     rules: agg.rules || 0,
@@ -208,6 +216,63 @@ async function testPush(request, env, device, { now, fetchImpl }) {
   return fail(502, 'push_failed', { kind: r.kind, status: r.status });
 }
 
+/* Журнал доставки: почему конкретное срабатывание пришло / не пришло.
+   Только своё устройство; без endpoint, ключей и ack_key. */
+export const DELIVERY_REASON = {
+  sent: 'push-сервис принял сообщение',
+  claimed: 'отправляется',
+  retry: 'временная ошибка push-сервиса, будет повтор',
+  failed: 'не доставлено: ошибка push-сервиса или попытки исчерпаны',
+  expired: 'не доставлено: окно повтора (10 мин) закрылось',
+  skipped: 'пропущено: сервер опоздал больше чем на 10 мин, старое не отправляется',
+  unknown: 'исход неизвестен: Worker прервался после отправки (повтора не было)',
+};
+const iso = (t) => (t ? new Date(t).toISOString() : null);
+const deliveryView = (r) => ({
+  occurrenceId: r.occurrence_id, type: r.type, status: r.status, reason: DELIVERY_REASON[r.status] || r.status,
+  errorCode: r.error_code || null, attempts: r.attempts,
+  scheduledAt: iso(r.scheduled_fire_at), sentAt: iso(r.sent_at), shownAt: iso(r.shown_at), ackedAt: iso(r.acked_at),
+});
+async function deliveries(request, env, device) {
+  const occ = new URL(request.url).searchParams.get('occurrence');
+  const db = env.DB;
+  if (occ != null) {
+    if (occ.length > 120) throw new HttpError(400, 'bad_occurrence');
+    const row = await db.prepare(`SELECT d.*, r.type FROM notification_deliveries d JOIN notification_rules r ON r.id = d.rule_id
+        WHERE r.device_id = ? AND d.occurrence_id = ? ORDER BY d.id DESC LIMIT 1`).bind(device.id, occ).first();
+    return json(200, { delivery: row ? deliveryView(row) : null });
+  }
+  const { results } = await db.prepare(`SELECT d.*, r.type FROM notification_deliveries d JOIN notification_rules r ON r.id = d.rule_id
+      WHERE r.device_id = ? ORDER BY d.scheduled_fire_at DESC, d.id DESC LIMIT 30`).bind(device.id).all();
+  return json(200, { deliveries: results.map(deliveryView) });
+}
+
+/* Подтверждение показа от Service Worker'а. Ключ — 16 случайных байт из
+   зашифрованного payload этой доставки: знает только получатель push. */
+const ACK_KEY_RE = /^[A-Za-z0-9_-]{22}$/;
+async function ack(request, env, { now }) {
+  const body = await readJson(request);
+  const id = body.d; const key = body.k;
+  if (!Number.isSafeInteger(id) || id <= 0 || typeof key !== 'string' || !ACK_KEY_RE.test(key)) throw new HttpError(400, 'bad_ack');
+  const shown = Number.isFinite(body.shownAt) && body.shownAt > now - 30 * 86400000 && body.shownAt < now + 86400000 ? Math.round(body.shownAt) : now;
+  const db = env.DB;
+  const r = await db.prepare(`UPDATE notification_deliveries SET shown_at = COALESCE(shown_at, ?), acked_at = COALESCE(acked_at, ?)
+      WHERE id = ? AND ack_key = ?`).bind(shown, now, id, key).run();
+  if (r.meta.changes !== 1) return fail(404, 'unknown_delivery');
+  const row = await db.prepare(`SELECT d.rule_id, d.scheduled_fire_at, d.sent_at, d.shown_at, d.occurrence_id, r.device_id, r.type
+      FROM notification_deliveries d JOIN notification_rules r ON r.id = d.rule_id WHERE d.id = ?`).bind(id).first();
+  if (row) {
+    await db.prepare('UPDATE push_subscriptions SET last_ack_at = ? WHERE device_id = ? AND active = 1').bind(now, row.device_id).run();
+    /* главный показатель доставки: насколько позже расписания iPhone реально показал уведомление */
+    console.log(JSON.stringify({
+      evt: 'ack', rule_id: row.rule_id, device: devTag(row.device_id), type: row.type, occurrence: row.occurrence_id,
+      scheduled_at: iso(row.scheduled_fire_at), sent_lag_s: row.sent_at ? Math.round((row.sent_at - row.scheduled_fire_at) / 1000) : null,
+      shown_lag_s: Math.round((row.shown_at - row.scheduled_fire_at) / 1000), ack_lag_s: Math.round((now - row.scheduled_fire_at) / 1000),
+    }));
+  }
+  return json(200, { ok: true });
+}
+
 /* Здоровье сервиса для release-checklist и мониторинга. Без авторизации:
    только «работает / не работает» и номер сборки — ни устройств, ни ключей, ни счётчиков. */
 async function health(request, env, { now }) {
@@ -233,7 +298,9 @@ const ROUTES = {
   'POST /api/device/register': { auth: false, fn: (req, env, dev, opts) => register(req, env, opts) },
   'POST /api/push/subscribe': { auth: true, fn: subscribe },
   'POST /api/push/unsubscribe': { auth: true, fn: unsubscribe },
-  'GET /api/push/status': { auth: true, fn: (req, env, dev) => status(env, dev) },
+  'GET /api/push/status': { auth: true, fn: (req, env, dev, opts) => status(env, dev, opts) },
+  'GET /api/push/deliveries': { auth: true, fn: (req, env, dev) => deliveries(req, env, dev) },
+  'POST /api/push/ack': { auth: false, fn: (req, env, dev, opts) => ack(req, env, opts) },
   'POST /api/notifications/sync': { auth: true, fn: sync },
   'POST /api/notifications/test': { auth: true, fn: testPush },
 };

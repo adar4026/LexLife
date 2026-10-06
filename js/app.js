@@ -5393,6 +5393,7 @@ const occurrences = 'caches' in window ? createOccurrenceStore({ base: document.
 const notifier = createNotifier({
   storage: Storage, show: showRuleNotification, permission: notifyPermission, occurrences,
   deferMs: async () => ((await pushClient.isServerPrimary()) ? SERVER_FALLBACK_MS : 0),
+  serverCheck: (occ) => pushClient.occurrenceStatus(occ), // запасной показ — только если push точно не ушёл
   onError: (err) => console.warn('[notify] не показано:', err && (err.message || err.name)),
 });
 let notifyTimer = null;
@@ -5453,6 +5454,7 @@ async function NotificationsScreen() {
     screen.appendChild(backHeader('Уведомления'));
 
     screen.appendChild(await statusPanel());
+    if (pushClient.serverAllowed && pushClient.state().enabled) screen.appendChild(deliveryLog());
 
     const wrap = el('<div class="notif-list"></div>');
     NOTIF_ORDER.forEach((type) => { const r = list.find((n) => n.type === type); if (r) wrap.appendChild(card(r)); });
@@ -5528,6 +5530,34 @@ async function NotificationsScreen() {
       $$('[data-act]', p).forEach((x) => { if (x.isConnected) x.disabled = false; });
     }));
     return p;
+  }
+
+  /* Журнал доставки с сервера: почему конкретное напоминание пришло / не пришло / опоздало.
+     «Показано» — время, когда iPhone реально вывел уведомление (подтверждение от SW). */
+  function deliveryLog() {
+    const box = el('<details class="notif-log"><summary>Журнал доставки (сервер)</summary><div class="notif-log__body"><p class="notif-log__empty">Загрузка…</p></div></details>');
+    const body = $('.notif-log__body', box);
+    const hm = (iso, sec) => (iso ? new Date(iso).toLocaleTimeString('ru-RU', sec ? { hour: '2-digit', minute: '2-digit', second: '2-digit' } : { hour: '2-digit', minute: '2-digit' }) : '');
+    const lagText = (from, to) => { const m = Math.round((Date.parse(to) - Date.parse(from)) / 60000); return m <= 0 ? 'вовремя' : `+${m} мин`; };
+    box.addEventListener('toggle', async () => {
+      if (!box.open || box.dataset.loaded) return;
+      box.dataset.loaded = '1';
+      const r = await pushClient.deliveries();
+      if (!r.ok) { body.innerHTML = `<p class="notif-log__empty">${r.status === 0 ? 'Нет сети — журнал недоступен.' : 'Сервер не отдал журнал.'}</p>`; return; }
+      const list = r.data.deliveries || [];
+      if (!list.length) { body.innerHTML = '<p class="notif-log__empty">Записей пока нет.</p>'; return; }
+      body.innerHTML = list.map((d) => {
+        const T = NOTIF_TYPES[d.type] || {};
+        const when = `${new Date(d.scheduledAt).toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' })}, ${hm(d.scheduledAt)}`;
+        let res;
+        if (d.status === 'sent' && d.shownAt) res = `показано в ${hm(d.shownAt)} (${lagText(d.scheduledAt, d.shownAt)})`;
+        else if (d.status === 'sent') res = `отправлено в ${hm(d.sentAt, true)}, показ на iPhone не подтверждён`;
+        else res = d.reason + (d.errorCode && d.errorCode !== 'late' ? ` (${d.errorCode})` : '');
+        const lvl = d.status === 'sent' ? (d.shownAt && Date.parse(d.shownAt) - Date.parse(d.scheduledAt) < 5 * 60000 ? 'ok' : 'warn') : 'bad';
+        return `<div class="notif-log__row notif-log__row--${lvl}"><span>${esc(T.emoji || '🔔')} ${esc(when)}</span><span>${esc(res)}</span></div>`;
+      }).join('');
+    });
+    return box;
   }
 
   function card(r) {
