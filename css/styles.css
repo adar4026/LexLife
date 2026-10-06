@@ -2585,7 +2585,7 @@ a.sleep-last:active { background: var(--surface-2); }
   letter-spacing: -0.01em;
   color: var(--text);
 }
-.jgroup__dot { color: var(--text2); font-weight: 700; }
+.jgroup__dot { color: var(--text2); font-weight: 700; margin-right: 0.15em; }
 .jgroup__sum { white-space: nowrap; }
 .jgroup--focus .jcards { outline: 2px solid var(--blue); outline-offset: 4px; border-radius: 22px; }
 

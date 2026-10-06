@@ -14,7 +14,7 @@
    не ответившая (старый код) — перезагружается здесь, один раз, WindowClient.navigate().
    ========================================================= */
 
-const CACHE_VERSION = 'lexlife-v59';
+const CACHE_VERSION = 'lexlife-v60';
 const FONT_CACHE = 'lexlife-fonts-v1';
 /* Журнал показанных срабатываний (push/локально) — общий со страницей (js/services/occurrenceStore.js) */
 const OCC_CACHE = 'lexlife-occ-v1';
