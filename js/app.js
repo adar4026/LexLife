@@ -7,7 +7,7 @@
    ========================================================= */
 
 import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup, SleepStoreError, ActivityStoreError } from './services/storage.js';
-import { createStatsEngine, evaluateWaterPlan, waterGoalDays, getWaterStatsRange, WATER_PERIODS, formatLiters, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay, dayNum } from './services/analytics.js';
+import { createStatsEngine, evaluateWaterPlan, waterGoalDays, getWaterStatsRange, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay, dayNum } from './services/analytics.js';
 import { parseWaterMinderCsv, assignImportKeys, buildWaterImportPlan, applyWaterImportPlan, applyTodayWaterImport, isWaterMinderKey } from './services/waterImport.js';
 import { lineChart, barChart as svgBarChart } from './ui/charts.js';
 import { AttachmentService, IdbAttachmentStore, AttachmentError, ATTACHMENT_ACCEPT, ATTACHMENT_TYPES, checkAttachmentFile, formatBytes, attachmentOf, VisitAttachmentService, VISIT_FILES_DB, visitDocsOf, MAX_FILES_PER_PICK } from './services/attachments.js';
@@ -39,6 +39,8 @@ import { createPushClient, SYNC_FAIL_TEXT, SERVER_FALLBACK_MS } from './services
 import { createOccurrenceStore } from './services/occurrenceStore.js';
 import { NEW_HOME_URL, PRIMARY_URL, migrationMode, deploymentRole, serverPushAllowed } from './services/deployment.js';
 import { createUpdateController, isFormRoute, hasUnsavedInput, UPDATE_MSG } from './services/swUpdate.js';
+import { PERIOD_KINDS, PERIOD_SHORT, PERIOD_NAME, periodWindow, aggregatePeriod, niceScale, fmtGroup } from './services/metricPeriods.js';
+import { PeriodSelector, PeriodNavigator, MetricHeader, HealthBarChart } from './ui/healthChart.js';
 import { buildJournal, filterJournal, groupJournal, journalFilters, journalEmptyText, journalType, visibleDays, todayJournal, parseJournalRoute, journalRoute, JOURNAL_PAGE_DAYS } from './services/journals.js';
 
 /* Документы анализов: файлы в IndexedDB (только на этом устройстве), метаданные — в health_tests */
@@ -813,11 +815,19 @@ function flashNotifyResult(granted, onText) {
 
 async function WaterScreen() {
   const screen = el('<div></div>');
-  let period = WATER_PERIODS.includes(readEntryUi('water')) ? readEntryUi('water') : 'year'; // 'week' | 'month' | 'year' — по умолчанию «Год», как у графика
+  /* Статистика: тип периода (ДН · НЕД · МЕС · 6 МЕС · ГОД) и смещение ‹ › — в записи истории:
+     «Назад» из журнала возвращает тот же период. Прежнее значение ('week'|'month'|'year') тоже понимаем. */
+  const savedUi = readEntryUi('water');
+  let stats = savedUi && typeof savedUi === 'object' && PERIOD_KINDS.includes(savedUi.k)
+    ? { kind: savedUi.k, offset: Math.min(0, Math.trunc(savedUi.o) || 0) }
+    : { kind: PERIOD_KINDS.includes(savedUi) ? savedUi : 'week', offset: 0 };
   let editingGoal = false;
+  const statsHost = el('<section class="section hstats" aria-label="Статистика воды"></section>');
+  let segFrom = null; // сегмент до переключения — для анимации бегунка
+  let statsData = null; // { log, goal } последней отрисовки — для смены периода без перечитывания экрана
 
   async function paint() {
-    saveEntryUi('water', period); // «Назад» из журнала воды — тот же период
+    saveEntryUi('water', { k: stats.kind, o: stats.offset });
     const [log, goal, record, loggedStreak, goalStreak, hyd] = await Promise.all([
       Storage.getWaterLog(), Storage.getWaterGoal(), Storage.getWaterRecord(), Storage.getWaterLoggedStreak(), Storage.getWaterStreak(), Storage.getHydration(),
     ]);
@@ -863,21 +873,12 @@ async function WaterScreen() {
     /* 6. История за день */
     screen.appendChild(journal(dayObj.entries || [], today));
 
-    /* 7. Статистика периода: один canonical range на среднее, график, подпись и «цель выполнена».
-       Пересчитывается при каждой отрисовке — переключение периода меняет всё сразу. */
-    const range = getWaterStatsRange(period, new Date(), log);
-    const seg = el(`
-      <div class="seg" style="margin-top:14px">
-        <button class="seg__btn ${period === 'week' ? 'is-active' : ''}" data-p="week" type="button">Неделя</button>
-        <button class="seg__btn ${period === 'month' ? 'is-active' : ''}" data-p="month" type="button">Месяц</button>
-        <button class="seg__btn ${period === 'year' ? 'is-active' : ''}" data-p="year" type="button">Год</button>
-      </div>
-    `);
-    seg.addEventListener('click', (e) => { const b = e.target.closest('[data-p]'); if (b) { period = b.dataset.p; paint(); } });
-    screen.appendChild(seg);
-    const chartSec = barChart(metricSeries(log, period, 'water', range), goal);
-    $('.card', chartSec).prepend(averageHero(range)); // крупное среднее — над графиком, в том же блоке
-    screen.appendChild(chartSec);
+    /* 7. Статистика периода (Apple Health по структуре): ДН · НЕД · МЕС · 6 МЕС · ГОД, среднее,
+       диапазон, ‹ ›, график с осью Y и целью. Один и тот же период — у среднего, графика,
+       подписи и «цель выполнена, дней» ниже. */
+    statsData = { log, goal };
+    screen.appendChild(statsHost);
+    paintStats();
 
     /* 8. Статистика */
     const L = (ml) => fmtNum(Math.round(ml / 100) / 10);
@@ -889,11 +890,67 @@ async function WaterScreen() {
       </div>
     `));
     screen.appendChild(el('<p class="plan-hint" style="margin:0 0 14px">Текущая серия — дни подряд по сегодня с итогом не меньше цели. Пока сегодня цель не выполнена, серия считается по вчера.</p>'));
-    screen.appendChild(goalPeriodStats(log, goal, range));
+    screen.appendChild(goalStatsHost);
 
     /* 9. Настройки напоминаний (тумблер = правило «Вода» центра уведомлений) */
     const waterRule = (await Storage.getNotifications()).find((n) => n.type === 'water') || null;
     screen.appendChild(reminderSettings(hyd, waterRule));
+  }
+
+  const goalStatsHost = el('<div></div>');
+  /* Блок статистики: перерисовывается сам (смена периода, ‹ ›), остальной экран не трогается */
+  function paintStats() {
+    const { log, goal } = statsData;
+    saveEntryUi('water', { k: stats.kind, o: stats.offset });
+    const today = dateKey();
+    const win = periodWindow(stats.kind, stats.offset, today);
+    const agg = aggregatePeriod(win, (d) => {
+      const o = log[d];
+      return o && typeof o.total === 'number' ? Math.max(0, o.total) : null;
+    }, { hourValues: waterByHour });
+    const isDay = win.kind === 'day';
+    const scale = niceScale(agg.max, isDay ? null : goal);
+    const ml = (v) => `${fmtGroup(v)} мл`;
+    const tip = (b) => (isDay ? { title: b.tip, value: ml(b.value) }
+      : win.kind === 'week' ? { title: b.tip, value: ml(b.value) }
+        : { title: b.tip, value: `в среднем ${fmtGroup(b.value)} мл/день` });
+    const shift = (d) => { stats = { ...stats, offset: Math.min(0, stats.offset + d) }; paintStats(); };
+
+    statsHost.innerHTML = '';
+    const segFromNow = segFrom;
+    segFrom = null;
+    statsHost.appendChild(PeriodSelector({
+      kinds: PERIOD_KINDS.map((k) => ({ id: k, label: PERIOD_SHORT[k], title: PERIOD_NAME[k] })),
+      active: win.kind,
+      onChange: (k) => { segFrom = stats.kind; stats = { kind: k, offset: 0 }; paintStats(); },
+      prev: segFromNow,
+    }));
+    statsHost.appendChild(MetricHeader({
+      caption: isDay ? 'Всего' : 'В среднем',
+      value: fmtGroup(isDay ? agg.total : agg.average),
+      unit: 'мл', // как в Apple Health: «В СРЕДНЕМ 1 375 мл»; «в день» — в подсказке столбца
+      range: win.range,
+      nav: PeriodNavigator({ hasNext: win.hasNext, onPrev: () => shift(-1), onNext: () => shift(1) }),
+    }));
+    statsHost.appendChild(HealthBarChart({
+      buckets: agg.buckets, scale, goal: isDay ? null : goal, goalLabel: `цель ${fmtGroup(goal)}`,
+      yFormat: fmtGroup, tip, compact: win.kind === 'year', ariaLabel: `Вода, ${PERIOD_NAME[win.kind]}: ${win.range}`,
+      emptyText: isDay ? 'В этот день записей нет' : 'Нет записей за период',
+    }));
+    if (isDay && log[win.start] && (log[win.start].entries || []).length === 0 && log[win.start].total > 0) {
+      statsHost.appendChild(el('<p class="hstats__note">Итог дня без разбивки по времени — по часам не показан.</p>'));
+    }
+    goalStatsHost.innerHTML = '';
+    goalStatsHost.appendChild(goalPeriodStats(log, goal, { dayKeys: win.dayKeys, label: PERIOD_NAME[win.kind], startDate: win.start, endDate: win.effEnd }));
+  }
+  /* приёмы дня по часам (фактическое время записи) */
+  function waterByHour(d) {
+    const out = new Array(24).fill(0);
+    for (const e of ((statsData && statsData.log[d]) || {}).entries || []) {
+      const hr = Number(String(e.t || '').slice(0, 2));
+      if (Number.isInteger(hr) && hr >= 0 && hr < 24 && typeof e.ml === 'number') out[hr] += Math.max(0, e.ml);
+    }
+    return out;
   }
 
   /* План гидратации (фиксированные слоты) — только ориентир. Статус порции считается по
@@ -1042,22 +1099,9 @@ async function WaterScreen() {
     return sec;
   }
 
-  /* Крупное среднее периода над графиком (Apple Health по смыслу, типографика LexLife).
-     Значение — средний суточный объём canonical range: сумма за диапазон / календарные дни
-     диапазона, дни без записей = 0, будущие дни в диапазон не входят. */
-  function averageHero(range) {
-    return el(`
-      <div class="wavg">
-        <div class="wavg__cap">В среднем</div>
-        <div class="wavg__val">${esc(formatLiters(range.average))}<span class="wavg__unit">л/день</span></div>
-        <div class="wavg__range">${esc(fmtDateRange(range.startDate, range.endDate))}</div>
-      </div>
-    `);
-  }
-
   /* Выполнение цели за выбранный период: всего дней с целью (не обязательно подряд) и лучшая серия.
      Дни периода — те же range.dayKeys, по которым построены график и среднее. Диапазон уже
-     показан над графиком (averageHero) — здесь не дублируется, только сами цифры периода.
+     показан над графиком (MetricHeader) — здесь не дублируется, только сами цифры периода.
      Пересчитывается из журнала при каждой отрисовке — после добавления, правки, переноса и удаления. */
   function goalPeriodStats(log, goal, rng) {
     const keys = rng.dayKeys;

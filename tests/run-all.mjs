@@ -12,6 +12,7 @@ const run = [
   ['visit-kinds.test.mjs', 'Asia/Tokyo'], ['visit-kinds.test.mjs', 'America/Los_Angeles'], ['visit-kinds.test.mjs', 'Europe/Madrid'], // поиск и относительное время — явные даты, но проверяем независимость от TZ процесса
   ['meds.test.mjs', 'America/Los_Angeles'], ['meds.test.mjs', 'Asia/Tokyo'], ['meds.test.mjs', 'Europe/Madrid'], // локальный день приёма
   ['sleep.test.mjs', 'Europe/Madrid'], ['sleep.test.mjs', 'America/Los_Angeles'], ['sleep.test.mjs', 'Asia/Tokyo'], ['sleep.test.mjs', 'UTC'], // день пробуждения, CET/CEST
+  ['metric-periods.test.mjs', 'Europe/Madrid'], ['metric-periods.test.mjs', 'America/Los_Angeles'], ['metric-periods.test.mjs', 'Pacific/Kiritimati'], // статистика ДН/НЕД/МЕС/6 МЕС/ГОД: локальный календарь
   ['journals.test.mjs', 'Europe/Madrid'], ['journals.test.mjs', 'America/Los_Angeles'], ['journals.test.mjs', 'Pacific/Kiritimati'], // «Все журналы»: дни записей — локальный календарь
   ['activity.test.mjs', 'Europe/Madrid'], ['activity.test.mjs', 'America/Los_Angeles'], ['activity.test.mjs', 'Asia/Tokyo'], ['activity.test.mjs', 'UTC'], // шаги/дистанция/велосипед: локальные дни, периоды, миграция
   ['history-import.test.mjs', 'Europe/Madrid'], ['history-import.test.mjs', 'America/Los_Angeles'], ['history-import.test.mjs', 'Asia/Tokyo'], // локальные даты истории

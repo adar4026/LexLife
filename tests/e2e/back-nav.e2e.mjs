@@ -208,7 +208,7 @@ export async function run({ keep = false } = {}) {
 
     /* ---------- 6. прокрутка и состояние экрана ---------- */
     await go('#/metric/water');
-    $('#screen [data-p="month"]').click();
+    $('#screen .hseg__btn[data-k="month"]').click();
     await sleep(300);
     window.scrollTo(0, 260);
     await sleep(400); // прокрутка сохраняется в запись с задержкой 250 мс
@@ -220,7 +220,7 @@ export async function run({ keep = false } = {}) {
     await sleep(300);
     await back('#/metric/water');
     await sleep(200);
-    check('6a. Вода после возврата: прежний период «Месяц»', $('#screen [data-p="month"]').classList.contains('is-active'));
+    check('6a. Вода после возврата: прежний период «Месяц»', $('#screen .hseg__btn[data-k="month"]').getAttribute('aria-selected') === 'true');
     check('6b. Вода после возврата: прежнее место прокрутки', y0 > 100 ? Math.abs(window.scrollY - y0) < 4 : true, `было ${y0}, стало ${window.scrollY}`);
 
     await go('#/calendar');

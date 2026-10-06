@@ -1252,23 +1252,7 @@ body.is-scroll-locked {
 .wqbar__fab:active { filter: brightness(0.9); }
 .wdel { background: none; border: 0; color: var(--text2); font-size: 15px; padding: 4px 8px; flex-shrink: 0; }
 
-/* Крупное среднее выбранного периода над графиком (модуль воды) */
-.wavg { margin: 0 0 14px; }
-.wavg__cap { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text2); }
-.wavg__val {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  margin-top: 2px;
-  font-size: 40px;
-  line-height: 1.05;
-  font-weight: 800;
-  font-family: var(--font-head);
-  letter-spacing: -0.02em;
-}
-.wavg__unit { font-size: 15px; font-weight: 700; font-family: inherit; color: var(--text2); letter-spacing: 0; }
-.wavg__range { font-size: 12px; color: var(--text2); margin-top: 4px; }
-@media (max-width: 360px) { .wavg__val { font-size: 34px; } }
+/* Крупное среднее выбранного периода — блок статистики .hstats / .hhead (js/ui/healthChart.js) */
 
 /* План гидратации + настройки напоминаний */
 .plan-row { gap: 10px; }
@@ -2678,3 +2662,162 @@ a.sleep-last:active { background: var(--surface-2); }
 /* диалог правки с «Удалить»: «Отмена · Сохранить» в ряд, «Удалить» — отдельной строкой ниже */
 .dialog__actions:not(.dialog__actions--stack):has(> .dialog__btn:nth-child(3)):has(> .dialog__btn--danger) { flex-wrap: wrap; }
 .dialog__actions:not(.dialog__actions--stack):has(> .dialog__btn:nth-child(3)) > .dialog__btn--danger { order: 3; flex-basis: 100%; }
+
+/* =========================================================
+   Статистика показателя в духе Apple Health (js/ui/healthChart.js): компактный системный
+   segmented control, «В СРЕДНЕМ» + число + диапазон, тихие ‹ ›, график без карточки —
+   тонкая сетка, пунктирные разделители, правая ось Y, лёгкая линия цели, подсказка столбца.
+   Число — системный округлый шрифт (SF Rounded на Apple), не Unbounded: акцент, но не давит
+   на график. Цвета — токены --hc-* (тёмная тема — :root, светлая — [data-theme="light"]).
+   ========================================================= */
+:root {
+  --hc-seg-bg: rgba(118, 118, 128, 0.24);
+  --hc-seg-on: #636366;
+  --hc-seg-ink: var(--text);
+  --hc-seg-on-ink: var(--text);
+  --hc-seg-shadow: 0 2px 6px rgba(0, 0, 0, 0.28);
+  --hc-nav-bg: rgba(118, 118, 128, 0.16);
+  --hc-nav-ink: var(--text2);
+  --hc-grid: rgba(235, 235, 245, 0.08);
+  --hc-sep: rgba(235, 235, 245, 0.14);
+  --hc-bar: var(--blue);
+  --hc-goal: color-mix(in srgb, var(--orange) 72%, transparent);
+  --hc-guide: rgba(235, 235, 245, 0.35);
+  --hc-tip-bg: #2c2c2e;
+  --hc-tip-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+  --hc-num-font: ui-rounded, "SF Pro Rounded", var(--font-system);
+}
+[data-theme="light"] {
+  --hc-seg-bg: rgba(118, 118, 128, 0.12);
+  --hc-seg-on: var(--surface);
+  --hc-seg-shadow: 0 2px 6px rgba(0, 0, 0, 0.1), 0 0 0 0.5px rgba(0, 0, 0, 0.04);
+  --hc-nav-bg: rgba(118, 118, 128, 0.09);
+  --hc-grid: rgba(60, 60, 67, 0.08);
+  --hc-sep: rgba(60, 60, 67, 0.16);
+  --hc-guide: rgba(60, 60, 67, 0.3);
+  --hc-tip-bg: var(--surface);
+  --hc-tip-shadow: 0 4px 14px rgba(0, 0, 0, 0.1), 0 0 0 0.5px rgba(0, 0, 0, 0.05);
+}
+.hstats { margin-top: 30px; }
+
+/* segmented control: капсула 32px, светлый «бегунок» переезжает на выбранный сегмент */
+.hseg { --hseg-n: 5; position: relative; display: flex; padding: 2px; border-radius: 9px; background: var(--hc-seg-bg); }
+.hseg__thumb {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 2px;
+  width: calc((100% - 4px) / var(--hseg-n));
+  border-radius: 7px;
+  background: var(--hc-seg-on);
+  box-shadow: var(--hc-seg-shadow);
+  pointer-events: none;
+}
+.hseg--anim .hseg__thumb { transition: transform 0.26s cubic-bezier(0.25, 0.8, 0.25, 1); }
+.hseg__btn {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 28px;
+  padding: 0 2px;
+  border: 0;
+  background: transparent;
+  color: var(--hc-seg-ink);
+  font-family: var(--font-system);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.hseg__btn[aria-selected="true"] { color: var(--hc-seg-on-ink); font-weight: 650; }
+
+/* заголовок: подпись · число + единица · диапазон; ‹ › — тихие вторичные кнопки справа */
+.hhead { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; margin: 16px 2px 12px; }
+.hhead__main { min-width: 0; }
+.hhead__cap { font-family: var(--font-system); font-size: 12.5px; font-weight: 600; letter-spacing: 0.03em; line-height: 1.3; text-transform: uppercase; color: var(--text2); }
+.hhead__val { display: flex; align-items: baseline; column-gap: 4px; white-space: nowrap; }
+.hhead__num { font-family: var(--hc-num-font); font-size: 34px; font-weight: 700; line-height: 1.12; letter-spacing: -0.01em; color: var(--text); font-variant-numeric: tabular-nums; }
+.hhead__unit { font-family: var(--hc-num-font); font-size: 17px; font-weight: 600; color: var(--text2); }
+.hhead__range { margin-top: 1px; font-family: var(--font-system); font-size: 14.5px; font-weight: 500; line-height: 1.3; color: var(--text2); }
+.hnav { display: flex; gap: 8px; flex-shrink: 0; padding-bottom: 1px; }
+.hnav__btn {
+  position: relative;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--hc-nav-bg);
+  color: var(--hc-nav-ink);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.hnav__btn::after { content: ''; position: absolute; inset: -7px; } /* зона касания 44px при маленькой кнопке */
+.hnav__btn svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+.hnav__btn:disabled { opacity: 0.35; cursor: default; }
+
+/* график */
+.hc { --hc-axis: 40px; --hc-h: 236px; position: relative; user-select: none; -webkit-user-select: none; }
+.hc__area { display: flex; }
+.hc__plot {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: var(--hc-h);
+  border-left: 1px solid var(--hc-grid);
+  border-right: 1px solid var(--hc-sep);
+  touch-action: pan-y;
+}
+.hc__axis { position: relative; width: var(--hc-axis); flex-shrink: 0; height: var(--hc-h); }
+.hc__tick { position: absolute; left: 6px; transform: translateY(50%); font-family: var(--font-system); font-size: 11.5px; font-weight: 500; color: var(--text2); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.hc__grid { position: absolute; left: 0; right: 0; height: 0; border-top: 1px solid var(--hc-grid); }
+.hc__grid--base { border-top-color: var(--hc-sep); }
+.hc__sep { position: absolute; top: 0; bottom: 0; width: 0; border-left: 1px dashed var(--hc-sep); }
+.hc__goal { position: absolute; left: 0; right: 0; height: 0; border-top: 1px dashed var(--hc-goal); z-index: 2; pointer-events: none; }
+.hc__goal-lbl { position: absolute; right: 3px; bottom: 2px; padding: 0 3px; border-radius: 4px; font-family: var(--font-system); font-size: 10.5px; font-weight: 500; color: var(--hc-goal); background: color-mix(in srgb, var(--bg) 82%, transparent); white-space: nowrap; }
+.hc__bars { position: absolute; inset: 0; display: flex; z-index: 1; }
+.hc__col { flex: 1; min-width: 0; height: 100%; display: flex; align-items: flex-end; justify-content: center; padding: 0; border: 0; background: none; cursor: pointer; }
+.hc__col:disabled { cursor: default; }
+.hc__col:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; border-radius: 6px; }
+.hc__bar { width: 54%; max-width: 26px; height: 0; background: var(--hc-bar); border-radius: 4px 4px 0 0; transition: height 0.32s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.15s ease; }
+.hc--dense .hc__bar { width: 48%; border-radius: 2px 2px 0 0; } /* день: 24 часа — тоньше, без тяжести */
+.hc--sel .hc__col:not(.is-sel) .hc__bar { opacity: 0.35; }
+.hc__guide { position: absolute; top: -6px; bottom: 0; width: 0; border-left: 1px solid var(--hc-guide); z-index: 0; pointer-events: none; }
+.hc__tip {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: var(--hc-tip-bg);
+  box-shadow: var(--hc-tip-shadow);
+  pointer-events: none;
+  white-space: nowrap;
+}
+.hc__tip[hidden], .hc__guide[hidden] { display: none; }
+/* выбран столбец — подсказка встаёт на место заголовка периода (как в Apple Health) */
+.hstats:has(.hc--sel) .hhead { visibility: hidden; }
+.hc__tip-title { font-family: var(--font-system); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; color: var(--text2); }
+.hc__tip-val { font-family: var(--hc-num-font); font-size: 17px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+.hc__x { display: grid; grid-template-columns: repeat(var(--hc-n), minmax(0, 1fr)); margin: 5px var(--hc-axis) 0 0; }
+.hc__xl { padding-left: 3px; font-family: var(--font-system); font-size: 11.5px; font-weight: 500; color: var(--text2); white-space: nowrap; overflow: visible; }
+.hc--compact .hc__xl { padding-left: 0; text-align: center; font-size: 10.5px; } /* год: 12 трёхбуквенных подписей по центру столбцов */
+.hc__xl-short { display: none; }
+@media (max-width: 340px) { /* крайний запасной вариант — буквы */
+  .hc--compact .hc__xl-full { display: none; }
+  .hc--compact .hc__xl-short { display: inline; }
+}
+.hc__empty { position: absolute; inset: 0; display: grid; place-items: center; margin: 0; font-size: 14px; color: var(--text2); pointer-events: none; z-index: 2; }
+.hstats__note { margin: 8px 2px 0; font-size: 12px; color: var(--text2); }
+@media (max-width: 380px) {
+  .hc { --hc-axis: 38px; --hc-h: 220px; }
+  .hseg__btn { font-size: 12.5px; }
+  .hhead__num { font-size: 32px; }
+}

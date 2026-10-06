@@ -14,7 +14,7 @@
    не ответившая (старый код) — перезагружается здесь, один раз, WindowClient.navigate().
    ========================================================= */
 
-const CACHE_VERSION = 'lexlife-v60';
+const CACHE_VERSION = 'lexlife-v61';
 const FONT_CACHE = 'lexlife-fonts-v1';
 /* Журнал показанных срабатываний (push/локально) — общий со страницей (js/services/occurrenceStore.js) */
 const OCC_CACHE = 'lexlife-occ-v1';
@@ -53,7 +53,9 @@ const APP_SHELL = [
   './js/services/visitKinds.js',
   './js/services/historyImport.js',
   './js/services/journals.js',
+  './js/services/metricPeriods.js',
   './js/ui/charts.js',
+  './js/ui/healthChart.js',
   './js/ui/docViewer.js',
   './js/ui/bottomNav.js',
   './js/ui/backNav.js',
