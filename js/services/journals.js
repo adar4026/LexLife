@@ -2,7 +2,8 @@
    js/services/journals.js — «Все журналы»: единое представление записей всех показателей.
 
    Источник данных не меняется и не копируется: провайдер каждого типа читает уже существующие
-   ключи (metrics_log.water, sleep_log, steps_log, bike_log, metrics_log.<точечный показатель>)
+   ключи (metrics_log.water, sleep_log, steps_log, bike_log, metrics_log.<точечный показатель>,
+   waist_log, workouts_log)
    и при чтении превращает их в одинаковые элементы журнала. Отдельного постоянного хранилища,
    миграции и изменений формата копии нет.
 
@@ -22,6 +23,8 @@
 import { fmtActivityValue, activityUnit, fmtKmApprox, stepsToKm, STEPS_SOURCES, LEGACY_ACTIVITY_SOURCE, isActivityDay } from './activity.js';
 import { formatSleepDuration, stampTime, isSleepDay } from './sleep.js';
 import { isWaterMinderKey } from './waterImport.js';
+import { waistPoints, fmtWaist } from './waist.js';
+import { sortWorkouts, workoutTitle, workoutValue, workoutSub, isWorkoutDay } from './workouts.js';
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -52,6 +55,7 @@ const fmtMl = (ml) => `${fmtInt(ml)}${NB}мл`;
 const plRecords = (n) => `${n}${NB}${plural(n, 'запись', 'записи', 'записей')}`;
 const plMeasures = (n) => `${n}${NB}${plural(n, 'измерение', 'измерения', 'измерений')}`;
 const plRides = (n) => `${n}${NB}${plural(n, 'поездка', 'поездки', 'поездок')}`;
+const plWorkouts = (n) => `${n}${NB}${plural(n, 'тренировка', 'тренировки', 'тренировок')}`;
 
 /* ---------- дни ---------- */
 const MONTHS_GEN = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
@@ -179,9 +183,33 @@ const pressureFmt = (v) => (isObj(v) && isNum(v.systolic) && isNum(v.diastolic) 
 /* итог дня одного точечного показателя: одно значение — само значение, несколько — «N измерений» */
 const pointSummary = (items) => (items.length === 1 ? items[0].value : plMeasures(items.length));
 
+/* Обхват талии: одно измерение за день (waist_log), времени нет */
+function collectWaist(data) {
+  const log = isObj(data.waist) ? data.waist : {};
+  return waistPoints(log).map(({ date, cm }) => {
+    const e = log[date];
+    return {
+      id: `waist:${date}`, type: 'waist', date, time: null, seq: 0,
+      title: 'Обхват талии', value: fmtWaist(cm), sub: typeof e.note === 'string' ? e.note : '',
+      amount: cm, progress: null, ref: { date, entry: e },
+    };
+  });
+}
+
+/* Тренировки: каждая запись — отдельный элемент (Планка / название упражнения); времени нет,
+   в пределах дня позже добавленная — выше */
+function collectWorkouts(data) {
+  const list = sortWorkouts(Array.isArray(data.workouts) ? data.workouts.filter((w) => isObj(w) && isWorkoutDay(w.date)) : []);
+  return list.map((w, i) => ({
+    id: `workout:${w.id}`, type: 'workout', date: w.date, time: null, seq: list.length - i,
+    title: workoutTitle(w), value: workoutValue(w), sub: workoutSub(w),
+    amount: null, progress: null, ref: { id: w.id, date: w.date, workout: w },
+  }));
+}
+
 /* Порядок — порядок фильтров. always — тип ведётся журналом (есть «Добавить»), его фильтр
    виден и без записей; остальные — только когда у пользователя есть записи этого типа.
-   «Ходьбы» и «Талии» в LexLife нет (ходьба — это «Шаги»): типов без данных не выдумываем,
+   «Ходьбы» в LexLife нет (ходьба — это «Шаги»): типов без данных не выдумываем,
    новый тип — новая запись здесь. */
 export const JOURNAL_TYPES = [
   { id: 'water', label: 'Вода', icon: 'water', always: true, emptyText: 'Нет записей воды', collect: collectWater,
@@ -196,7 +224,10 @@ export const JOURNAL_TYPES = [
       const km = items.filter((x) => isNum(x.amount));
       return km.length ? `${fmtActivityValue('bike', Math.round(km.reduce((s, x) => s + x.amount, 0) * 100) / 100)}${NB}км` : plRides(items.length);
     } },
+  { id: 'workout', label: 'Тренировки', icon: 'workout', emptyText: 'Пока нет тренировок', collect: collectWorkouts,
+    summary: (items) => plWorkouts(items.length) },
   { id: 'weight', label: 'Вес', icon: 'weight', emptyText: 'Нет записей веса', collect: pointCollector('weight', 'Вес', single('кг')), summary: pointSummary },
+  { id: 'waist', label: 'Талия', icon: 'waist', emptyText: 'Пока нет измерений', collect: collectWaist, summary: pointSummary },
   { id: 'pressure', label: 'Давление', icon: 'pressure', emptyText: 'Нет записей давления', collect: pointCollector('pressure', 'Давление', pressureFmt),
     summary: (items) => plMeasures(items.length) },
   { id: 'pulse', label: 'Пульс', icon: 'pulse', emptyText: 'Нет записей пульса', collect: pointCollector('pulse', 'Пульс', single('уд/мин', 0)), summary: pointSummary },
@@ -220,7 +251,7 @@ export function compareInDay(a, b) {
   return b.seq - a.seq;
 }
 
-/* data: { metricsLog, sleep, steps, bike }; ctx: { waterGoal, sleepGoal } → все элементы */
+/* data: { metricsLog, sleep, steps, bike, waist, workouts }; ctx: { waterGoal, sleepGoal } → все элементы */
 export function buildJournal(data = {}, ctx = {}, types = JOURNAL_TYPES) {
   const out = [];
   for (const t of types) {

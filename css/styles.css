@@ -2610,6 +2610,8 @@ a.sleep-last:active { background: var(--surface-2); }
 .jcard__icon--weight { color: var(--hm-weight); background: color-mix(in srgb, var(--hm-weight) 14%, transparent); }
 .jcard__icon--pressure { color: var(--hm-bp); background: color-mix(in srgb, var(--hm-bp) 14%, transparent); }
 .jcard__icon--pulse, .jcard__icon--temperature, .jcard__icon--spo2 { color: var(--hm-pulse); background: color-mix(in srgb, var(--hm-pulse) 14%, transparent); }
+.jcard__icon--waist { color: var(--hm-weight); background: color-mix(in srgb, var(--hm-weight) 14%, transparent); }
+.jcard__icon--workout { color: var(--hm-bike); background: color-mix(in srgb, var(--hm-bike) 14%, transparent); }
 .jcard__body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .jcard__title { font-size: 15.5px; font-weight: 800; line-height: 1.25; overflow-wrap: anywhere; }
 .jcard__sub { font-size: 13.5px; font-weight: 600; color: var(--text2); line-height: 1.3; overflow-wrap: anywhere; }
@@ -2823,3 +2825,19 @@ a.sleep-last:active { background: var(--surface-2); }
   .hseg__btn { font-size: 12.5px; }
   .hhead__num { font-size: 32px; }
 }
+
+/* =========================================================
+   Обхват талии (#/metric/waist) и «Тренировки» (#/workouts) — только существующие
+   токены и компоненты: шапка «Сна» (кнопка справа), .hseg / .hhead / .hnav статистики воды,
+   .card, .sgrid, карточки журнала. Новых цветов нет.
+   ========================================================= */
+.hdr-add { background: none; border: 0; padding: 0; font: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.hdr-add .hi { stroke-width: 2.2; }
+.waist-card { margin-top: 2px; padding: 12px 12px 14px; }
+.waist-period { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 2px 4px; }
+.waist-period__range { min-width: 0; font-size: 13px; font-weight: 600; color: var(--text2); overflow-wrap: anywhere; }
+.waist-chart__empty { margin: 22px 0 18px; text-align: center; }
+.waist-grid { grid-template-columns: 1fr 1fr; }
+.waist-empty .med-empty__icon { color: var(--hm-weight); }
+.workouts-empty .med-empty__icon { color: var(--hm-bike); }
+.workouts .jtools { margin-top: 4px; }

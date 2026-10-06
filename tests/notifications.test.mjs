@@ -297,7 +297,7 @@ const loadSw = () => loadServiceWorker({ scope: 'https://example.test/LexLife/' 
 
 test('sw.js: CACHE_VERSION поднят, новые модули в APP_SHELL, старые кэши удаляются, данные не трогаются', () => {
   const src = readFileSync(new URL('../sw.js', import.meta.url), 'utf8');
-  assert.match(src, /const CACHE_VERSION = 'lexlife-v62';/);
+  assert.match(src, /const CACHE_VERSION = 'lexlife-v63';/);
   for (const m of ['notifySchedule', 'notifier', 'zonedSchedule', 'pushClient', 'occurrenceStore', 'deployment', 'sleep', 'activity']) assert.match(src, new RegExp(`'\\./js/services/${m}\\.js'`), m);
   assert.match(src, /APP_CACHE_RE\.test\(k\) && k !== CACHE_VERSION/); // только кэши оболочки прежних версий (подробно — tests/sw-update.test.mjs)
   assert.match(src, /startsWith\(new URL\(self\.registration\.scope\)\.pathname \+ 'api\/'\)/, 'API не кэшируется SW');

@@ -15,6 +15,8 @@ import {
   ACTIVITY_METRICS, ACTIVITY_NOTE_MAX, isValidStepsLog, isValidBikeLog, isValidActivityMigration,
   isValidStepsEntry, isValidRide, migrateLegacyActivity, sortRides,
 } from './activity.js';
+import { isValidWaistLog, isValidWaistEntry, WAIST_NOTE_MAX } from './waist.js';
+import { isValidWorkoutsLog, isValidWorkoutsMigration, isValidWorkout, migrateLegacyWorkouts, sortWorkouts, WORKOUT_NOTE_MAX } from './workouts.js';
 
 const APP_ID = 'lexlife';
 /* Старые бэкапы (экспортированные до ребрендинга) помечены прежним app id —
@@ -49,6 +51,9 @@ export const KEYS = {
   stepsLog: 'steps_log',        // шаги: { "ГГГГ-ММ-ДД": { steps, note, source, … } } — один итог за день, вся ходьба (services/activity.js)
   bikeLog: 'bike_log',          // велосипед: [{ id, date, time, km, minutes, note, source, … }] — поездки, итог дня = сумма km
   activityMigration: 'activity_migration', // отметка однократного переноса из activity_days (входит в бэкап)
+  waistLog: 'waist_log',        // обхват талии: { "ГГГГ-ММ-ДД": { cm, … } } — одно измерение за день (services/waist.js)
+  workoutsLog: 'workouts_log',  // тренировки: [{ id, date, kind: 'plank'|'other', … }] — Планка и «Другое упражнение» (services/workouts.js)
+  workoutsMigration: 'workouts_migration', // отметка однократного переноса планки/«другого» из activity_days (входит в бэкап)
 };
 
 /* Ключи с пользовательскими данными (для бэкапа/очистки) — без служебного meta */
@@ -56,6 +61,7 @@ const DATA_KEYS = [
   KEYS.alerts, KEYS.tests, KEYS.meds, KEYS.visits, KEYS.metrics, KEYS.metricsLog, KEYS.profile, KEYS.hydration, KEYS.notifications,
   KEYS.activityDays, KEYS.activityGoals, KEYS.medLog, KEYS.medIntakes, KEYS.sleepLog, KEYS.sleepSettings,
   KEYS.stepsLog, KEYS.bikeLog, KEYS.activityMigration,
+  KEYS.waistLog, KEYS.workoutsLog, KEYS.workoutsMigration,
 ];
 
 /* UI-настройка темы: хранится строкой (не JSON), живёт вне DATA_KEYS, но входит в бэкап (settings.theme) */
@@ -85,6 +91,7 @@ const KEY_LABELS = {
   [KEYS.medIntakes]: 'Приёмы лекарств', [KEYS.sleepLog]: 'Сон', [KEYS.sleepSettings]: 'Настройки сна',
   [KEYS.stepsLog]: 'Шаги', [KEYS.bikeLog]: 'Велосипед',
   [KEYS.activityMigration]: 'Перенос активности',
+  [KEYS.waistLog]: 'Обхват талии', [KEYS.workoutsLog]: 'Тренировки', [KEYS.workoutsMigration]: 'Перенос тренировок',
 };
 
 /* Ошибка бэкапа с кодом — UI показывает message как есть */
@@ -110,6 +117,16 @@ export class ActivityStoreError extends Error {
   constructor(code, message, existing = null) {
     super(message);
     this.name = 'ActivityStoreError';
+    this.code = code;
+    this.existing = existing;
+  }
+}
+
+/* Ошибка сохранения талии / тренировки: DUPLICATE_DATE (existing — измерение этой даты) | NOT_FOUND | INVALID | NO_SPACE */
+export class EntryStoreError extends Error {
+  constructor(code, message, existing = null) {
+    super(message);
+    this.name = 'EntryStoreError';
     this.code = code;
     this.existing = existing;
   }
@@ -486,6 +503,9 @@ const KEY_VALIDATORS = {
   [KEYS.stepsLog]: isValidStepsLog,
   [KEYS.bikeLog]: isValidBikeLog,
   [KEYS.activityMigration]: isValidActivityMigration,
+  [KEYS.waistLog]: isValidWaistLog,
+  [KEYS.workoutsLog]: isValidWorkoutsLog,
+  [KEYS.workoutsMigration]: isValidWorkoutsMigration,
 };
 
 /* Проверка набора данных финальной схемы; бросает BackupError с названием раздела */
@@ -517,6 +537,8 @@ function summarize(data) {
     sleep: Array.isArray(data[KEYS.sleepLog]) ? data[KEYS.sleepLog].length : 0,
     steps: Object.keys(data[KEYS.stepsLog] || {}).length,
     bike: Array.isArray(data[KEYS.bikeLog]) ? data[KEYS.bikeLog].length : 0,
+    waist: Object.keys(data[KEYS.waistLog] || {}).length,
+    workouts: Array.isArray(data[KEYS.workoutsLog]) ? data[KEYS.workoutsLog].length : 0,
   };
 }
 
@@ -789,6 +811,7 @@ export class StorageService {
     if ((await this._read(KEYS.sleepSettings, null)) == null) await this._write(KEYS.sleepSettings, defaultSleepSettings());
     await this._ensureActivityKeys();
     await this._migrateActivity();
+    await this._migrateWorkouts();
     return this;
   }
 
@@ -796,6 +819,9 @@ export class StorageService {
   async _ensureActivityKeys() {
     if ((await this._read(KEYS.stepsLog, null)) == null) await this._write(KEYS.stepsLog, {});
     if ((await this._read(KEYS.bikeLog, null)) == null) await this._write(KEYS.bikeLog, []);
+    /* талия и тренировки — такие же аддитивные разделы */
+    if ((await this._read(KEYS.waistLog, null)) == null) await this._write(KEYS.waistLog, {});
+    if ((await this._read(KEYS.workoutsLog, null)) == null) await this._write(KEYS.workoutsLog, []);
   }
 
   /* Однократный перенос старой «Активности» (activity_days) в steps_log / bike_log.
@@ -816,6 +842,22 @@ export class StorageService {
       if (!(await this._write(KEYS.bikeLog, res.bikeLog))) return null;
     }
     if (!(await this._write(KEYS.activityMigration, res.marker))) return null;
+    return res.marker;
+  }
+
+  /* Однократный перенос Планки и «Другого упражнения» из activity_days в workouts_log —
+     так же, как _migrateActivity: отметка workouts_migration пишется последней и только после
+     успешной записи; есть отметка → ничего не делается (удалённое не возвращается); прерванный
+     перенос повторяется без дублей (детерминированные id). activity_days не изменяется.
+     → отметка | null (перенос уже был / не удалось записать) */
+  async _migrateWorkouts() {
+    if ((await this._read(KEYS.workoutsMigration, null)) != null) return null;
+    const res = migrateLegacyWorkouts({
+      activityDays: await this._read(KEYS.activityDays, {}),
+      workoutsLog: await this._read(KEYS.workoutsLog, []),
+    }, { now: nowISO() });
+    if (res.changed && !(await this._write(KEYS.workoutsLog, res.workoutsLog))) return null;
+    if (!(await this._write(KEYS.workoutsMigration, res.marker))) return null;
     return res.marker;
   }
 
@@ -1533,6 +1575,106 @@ export class StorageService {
     return metric === 'bike' ? this.getBikeRides() : this.getDailyActivityLog(metric);
   }
 
+  /* ---- Обхват талии (waist_log, services/waist.js) ----
+     Одно измерение за день. Запись идёт через ту же очередь, что шаги/велосипед (_serialActivity):
+     два быстрых сохранения не затирают друг друга. */
+  async getWaistLog() {
+    const v = await this._read(KEYS.waistLog, {});
+    return isPlainObj(v) ? v : {};
+  }
+  /* Сохранить измерение. value — normalizeWaistInput(…).value ({ date, cm }).
+     from — дата редактируемого измерения: другая дата → перенос одной записью.
+     Дата занята другим измерением → EntryStoreError DUPLICATE_DATE (existing), пока вызывающий
+     не подтвердит замену (overwrite: true). createdAt / source / note остаются при правке и переносе.
+     → { date, entry } */
+  async saveWaist(value, { from = null, overwrite = false } = {}) {
+    return this._serialActivity(async () => {
+      const log = { ...(await this.getWaistLog()) };
+      const date = value && value.date;
+      if (!isDateStr(date) || !date) throw new EntryStoreError('INVALID', 'Укажите дату измерения.');
+      const moving = from != null && from !== date;
+      const orig = from != null ? log[from] || null : null;
+      if (from != null && !orig) throw new EntryStoreError('NOT_FOUND', 'Измерение не найдено — данные изменились, пока была открыта форма.');
+      const target = log[date] || null;
+      if (target && (from == null || moving) && !overwrite) throw new EntryStoreError('DUPLICATE_DATE', 'За эту дату уже есть измерение.', { date, ...target });
+      const base = orig || target || {};
+      const at = nowISO();
+      const entry = { ...base, cm: value.cm, createdAt: base.createdAt || at, updatedAt: at };
+      if (typeof value.note === 'string') entry.note = value.note.slice(0, WAIST_NOTE_MAX);
+      if (!isValidWaistEntry(entry)) throw new EntryStoreError('INVALID', 'Измерение заполнено некорректно.');
+      if (moving) delete log[from];
+      log[date] = entry;
+      if (!(await this._write(KEYS.waistLog, log))) throw new EntryStoreError('NO_SPACE', 'Не удалось сохранить: недостаточно места на устройстве.');
+      return { date, entry };
+    });
+  }
+  /* → удалённое измерение | null */
+  async removeWaist(date) {
+    return this._serialActivity(async () => {
+      const log = { ...(await this.getWaistLog()) };
+      const rec = log[date];
+      if (!rec) return null;
+      delete log[date];
+      if (!(await this._write(KEYS.waistLog, log))) throw new EntryStoreError('NO_SPACE', 'Не удалось сохранить: недостаточно места на устройстве.');
+      return rec;
+    });
+  }
+
+  /* ---- Тренировки (workouts_log, services/workouts.js): Планка и «Другое упражнение» ---- */
+  /* новые сверху */
+  async getWorkouts() {
+    const list = await this._read(KEYS.workoutsLog, []);
+    return sortWorkouts(Array.isArray(list) ? list.filter(isPlainObj) : []);
+  }
+  _workoutFields(v, prev = {}) {
+    const note = typeof v.note === 'string' ? v.note.slice(0, WORKOUT_NOTE_MAX) : (prev.note || '');
+    return v.kind === 'plank'
+      ? { kind: 'plank', date: v.date, sets: v.sets, seconds: v.seconds, note }
+      : { kind: 'other', date: v.date, name: v.name, minutes: v.minutes ?? null, note };
+  }
+  /* value — normalizeWorkoutInput(…).value → новая запись */
+  async addWorkout(value) {
+    return this._serialActivity(async () => {
+      const list = await this._read(KEYS.workoutsLog, []);
+      const at = nowISO();
+      const w = { id: uid(), ...this._workoutFields(value || {}), source: 'manual', createdAt: at, updatedAt: at };
+      if (!isValidWorkout(w)) throw new EntryStoreError('INVALID', 'Тренировка заполнена некорректно.');
+      if (!(await this._write(KEYS.workoutsLog, [...(Array.isArray(list) ? list : []), w]))) throw new EntryStoreError('NO_SPACE', 'Не удалось сохранить: недостаточно места на устройстве.');
+      return w;
+    });
+  }
+  /* Правка: дата (перенос на другой день), поля типа, заметка; id, тип и происхождение остаются.
+     → запись | null (запись уже удалена) */
+  async updateWorkout(id, value) {
+    return this._serialActivity(async () => {
+      const list = await this._read(KEYS.workoutsLog, []);
+      const i = Array.isArray(list) ? list.findIndex((w) => w && w.id === id) : -1;
+      if (i < 0) return null;
+      const prev = list[i];
+      const fields = this._workoutFields({ ...(value || {}), kind: prev.kind }, prev);
+      /* поля другого типа не переносятся: у планки нет name/minutes, у «другого» — sets/seconds;
+         legacySeconds (точные секунды перенесённых неравных подходов) сбрасывается любой правкой —
+         после ручного ввода новых sets/seconds хранить устаревшую точность не нужно */
+      const { sets, seconds, name, minutes, legacySeconds, ...rest } = prev;
+      const next = { ...rest, ...fields, id, createdAt: prev.createdAt || nowISO(), updatedAt: nowISO() };
+      if (!isValidWorkout(next)) throw new EntryStoreError('INVALID', 'Тренировка заполнена некорректно.');
+      const out = list.slice();
+      out[i] = next;
+      if (!(await this._write(KEYS.workoutsLog, out))) throw new EntryStoreError('NO_SPACE', 'Не удалось сохранить: недостаточно места на устройстве.');
+      return next;
+    });
+  }
+  /* → удалённая запись | null */
+  async removeWorkout(id) {
+    return this._serialActivity(async () => {
+      const list = await this._read(KEYS.workoutsLog, []);
+      const rec = Array.isArray(list) ? list.find((w) => w && w.id === id) : null;
+      if (!rec) return null;
+      if (!(await this._write(KEYS.workoutsLog, list.filter((w) => w.id !== id)))) throw new EntryStoreError('NO_SPACE', 'Не удалось сохранить: недостаточно места на устройстве.');
+      return rec;
+    });
+  }
+
   /* ---- Врачи и визиты ---- */
   async getVisits() {
     const list = await this._read(KEYS.visits, []);
@@ -1772,6 +1914,7 @@ export class StorageService {
       if (env.schemaVersion < CURRENT_SCHEMA_VERSION) await sandbox._migrate();
       await sandbox._ensureDefaults();
       await sandbox._migrateActivity(); // старая копия без отметки — шаги/велотренажёр переносятся так же, как при запуске
+      await sandbox._migrateWorkouts(); // и планка / «другое упражнение» — в «Тренировки»
     } catch {
       throw new BackupError('MIGRATION_FAILED', 'Не удалось обновить данные из старой резервной копии: структура файла повреждена.');
     }
@@ -1853,6 +1996,7 @@ export class StorageService {
       this.getTests(), this.getVisits(), this.getMeds(), this.getMetricsLog(), this.getMetricsConfig(),
       this.getNotifications(), this.getProfile(), this.getHydration(), this.getAllActivity(), this.getGoals(),
       this.getSleepEntries(), this.getSleepSettings(), this.getDailyActivityLog('steps'), this.getBikeRides(),
+      this.getWaistLog(), this.getWorkouts(),
     ]);
     return summarize(data);
   }

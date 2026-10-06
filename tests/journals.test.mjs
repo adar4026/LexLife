@@ -148,7 +148,12 @@ test('11. переключение фильтров: Вода → Сон → В�
   const ids = journalFilters(all).map((f) => f.id);
   assert.deepEqual(ids, ['all', 'water', 'sleep', 'steps', 'bike', 'weight', 'pressure']);
   assert.ok(!ids.includes('pulse'), 'нет записей пульса — нет и фильтра');
-  assert.ok(!JOURNAL_TYPES.some((t) => t.id === 'walk' || t.id === 'waist'), 'типов без данных в LexLife не выдумываем');
+  assert.ok(!JOURNAL_TYPES.some((t) => t.id === 'walk'), 'типов без данных в LexLife не выдумываем');
+  /* «Талия» и «Тренировки» — разделы LexLife; их фильтры — только когда есть записи */
+  assert.ok(!ids.includes('waist') && !ids.includes('workout'));
+  const withNew = buildJournal({ ...data(), waist: { [TODAY]: { cm: 93 } }, workouts: [{ id: 'w1', kind: 'plank', date: TODAY, sets: 3, seconds: 60 }] }, ctx);
+  const ids2 = journalFilters(withNew).map((f) => f.id);
+  assert.ok(ids2.includes('waist') && ids2.includes('workout'));
   /* журнал открыт из раздела без записей — его фильтр виден */
   assert.ok(journalFilters([], 'pulse').some((f) => f.id === 'pulse'));
   assert.deepEqual(journalFilters([]).map((f) => f.id), ['all', 'water', 'sleep', 'steps', 'bike']);
