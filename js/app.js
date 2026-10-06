@@ -830,6 +830,28 @@ function flashNotifyResult(granted, onText) {
   else flash('Сохранено, но уведомления не разрешены');
 }
 
+/* Слой воды резервуара экрана «Вода»: две мягкие волны (задняя бледнее) и тело с градиентом.
+   Волна — два периода на ширину 200%: сдвиг на −50% бесшовно повторяет её. */
+const WATER_WAVE_PATH = 'M0,9 C16.5,2.5 33.5,2.5 50,9 S83.5,15.5 100,9 S133.5,2.5 150,9 S183.5,15.5 200,9 V19 H0 Z';
+const WATER_TANK_LAYER = `<div class="wtank__water" aria-hidden="true">
+  <svg class="wtank__wave wtank__wave--back" viewBox="0 0 200 18" preserveAspectRatio="none" focusable="false"><path d="${WATER_WAVE_PATH}"/></svg>
+  <svg class="wtank__wave" viewBox="0 0 200 18" preserveAspectRatio="none" focusable="false"><path d="${WATER_WAVE_PATH}"/></svg>
+  <div class="wtank__body"></div>
+</div>`;
+
+/* Шкала резервуара: 0 % — верх кнопки цели (или редактора цели), 100 % — верх заголовка
+   «💧 Вода». Середина волны ставится в px от верха резервуара (--surf-y); при 0 % слой целиком
+   ниже резервуара. Меряется по вёрстке — верно и на маленьких экранах, и с открытым редактором. */
+function placeTankWater(tank, level) {
+  const box = tank.getBoundingClientRect();
+  const low = tank.querySelector(':scope > .btn-ghost, :scope > .goal-editor').getBoundingClientRect().top - box.top;
+  const high = tank.querySelector('.header__title').getBoundingClientRect().top - box.top;
+  const waveH = parseFloat(getComputedStyle(tank).getPropertyValue('--wave-h')) || 0;
+  const y = level > 0 ? low - Math.min(level, 1) * (low - high) : box.height + waveH / 2;
+  tank.style.setProperty('--lvl', String(level));
+  tank.style.setProperty('--surf-y', `${y.toFixed(1)}px`);
+}
+
 async function WaterScreen() {
   const screen = el('<div></div>');
   /* Статистика: тип периода (ДН · НЕД · МЕС · 6 МЕС · ГОД) и смещение ‹ › — в записи истории:
@@ -839,6 +861,8 @@ async function WaterScreen() {
     ? { kind: savedUi.k, offset: Math.min(0, Math.trunc(savedUi.o) || 0) }
     : { kind: PERIOD_KINDS.includes(savedUi) ? savedUi : 'week', offset: 0 };
   let editingGoal = false;
+  let tankLevel = null; // уровень резервуара прошлой отрисовки — от него анимируется новый
+  let tankRO = null;
   const statsHost = el('<section class="section hstats" aria-label="Статистика воды"></section>');
   let segFrom = null; // сегмент до переключения — для анимации бегунка
   let statsData = null; // { log, goal } последней отрисовки — для смены периода без перечитывания экрана
@@ -855,15 +879,23 @@ async function WaterScreen() {
     const remaining = Math.max(0, goal - total);
     const color = fillColor(pct);
     screen.innerHTML = '';
-    screen.appendChild(backHeader('💧 Вода', { fallback: 'metrics' }));
+    /* Резервуар: верх экрана — от края экрана (с safe area) до низа кнопки цели. Вода поднимается
+       по сегодняшнему прогрессу (waterProgress: выпито / цель, 0…1) от верха кнопки цели (0 %) до
+       верха заголовка «💧 Вода» (100 %). Слой — под содержимым, без касаний; при записи уровень
+       плавно поднимается от прежнего значения. */
+    const level = waterProgress(total, goal).progress;
+    const tank = el(`<div class="wtank is-init${level > 0 ? ' is-wet' : ''}">${WATER_TANK_LAYER}</div>`);
+    screen.appendChild(tank);
+    tank.appendChild(backHeader('💧 Вода', { fallback: 'metrics' }));
 
     /* 1. Кольцо + 2. текущий объём / цель */
     const r = 60, circ = 2 * Math.PI * r;
     const off = circ * (1 - Math.min(pct, 100) / 100);
-    screen.appendChild(el(`
+    tank.appendChild(el(`
       <div class="water-hero">
         <div class="wring">
           <svg width="150" height="150" viewBox="0 0 150 150">
+            <circle class="wring__disc" cx="75" cy="75" r="${r - 6.5}"/>
             <circle cx="75" cy="75" r="${r}" fill="none" stroke="var(--surface-2)" stroke-width="13"/>
             <circle cx="75" cy="75" r="${r}" fill="none" stroke="${color}" stroke-width="13" stroke-linecap="round" stroke-dasharray="${circ.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" transform="rotate(-90 75 75)"/>
           </svg>
@@ -873,12 +905,28 @@ async function WaterScreen() {
       </div>
     `));
     if (editingGoal) {
-      screen.appendChild(buildGoalEditor(goal));
+      tank.appendChild(buildGoalEditor(goal));
     } else {
       const gb = el('<button class="btn-ghost" type="button" style="margin-top:10px">✎ Редактировать цель</button>');
       gb.addEventListener('click', () => { editingGoal = true; paint(); });
-      screen.appendChild(gb);
+      tank.appendChild(gb);
     }
+    /* Первая расстановка — без анимации (is-init), затем подъём от прежнего уровня к новому;
+       ResizeObserver переставляет воду при изменении вёрстки (шрифты, поворот экрана) */
+    let shown = tankLevel == null ? level : tankLevel;
+    let placed = false;
+    tankLevel = level;
+    if (tankRO) tankRO.disconnect();
+    tankRO = new ResizeObserver(() => {
+      placeTankWater(tank, shown);
+      if (placed) return;
+      placed = true;
+      requestAnimationFrame(() => {
+        tank.classList.remove('is-init');
+        if (shown !== level) requestAnimationFrame(() => { shown = level; placeTankWater(tank, level); });
+      });
+    });
+    tankRO.observe(tank);
 
     /* 3. Быстрое добавление */
     screen.appendChild(quickBar());
