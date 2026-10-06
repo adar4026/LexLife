@@ -18,7 +18,7 @@ export function endpointHost(endpoint) {
 const iso = (t) => (Number.isFinite(t) ? new Date(t).toISOString() : null);
 
 /* Одно событие доставки. decision: sent | retry | failed | gone | skipped_late |
-   lost_race | no_subscription | expired | ghost_dropped */
+   lost_race | no_subscription | expired | stale_suspect (только диагностика) */
 export function logDelivery(e) {
   const out = {
     evt: 'push', decision: e.decision,

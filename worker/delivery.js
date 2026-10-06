@@ -7,8 +7,10 @@
 import { sendWebPush, topicFor } from './webpush.js';
 import { endpointHost } from './log.js';
 
-export const MAX_TRANSIENT_FAILURES = 10; // подряд: 429/5xx/сеть
-export const MAX_PERMANENT_FAILURES = 3;  // подряд: прочие 4xx (403 VAPID, 400 …)
+/* Подписка удаляется ТОЛЬКО при подтверждённой недействительности (404/410 от
+   push-сервиса), явной отписке (/api/push/unsubscribe) или замене новой подпиской
+   того же устройства (/api/push/subscribe). Прочие ошибки (403, 400, 429, 5xx, сеть)
+   только считаются в failure_count для диагностики — доставка продолжается. */
 
 export class ConfigError extends Error {
   constructor(message) { super(message); this.code = 'push_not_configured'; }
@@ -23,7 +25,7 @@ export const activeSubscription = (db, deviceId) => db
   .prepare('SELECT * FROM push_subscriptions WHERE device_id = ? AND active = 1 ORDER BY updated_at DESC LIMIT 1')
   .bind(deviceId).first();
 
-/* Подписки устройства больше нет: правила перестают выбираться cron'ом,
+/* Подписка недействительна (404/410): правила перестают выбираться cron'ом,
    пока устройство не подпишется снова (тогда next_fire_at пересчитается). */
 export async function dropSubscription(db, sub, now) {
   await db.batch([
@@ -49,10 +51,7 @@ export async function pushToDevice(env, deviceId, payload, { now = Date.now(), f
   } else if (r.kind === 'gone') {
     await dropSubscription(db, sub, now);
   } else {
-    const count = (sub.failure_count || 0) + 1;
-    const limit = r.kind === 'error' ? MAX_PERMANENT_FAILURES : MAX_TRANSIENT_FAILURES;
-    if (count >= limit) await dropSubscription(db, sub, now);
-    else await db.prepare('UPDATE push_subscriptions SET failure_count = ?, last_failure_at = ?, updated_at = ? WHERE id = ?').bind(count, now, now, sub.id).run();
+    await db.prepare('UPDATE push_subscriptions SET failure_count = failure_count + 1, last_failure_at = ?, updated_at = ? WHERE id = ?').bind(now, now, sub.id).run();
   }
   return { kind: r.kind, status: r.status, host: endpointHost(sub.endpoint) };
 }

@@ -244,8 +244,8 @@ export function createPushClient({
       const r = await sendSubscription(sub);
       return { state: r.ok ? 'updated' : 'error' };
     }
-    /* Сервер тоже знает эту подписку? (отметка запуска last_seen_at; подписку могли
-       снять 404/410 или очистка удалённых установок) — нет → отправляем снова */
+    /* Сервер тоже знает эту подписку? (отметка запуска last_seen_at; подписку мог
+       снять ответ 404/410 push-сервиса) — нет → отправляем снова */
     const s = await api('GET', 'push/status');
     if ((s.ok && s.data.subscription !== 'active') || s.status === 401) {
       const r = await sendSubscription(sub);

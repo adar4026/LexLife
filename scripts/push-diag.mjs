@@ -90,6 +90,7 @@ const late = rows.filter((d) => d.sent_at && d.sent_at - d.scheduled_fire_at > 2
 if (late.length) issues.push(`${late.length} отправок позже 2 мин после расписания (cron/D1 задержка)`);
 const held = rows.filter((d) => d.shown_at && d.shown_at - d.scheduled_fire_at > 5 * 60000);
 if (held.length) issues.push(`${held.length} push показаны iPhone позже 5 мин после расписания при своевременной отправке → задержка на стороне устройства (сон, Фокусирование, «Сводка уведомлений», режим энергосбережения)`);
+for (const r of q(`SELECT substr(s.device_id,1,8) dev, s.failure_count FROM push_subscriptions s WHERE s.active = 1 AND s.failure_count >= 3`)) issues.push(`устройство ${r.dev}: ${r.failure_count} ошибок push-сервиса подряд (не 404/410) — подписка не удаляется, проверьте статусы в журнале`);
 const unacked = rows.filter((d) => d.has_ack && d.status === 'sent' && !d.shown_at);
-if (unacked.length) issues.push(`${unacked.length} push приняты Apple, но не подтверждены Service Worker'ом (установка удалена, iPhone вне сети или SW ещё не обновился до v65)`);
+if (unacked.length) issues.push(`${unacked.length} push приняты Apple, но не подтверждены Service Worker'ом (установка удалена, iPhone вне сети или SW ещё не обновился до v65) — подписки при этом не удаляются`);
 console.log(issues.length ? issues.map((x) => `• ${x}`).join('\n') : 'нет');

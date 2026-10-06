@@ -114,7 +114,7 @@ async function unsubscribe(request, env, device, { now }) {
 }
 
 /* status вызывается и при каждом запуске приложения (pushClient.checkSubscription):
-   last_seen_at отличает живую установку от удалённой (см. cron GHOST_AFTER_MS) */
+   last_seen_at — для диагностики (cron findStaleSubscriptions), подписки не удаляет */
 async function status(env, device, { now }) {
   const db = env.DB;
   await db.prepare('UPDATE devices SET last_seen_at = ? WHERE id = ?').bind(now, device.id).run();

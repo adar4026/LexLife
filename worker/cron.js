@@ -32,7 +32,7 @@
 import { NOTIF_GRACE_MS } from '../js/services/notifySchedule.js';
 import { wallLabel, occurrenceId } from '../js/services/zonedSchedule.js';
 import { rowToRule, nextFireFor, PUSH_TEXT, PUSH_TARGET } from './rules.js';
-import { pushToDevice, dropSubscription } from './delivery.js';
+import { pushToDevice } from './delivery.js';
 import { b64uEncode } from './webpush.js';
 import { logDelivery } from './log.js';
 
@@ -42,14 +42,14 @@ export const RETRY_BACKOFF_MS = [60000, 120000];
 export const STUCK_CLAIM_MS = 5 * 60000;
 export const DELIVERY_RETENTION_MS = 30 * 86400000;
 export const IDLE_DEVICE_RETENTION_MS = 90 * 86400000;
-/* «Призрачная» подписка: PWA удалён с экрана «Домой», а Apple продолжает
-   отвечать 201. Снимается, только если за GHOST_AFTER_MS устройство ни разу
-   не открывало приложение, ни один push не подтверждён Service Worker'ом
-   и было не меньше GHOST_MIN_SENT доставок с ack (т. е. новым кодом).
-   Живая установка, снятая по ошибке, восстанавливается при следующем
-   запуске: pushClient.checkSubscription() → status 'none' → подписка заново. */
-export const GHOST_AFTER_MS = 7 * 86400000;
-export const GHOST_MIN_SENT = 10;
+/* Подозрительная подписка (диагностика, НЕ удаление): за STALE_AFTER_MS приложение
+   на устройстве не открывалось, ни один push не подтверждён Service Worker'ом при
+   ≥ STALE_MIN_SENT отправках с ack. Так выглядит удалённая установка PWA (Apple
+   отвечает 201), но так же — iPhone, который задерживает push, или пользователь,
+   который просто не открывает приложение. Поэтому только лог 'stale_suspect'
+   раз в час и строка в scripts/push-diag.mjs; доставка продолжается. */
+export const STALE_AFTER_MS = 7 * 86400000;
+export const STALE_MIN_SENT = 10;
 const CONCURRENCY = 6;
 
 const newAckKey = () => b64uEncode(crypto.getRandomValues(new Uint8Array(16)));
@@ -164,23 +164,20 @@ async function processRetry(env, d, now, stats, fetchImpl) {
   await finish(db, d.id, d.attempts + 1, d.scheduled_fire_at, res, now, stats, ctx);
 }
 
-/* Подписки удалённых установок PWA (см. GHOST_AFTER_MS) */
-export async function dropGhostSubscriptions(db, now) {
-  const since = now - GHOST_AFTER_MS;
+export async function findStaleSubscriptions(db, now) {
+  const since = now - STALE_AFTER_MS;
   const { results } = await db.prepare(`
-    SELECT s.id, s.device_id FROM push_subscriptions s JOIN devices dv ON dv.id = s.device_id
+    SELECT s.id, s.device_id, s.last_success_at, s.last_ack_at, dv.last_seen_at FROM push_subscriptions s JOIN devices dv ON dv.id = s.device_id
     WHERE s.active = 1 AND s.created_at < ?
       AND COALESCE(dv.last_seen_at, 0) < ? AND COALESCE(s.last_ack_at, 0) < ?
       AND (SELECT COUNT(*) FROM notification_deliveries x JOIN notification_rules r ON r.id = x.rule_id
-           WHERE r.device_id = s.device_id AND x.status = 'sent' AND x.ack_key IS NOT NULL AND x.created_at >= ?) >= ?
-      AND NOT EXISTS (SELECT 1 FROM notification_deliveries x JOIN notification_rules r ON r.id = x.rule_id
-           WHERE r.device_id = s.device_id AND x.acked_at IS NOT NULL AND x.created_at >= ?)`)
-    .bind(since, since, since, since, GHOST_MIN_SENT, since).all();
+           WHERE r.device_id = s.device_id AND x.status = 'sent' AND x.ack_key IS NOT NULL AND x.created_at >= ?) >= ?`)
+    .bind(since, since, since, since, STALE_MIN_SENT).all();
   for (const sub of results) {
-    await dropSubscription(db, sub, now);
-    logDelivery({ decision: 'ghost_dropped', deviceId: sub.device_id, now, reason: `${GHOST_AFTER_MS / 86400000} дн.: приложение не открывалось, ни один push не подтверждён` });
+    logDelivery({ decision: 'stale_suspect', deviceId: sub.device_id, now,
+      reason: `${STALE_AFTER_MS / 86400000} дн. без запуска приложения и без подтверждений показа; подписка НЕ удаляется, доставка продолжается` });
   }
-  return results.length;
+  return results;
 }
 
 /* Обслуживание (раз в час): зависшие claim, срок хранения журнала, брошенные устройства */
@@ -193,7 +190,7 @@ export async function maintenance(db, now) {
                 AND NOT EXISTS (SELECT 1 FROM push_subscriptions s WHERE s.device_id = devices.id AND s.active = 1)`)
       .bind(now - IDLE_DEVICE_RETENTION_MS),
   ]);
-  await dropGhostSubscriptions(db, now);
+  await findStaleSubscriptions(db, now); // только диагностика
 }
 
 export async function runCron(env, now = Date.now(), { fetchImpl = fetch } = {}) {

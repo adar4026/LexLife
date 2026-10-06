@@ -14,7 +14,7 @@
 
 import assert from 'node:assert/strict';
 import { handleApi } from '../worker/api.js';
-import { runCron, maintenance, MAX_ATTEMPTS, STUCK_CLAIM_MS, GHOST_AFTER_MS, GHOST_MIN_SENT } from '../worker/cron.js';
+import { runCron, maintenance, MAX_ATTEMPTS, STUCK_CLAIM_MS, STALE_AFTER_MS, STALE_MIN_SENT } from '../worker/cron.js';
 import { generateVapidKeys } from '../worker/webpush.js';
 import { sha256Hex } from '../worker/auth.js';
 import worker from '../worker/index.js';
@@ -326,13 +326,22 @@ test('cron: сеть недоступна / 503 постоянно → не бо
   assert.equal(s.db.q('SELECT failure_count FROM push_subscriptions')[0].failure_count, MAX_ATTEMPTS);
 });
 
-test('cron: 403 (неверный VAPID) три раза подряд → подписка деактивирована', async () => {
-  const s = await setup({ responder: () => 403 });
+test('cron: 403 / 400 / 503 подряд — подписка НЕ удаляется (только 404/410), failure_count растёт, после восстановления — доставка', async () => {
+  let code = 403;
+  const s = await setup({ responder: () => code });
   const { auth } = await s.subscribed();
   await s.sync(auth, [R({ type: 'water', repeat: 'interval', intervalMinutes: 60, startTime: '09:00', endTime: '20:00' })]);
   await cronEveryMinute(s, M(2031, 3, 10, 9, 0), M(2031, 3, 10, 14, 0));
-  assert.equal(s.push.log.length, 3);
-  assert.equal(s.db.q('SELECT COUNT(*) n FROM push_subscriptions')[0].n, 0);
+  assert.equal(s.push.log.length, 5, 'каждый слот 9–13 отправлен, по одной попытке (4xx не повторяется)');
+  code = 400; await cronEveryMinute(s, M(2031, 3, 10, 14, 0), M(2031, 3, 10, 15, 0));
+  code = 503; await cronEveryMinute(s, M(2031, 3, 10, 15, 0), M(2031, 3, 10, 18, 0));
+  const sub = s.db.q('SELECT active, failure_count FROM push_subscriptions');
+  assert.equal(sub.length, 1); assert.equal(sub[0].active, 1);
+  assert.ok(sub[0].failure_count >= 6 + 3 * MAX_ATTEMPTS - 1, String(sub[0].failure_count));
+  assert.ok(s.db.q('SELECT next_fire_at FROM notification_rules')[0].next_fire_at, 'правило остаётся в расписании');
+  code = 201; await cronEveryMinute(s, M(2031, 3, 10, 18, 0), M(2031, 3, 10, 18, 2));
+  assert.equal(s.push.log.at(-1).status, 201);
+  assert.equal(s.db.q('SELECT failure_count FROM push_subscriptions')[0].failure_count, 0, 'успех обнуляет счётчик');
 });
 
 test('cron: опоздание больше 10 мин (cron стоял) → skipped без push, следующее — по расписанию', async () => {
@@ -677,7 +686,7 @@ test('структурированные логи: rule_id, device, scheduled_at
   assert.ok(!raw.includes(ackKey), 'ack-ключ не в логах');
 });
 
-test('подписка удалённой установки PWA (Apple отвечает 201): снимается через 7 дней без запусков и ack; живая — остаётся', async () => {
+test('без запусков и ack 7+ дней: подписка НЕ удаляется — только лог stale_suspect; доставка продолжается', async () => {
   const s = await setup();
   const live = await s.subscribed();
   const ghost = await s.subscribed({ now: M(2031, 3, 10, 7, 0) });
@@ -694,21 +703,27 @@ test('подписка удалённой установки PWA (Apple отве
       if (new Date(t).getUTCMinutes() === 0) await maintenance(s.db, t);
     }
   }
-  const active = s.db.q('SELECT device_id FROM push_subscriptions WHERE active = 1').map((r) => r.device_id);
-  assert.deepEqual(active, [live.auth.deviceId], 'призрачная подписка снята, живая — нет');
-  assert.ok(s.db.q('SELECT COUNT(*) n FROM notification_deliveries')[0].n >= GHOST_MIN_SENT);
-  assert.ok(LOGS.some((l) => l.decision === 'ghost_dropped'));
-  /* устройство без запусков, но с подтверждёнными push — тоже живое */
+  const active = s.db.q('SELECT device_id FROM push_subscriptions WHERE active = 1').map((r) => r.device_id).sort();
+  assert.deepEqual(active, [live.auth.deviceId, ghost.auth.deviceId].sort(), 'обе подписки на месте');
+  assert.ok(s.db.q('SELECT COUNT(*) n FROM notification_deliveries')[0].n >= STALE_MIN_SENT);
+  const flagged = LOGS.filter((l) => l.decision === 'stale_suspect');
+  assert.ok(flagged.length > 0 && flagged.every((l) => l.device === ghost.auth.deviceId.slice(0, 8)), 'помечено только молчащее устройство');
+  const lastDay = start + 7 * 86400000;
+  const ghostRule = s.db.q('SELECT id FROM notification_rules WHERE device_id = ?', ghost.auth.deviceId)[0].id;
+  assert.ok(s.db.q("SELECT COUNT(*) n FROM notification_deliveries WHERE rule_id = ? AND status = 'sent' AND scheduled_fire_at >= ?", ghostRule, lastDay)[0].n > 0, 'доставка на помеченную подписку продолжается');
+  /* устройство без запусков, но с подтверждёнными push — не помечается */
+  LOGS.length = 0;
   const s2 = await setup();
   const quiet = await s2.subscribed({ now: start });
   await s2.sync(quiet.auth, rules, { now: start });
-  for (let t = start; t < start + GHOST_AFTER_MS + 86400000; t += 60 * MIN) {
+  for (let t = start; t < start + STALE_AFTER_MS + 86400000; t += 60 * MIN) {
     await s2.cron(t);
     const last = (await AT(quiet.ua, s2)).at(-1);
     if (last && last.ack) await s2.call('POST', '/api/push/ack', { now: t, body: { d: last.ack.d, k: last.ack.k, shownAt: t } });
     if (new Date(t).getUTCMinutes() === 0) await maintenance(s2.db, t);
   }
   assert.equal(s2.db.q('SELECT COUNT(*) n FROM push_subscriptions WHERE active = 1')[0].n, 1);
+  assert.ok(!LOGS.some((l) => l.decision === 'stale_suspect'));
 });
 
 let passed = 0; let failed = 0;
