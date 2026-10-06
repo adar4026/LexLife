@@ -2686,6 +2686,8 @@ a.sleep-last:active { background: var(--surface-2); }
   --hc-tip-bg: #2c2c2e;
   --hc-tip-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
   --hc-num-font: ui-rounded, "SF Pro Rounded", var(--font-system);
+  /* заголовок статистики (В СРЕДНЕМ · число · мл · диапазон) — системная типографика Apple Health, только здесь */
+  --hc-head-font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", system-ui, sans-serif;
 }
 [data-theme="light"] {
   --hc-seg-bg: rgba(118, 118, 128, 0.12);
@@ -2736,11 +2738,11 @@ a.sleep-last:active { background: var(--surface-2); }
 /* заголовок: подпись · число + единица · диапазон; ‹ › — тихие вторичные кнопки справа */
 .hhead { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; margin: 16px 2px 12px; }
 .hhead__main { min-width: 0; }
-.hhead__cap { font-family: var(--font-system); font-size: 12.5px; font-weight: 600; letter-spacing: 0.03em; line-height: 1.3; text-transform: uppercase; color: var(--text2); }
+.hhead__cap { font-family: var(--hc-head-font); font-size: 12.5px; font-weight: 600; letter-spacing: 0.03em; line-height: 1.3; text-transform: uppercase; color: var(--text2); }
 .hhead__val { display: flex; align-items: baseline; column-gap: 4px; white-space: nowrap; }
-.hhead__num { font-family: var(--hc-num-font); font-size: 34px; font-weight: 700; line-height: 1.12; letter-spacing: -0.01em; color: var(--text); font-variant-numeric: tabular-nums; }
-.hhead__unit { font-family: var(--hc-num-font); font-size: 17px; font-weight: 600; color: var(--text2); }
-.hhead__range { margin-top: 1px; font-family: var(--font-system); font-size: 14.5px; font-weight: 500; line-height: 1.3; color: var(--text2); }
+.hhead__num { font-family: var(--hc-head-font); font-size: 34px; font-weight: 600; line-height: 1.12; letter-spacing: -0.01em; color: var(--text); }
+.hhead__unit { font-family: var(--hc-head-font); font-size: 17px; font-weight: 500; color: var(--text2); }
+.hhead__range { margin-top: 1px; font-family: var(--hc-head-font); font-size: 14.5px; font-weight: 500; line-height: 1.3; color: var(--text2); }
 .hnav { display: flex; gap: 8px; flex-shrink: 0; padding-bottom: 1px; }
 .hnav__btn {
   position: relative;
