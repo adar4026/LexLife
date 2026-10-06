@@ -1240,6 +1240,83 @@ body.is-scroll-locked {
 .wring__sub { font-size: 12px; color: var(--text2); margin-top: 2px; }
 .water-goalrow { display: flex; gap: 14px; align-items: center; justify-content: center; flex-wrap: wrap; margin-top: 12px; font-size: 13px; color: var(--text2); }
 .water-goalrow b { color: var(--text); }
+/* Резервуар экрана «Вода» (.wtank): верх экрана от края (с safe area) до низа кнопки цели.
+   Выходит на поля .screen (16px и safe-top + 12px) — вода доходит до краёв экрана, а
+   содержимое остаётся на прежнем месте. Шкала: 0 % — верх кнопки цели, 100 % — верх заголовка
+   «💧 Вода»; середину волны ставит placeTankWater (--surf-y, px от верха резервуара). Смещение —
+   только transform (без вёрстки); is-init — первая расстановка без анимации.
+   Цвета — сплошные внутри слоя, полупрозрачность — общей opacity слоя: стык волны и тела
+   не даёт полосы. Тёмная тема — :root, светлая — [data-theme="light"]. */
+:root {
+  --water-a: #4c9bf0;      /* у волны — чуть насыщеннее */
+  --water-b: #2b5d97;      /* ниже — ближе к фону */
+  --water-back: #3f86d6;   /* задняя волна */
+  --water-alpha: 0.34;
+  --water-text2: #b3bdc8;  /* подписи поверх воды */
+}
+[data-theme="light"] {
+  --water-a: #4fa3f2;
+  --water-b: #b4dafb;
+  --water-back: #93c8f8;
+  --water-alpha: 0.36;
+  --water-text2: #474c56;
+}
+.wtank {
+  --wave-h: 26px;
+  --surf-y: 200vh;
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  margin: calc(-1 * (var(--safe-top) + 12px)) -16px 0;
+  padding: calc(var(--safe-top) + 12px) 16px 0;
+}
+.wtank > :not(.wtank__water) { position: relative; z-index: 1; }
+.wtank.is-wet { --text2: var(--water-text2); }
+.wtank__water {
+  position: absolute;
+  top: calc(-1 * var(--wave-h));
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: var(--water-alpha);
+  transform: translate3d(0, calc(var(--surf-y) + var(--wave-h) / 2), 0);
+  transition: transform 1.1s cubic-bezier(0.22, 0.8, 0.26, 1);
+}
+.wtank.is-init .wtank__water { transition: none; }
+.wtank__body {
+  position: absolute;
+  top: var(--wave-h);
+  right: 0;
+  bottom: 0;
+  left: 0;
+  background: linear-gradient(180deg, var(--water-a), var(--water-b) min(100%, 320px));
+}
+.wtank__wave {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 200%;
+  height: calc(var(--wave-h) + 1px);
+  fill: var(--water-a);
+  animation: wtank-drift 16s linear infinite;
+}
+.wtank__wave--back {
+  top: -5px;
+  fill: var(--water-back);
+  animation-duration: 23s;
+  animation-direction: reverse;
+  animation-delay: -7s;
+}
+@keyframes wtank-drift { to { transform: translate3d(-50%, 0, 0); } }
+@media (prefers-reduced-motion: reduce) {
+  .wtank__water { transition: none; }
+  .wtank__wave { animation: none; }
+  .wtank__wave--back { transform: translate3d(-25%, 0, 0); }
+}
+/* Под цифрами кольца — диск цвета фона: над водой читается так же, как без неё */
+.wring__disc { fill: var(--bg); fill-opacity: 0.72; }
 .water-goalbtn { background: none; border: 0; color: var(--blue); font-size: 13px; font-weight: 700; }
 .water-add.is-active { background: var(--blue); border-color: var(--blue); color: #fff; }
 
@@ -2610,6 +2687,8 @@ a.sleep-last:active { background: var(--surface-2); }
 .jcard__icon--weight { color: var(--hm-weight); background: color-mix(in srgb, var(--hm-weight) 14%, transparent); }
 .jcard__icon--pressure { color: var(--hm-bp); background: color-mix(in srgb, var(--hm-bp) 14%, transparent); }
 .jcard__icon--pulse, .jcard__icon--temperature, .jcard__icon--spo2 { color: var(--hm-pulse); background: color-mix(in srgb, var(--hm-pulse) 14%, transparent); }
+.jcard__icon--waist { color: var(--hm-weight); background: color-mix(in srgb, var(--hm-weight) 14%, transparent); }
+.jcard__icon--workout { color: var(--hm-bike); background: color-mix(in srgb, var(--hm-bike) 14%, transparent); }
 .jcard__body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .jcard__title { font-size: 15.5px; font-weight: 800; line-height: 1.25; overflow-wrap: anywhere; }
 .jcard__sub { font-size: 13.5px; font-weight: 600; color: var(--text2); line-height: 1.3; overflow-wrap: anywhere; }
@@ -2823,3 +2902,19 @@ a.sleep-last:active { background: var(--surface-2); }
   .hseg__btn { font-size: 12.5px; }
   .hhead__num { font-size: 32px; }
 }
+
+/* =========================================================
+   Обхват талии (#/metric/waist) и «Тренировки» (#/workouts) — только существующие
+   токены и компоненты: шапка «Сна» (кнопка справа), .hseg / .hhead / .hnav статистики воды,
+   .card, .sgrid, карточки журнала. Новых цветов нет.
+   ========================================================= */
+.hdr-add { background: none; border: 0; padding: 0; font: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.hdr-add .hi { stroke-width: 2.2; }
+.waist-card { margin-top: 2px; padding: 12px 12px 14px; }
+.waist-period { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 2px 4px; }
+.waist-period__range { min-width: 0; font-size: 13px; font-weight: 600; color: var(--text2); overflow-wrap: anywhere; }
+.waist-chart__empty { margin: 22px 0 18px; text-align: center; }
+.waist-grid { grid-template-columns: 1fr 1fr; }
+.waist-empty .med-empty__icon { color: var(--hm-weight); }
+.workouts-empty .med-empty__icon { color: var(--hm-bike); }
+.workouts .jtools { margin-top: 4px; }

@@ -15,6 +15,8 @@ const run = [
   ['metric-periods.test.mjs', 'Europe/Madrid'], ['metric-periods.test.mjs', 'America/Los_Angeles'], ['metric-periods.test.mjs', 'Pacific/Kiritimati'], // статистика ДН/НЕД/МЕС/6 МЕС/ГОД: локальный календарь
   ['journals.test.mjs', 'Europe/Madrid'], ['journals.test.mjs', 'America/Los_Angeles'], ['journals.test.mjs', 'Pacific/Kiritimati'], // «Все журналы»: дни записей — локальный календарь
   ['activity.test.mjs', 'Europe/Madrid'], ['activity.test.mjs', 'America/Los_Angeles'], ['activity.test.mjs', 'Asia/Tokyo'], ['activity.test.mjs', 'UTC'], // шаги/дистанция/велосипед: локальные дни, периоды, миграция
+  ['waist.test.mjs', 'Europe/Madrid'], ['waist.test.mjs', 'America/Los_Angeles'], ['waist.test.mjs', 'Pacific/Kiritimati'], // обхват талии: дни, периоды НЕД/МЕС/6 МЕС/ГОД
+  ['workouts.test.mjs', 'Europe/Madrid'], ['workouts.test.mjs', 'America/Los_Angeles'], ['workouts.test.mjs', 'Asia/Tokyo'], // тренировки: даты, перенос из activity_days
   ['history-import.test.mjs', 'Europe/Madrid'], ['history-import.test.mjs', 'America/Los_Angeles'], ['history-import.test.mjs', 'Asia/Tokyo'], // локальные даты истории
   ['water-stats-range.test.mjs'], ['water-stats-range.test.mjs', 'America/Los_Angeles'], ['water-stats-range.test.mjs', 'Asia/Tokyo'], ['water-stats-range.test.mjs', 'Pacific/Kiritimati'], // диапазон периода воды — локальный календарь
   ['sw-update.test.mjs'], // обновление открытой вкладки после deploy: sw.js activate ↔ js/services/swUpdate.js

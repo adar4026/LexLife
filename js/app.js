@@ -6,7 +6,7 @@
    Показатели — единая модель: каждый показатель = модуль #/metric/<key>.
    ========================================================= */
 
-import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup, SleepStoreError, ActivityStoreError } from './services/storage.js';
+import Storage, { REFERENCE, TEST_FIELDS, dateKey, APP_VERSION, APP_UPDATED, CURRENT_SCHEMA_VERSION, BackupError, parseBackup, SleepStoreError, ActivityStoreError, EntryStoreError } from './services/storage.js';
 import { createStatsEngine, evaluateWaterPlan, waterGoalDays, getWaterStatsRange, PERIODS, PERIOD_KEYS, DEFAULT_PERIOD, MIN_DELTA, TREND_MIN_POINTS, TREND_MIN_SPAN, isoOfDay, dayNum } from './services/analytics.js';
 import { parseWaterMinderCsv, assignImportKeys, buildWaterImportPlan, applyWaterImportPlan, applyTodayWaterImport, isWaterMinderKey } from './services/waterImport.js';
 import { lineChart, barChart as svgBarChart } from './ui/charts.js';
@@ -41,6 +41,11 @@ import { NEW_HOME_URL, PRIMARY_URL, migrationMode, deploymentRole, serverPushAll
 import { createUpdateController, isFormRoute, hasUnsavedInput, UPDATE_MSG } from './services/swUpdate.js';
 import { PERIOD_KINDS, PERIOD_SHORT, PERIOD_NAME, periodWindow, aggregatePeriod, niceScale, fmtGroup } from './services/metricPeriods.js';
 import { PeriodSelector, PeriodNavigator, MetricHeader, HealthBarChart } from './ui/healthChart.js';
+import { WAIST_PERIOD_KINDS, normalizeWaistInput, latestWaist, waistPeriod, fmtCm, fmtWaist, fmtWaistChange } from './services/waist.js';
+import {
+  WORKOUT_TITLES, WORKOUT_NAME_SUGGESTIONS, WORKOUT_NAME_MAX, WORKOUT_NOTE_MAX, normalizeWorkoutInput, parseWorkoutInt,
+  workoutTitle, workoutValue, fmtSeconds,
+} from './services/workouts.js';
 import { buildJournal, filterJournal, groupJournal, journalFilters, journalEmptyText, journalType, visibleDays, todayJournal, parseJournalRoute, journalRoute, JOURNAL_PAGE_DAYS } from './services/journals.js';
 
 /* Документы анализов: файлы в IndexedDB (только на этом устройстве), метаданные — в health_tests */
@@ -91,8 +96,11 @@ const METRICS = {
   temperature: { key: 'temperature', name: 'Температура', emoji: '🌡', unit: '°C', kind: 'single', step: '0.1' },
   spo2: { key: 'spo2', name: 'Сатурация', emoji: '🫁', unit: '%', kind: 'single', step: '1' },
   glucose: { key: 'glucose', name: 'Глюкоза', emoji: '🍬', unit: 'ммоль/л', kind: 'single', step: '0.1' },
+  /* свой модуль и свой ключ (waist_log, services/waist.js) — не metrics_log, поэтому не в METRIC_ORDER */
+  waist: { key: 'waist', name: 'Обхват талии', emoji: '📏', unit: 'см', kind: 'waist', step: '0.1' },
 };
 const METRIC_ORDER = ['weight', 'pressure', 'pulse', 'water', 'temperature', 'spo2', 'glucose'];
+const METRICS_GRID = ['weight', 'waist', 'pressure', 'pulse', 'water', 'temperature', 'spo2', 'glucose']; // сетка «Показателей»: талия рядом с весом
 const POINT_JOURNAL_KEYS = METRIC_ORDER.filter((k) => METRICS[k].kind !== 'water'); // значение за день — «Все журналы»
 
 const fmtMl = (ml) => (ml == null ? '—' : Math.round(ml).toLocaleString('ru-RU'));
@@ -163,6 +171,9 @@ const HOME_ICONS = {
   steps: '<path d="M8.6 3.8c1.7 0 2.6 1.7 2.6 3.8s-1.1 4-2.6 4-2.7-1.6-2.7-3.9.9-3.9 2.7-3.9z"/><path d="M6.3 14.1h4.6l-.3 2.1a2.2 2.2 0 0 1-4.3 0z"/><path d="M15.6 7.8c1.7 0 2.6 1.7 2.6 3.8s-1.1 4-2.6 4-2.7-1.6-2.7-3.9.9-3.9 2.7-3.9z"/><path d="M13.3 18.1h4.6l-.3 2.1a2.2 2.2 0 0 1-4.3 0z"/>',
   bike: '<circle cx="6" cy="15.8" r="3.7"/><circle cx="18" cy="15.8" r="3.7"/><path d="M6 15.8l3.7-6.9h6.4L18 15.8"/><path d="M9.7 8.9l2.6 6.9H6"/><path d="M8.4 6.4h2.8"/><path d="M14.8 6h2.4l-1.1 2.9"/>',
 };
+/* сантиметровая лента · гантель */
+HOME_ICONS.waist = '<path d="M3.5 9.5h14a3 3 0 0 1 0 6h-14z"/><path d="M7 9.5v2.2M10.5 9.5v3M14 9.5v2.2"/><path d="M17.5 15.5H21"/>';
+HOME_ICONS.workout = '<path d="M7 8.5v7M17 8.5v7"/><rect x="3.8" y="9.8" width="3.2" height="4.4" rx="1"/><rect x="17" y="9.8" width="3.2" height="4.4" rx="1"/><path d="M7 12h10"/>';
 HOME_ICONS.temperature = HOME_ICONS.pulse;
 HOME_ICONS.spo2 = HOME_ICONS.pulse;
 HOME_ICONS.glucose = HOME_ICONS.lab;
@@ -199,6 +210,7 @@ async function HomeScreen() {
     Storage.getSleepEntries(), Storage.getSleepSettings(),
     Storage.getDailyActivityLog('steps'), Storage.getBikeRides(),
   ]);
+  const [waistLog, workouts] = await Promise.all([Storage.getWaistLog(), Storage.getWorkouts()]);
   const screen = el('<div class="home"></div>');
   /* мягкое появление — только при первом открытии Главной за запуск (не на каждом переключении вкладки) */
   const enter = !homeEntered;
@@ -208,7 +220,7 @@ async function HomeScreen() {
   screen.appendChild(renderHomeSleep(getSleepForDate(sleepEntries, today), sleepSettings.goalMinutes));
   const activityStores = { steps: stepsLog, bike: bikeRides };
   ACTIVITY_KEYS.forEach((k) => screen.appendChild(renderHomeActivity(k, activityStores[k], today)));
-  const journalItems = buildJournal({ metricsLog, sleep: sleepEntries, steps: stepsLog, bike: bikeRides }, { waterGoal: goal, sleepGoal: sleepSettings.goalMinutes });
+  const journalItems = buildJournal({ metricsLog, sleep: sleepEntries, steps: stepsLog, bike: bikeRides, waist: waistLog, workouts }, { waterGoal: goal, sleepGoal: sleepSettings.goalMinutes });
   screen.appendChild(renderTodayJournals(journalItems, today));
   const upcoming = renderUpcoming({ meds, takenToday, intakes, visits, now });
   if (upcoming) screen.appendChild(upcoming);
@@ -529,12 +541,17 @@ function renderRecentActivity(data) {
    Вкладка 2 — Показатели (сетка модулей)
    ========================================================= */
 async function MetricsScreen() {
-  const latests = await Promise.all(METRIC_ORDER.map((k) => Storage.getMetricLatest(k)));
+  const waistLog = await Storage.getWaistLog();
+  const latests = await Promise.all(METRICS_GRID.map((k) => {
+    if (k !== 'waist') return Storage.getMetricLatest(k);
+    const w = latestWaist(waistLog, dateKey());
+    return w ? { date: w.date, value: w.cm } : null;
+  }));
   const screen = el('<div></div>');
   screen.appendChild(el('<header class="header"><h1 class="header__title">Показатели</h1></header>'));
   const sec = el('<section class="section" style="margin-top:8px"><div class="mcard-grid"></div></section>');
   const grid = $('.mcard-grid', sec);
-  METRIC_ORDER.forEach((k, i) => grid.appendChild(metricCard(k, latests[i])));
+  METRICS_GRID.forEach((k, i) => grid.appendChild(metricCard(k, latests[i])));
   screen.appendChild(sec);
   screen.addEventListener('click', onRouteClick);
   return screen;
@@ -813,6 +830,28 @@ function flashNotifyResult(granted, onText) {
   else flash('Сохранено, но уведомления не разрешены');
 }
 
+/* Слой воды резервуара экрана «Вода»: две мягкие волны (задняя бледнее) и тело с градиентом.
+   Волна — два периода на ширину 200%: сдвиг на −50% бесшовно повторяет её. */
+const WATER_WAVE_PATH = 'M0,9 C16.5,2.5 33.5,2.5 50,9 S83.5,15.5 100,9 S133.5,2.5 150,9 S183.5,15.5 200,9 V19 H0 Z';
+const WATER_TANK_LAYER = `<div class="wtank__water" aria-hidden="true">
+  <svg class="wtank__wave wtank__wave--back" viewBox="0 0 200 18" preserveAspectRatio="none" focusable="false"><path d="${WATER_WAVE_PATH}"/></svg>
+  <svg class="wtank__wave" viewBox="0 0 200 18" preserveAspectRatio="none" focusable="false"><path d="${WATER_WAVE_PATH}"/></svg>
+  <div class="wtank__body"></div>
+</div>`;
+
+/* Шкала резервуара: 0 % — верх кнопки цели (или редактора цели), 100 % — верх заголовка
+   «💧 Вода». Середина волны ставится в px от верха резервуара (--surf-y); при 0 % слой целиком
+   ниже резервуара. Меряется по вёрстке — верно и на маленьких экранах, и с открытым редактором. */
+function placeTankWater(tank, level) {
+  const box = tank.getBoundingClientRect();
+  const low = tank.querySelector(':scope > .btn-ghost, :scope > .goal-editor').getBoundingClientRect().top - box.top;
+  const high = tank.querySelector('.header__title').getBoundingClientRect().top - box.top;
+  const waveH = parseFloat(getComputedStyle(tank).getPropertyValue('--wave-h')) || 0;
+  const y = level > 0 ? low - Math.min(level, 1) * (low - high) : box.height + waveH / 2;
+  tank.style.setProperty('--lvl', String(level));
+  tank.style.setProperty('--surf-y', `${y.toFixed(1)}px`);
+}
+
 async function WaterScreen() {
   const screen = el('<div></div>');
   /* Статистика: тип периода (ДН · НЕД · МЕС · 6 МЕС · ГОД) и смещение ‹ › — в записи истории:
@@ -822,6 +861,8 @@ async function WaterScreen() {
     ? { kind: savedUi.k, offset: Math.min(0, Math.trunc(savedUi.o) || 0) }
     : { kind: PERIOD_KINDS.includes(savedUi) ? savedUi : 'week', offset: 0 };
   let editingGoal = false;
+  let tankLevel = null; // уровень резервуара прошлой отрисовки — от него анимируется новый
+  let tankRO = null;
   const statsHost = el('<section class="section hstats" aria-label="Статистика воды"></section>');
   let segFrom = null; // сегмент до переключения — для анимации бегунка
   let statsData = null; // { log, goal } последней отрисовки — для смены периода без перечитывания экрана
@@ -838,15 +879,23 @@ async function WaterScreen() {
     const remaining = Math.max(0, goal - total);
     const color = fillColor(pct);
     screen.innerHTML = '';
-    screen.appendChild(backHeader('💧 Вода', { fallback: 'metrics' }));
+    /* Резервуар: верх экрана — от края экрана (с safe area) до низа кнопки цели. Вода поднимается
+       по сегодняшнему прогрессу (waterProgress: выпито / цель, 0…1) от верха кнопки цели (0 %) до
+       верха заголовка «💧 Вода» (100 %). Слой — под содержимым, без касаний; при записи уровень
+       плавно поднимается от прежнего значения. */
+    const level = waterProgress(total, goal).progress;
+    const tank = el(`<div class="wtank is-init${level > 0 ? ' is-wet' : ''}">${WATER_TANK_LAYER}</div>`);
+    screen.appendChild(tank);
+    tank.appendChild(backHeader('💧 Вода', { fallback: 'metrics' }));
 
     /* 1. Кольцо + 2. текущий объём / цель */
     const r = 60, circ = 2 * Math.PI * r;
     const off = circ * (1 - Math.min(pct, 100) / 100);
-    screen.appendChild(el(`
+    tank.appendChild(el(`
       <div class="water-hero">
         <div class="wring">
           <svg width="150" height="150" viewBox="0 0 150 150">
+            <circle class="wring__disc" cx="75" cy="75" r="${r - 6.5}"/>
             <circle cx="75" cy="75" r="${r}" fill="none" stroke="var(--surface-2)" stroke-width="13"/>
             <circle cx="75" cy="75" r="${r}" fill="none" stroke="${color}" stroke-width="13" stroke-linecap="round" stroke-dasharray="${circ.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" transform="rotate(-90 75 75)"/>
           </svg>
@@ -856,12 +905,28 @@ async function WaterScreen() {
       </div>
     `));
     if (editingGoal) {
-      screen.appendChild(buildGoalEditor(goal));
+      tank.appendChild(buildGoalEditor(goal));
     } else {
       const gb = el('<button class="btn-ghost" type="button" style="margin-top:10px">✎ Редактировать цель</button>');
       gb.addEventListener('click', () => { editingGoal = true; paint(); });
-      screen.appendChild(gb);
+      tank.appendChild(gb);
     }
+    /* Первая расстановка — без анимации (is-init), затем подъём от прежнего уровня к новому;
+       ResizeObserver переставляет воду при изменении вёрстки (шрифты, поворот экрана) */
+    let shown = tankLevel == null ? level : tankLevel;
+    let placed = false;
+    tankLevel = level;
+    if (tankRO) tankRO.disconnect();
+    tankRO = new ResizeObserver(() => {
+      placeTankWater(tank, shown);
+      if (placed) return;
+      placed = true;
+      requestAnimationFrame(() => {
+        tank.classList.remove('is-init');
+        if (shown !== level) requestAnimationFrame(() => { shown = level; placeTankWater(tank, level); });
+      });
+    });
+    tankRO.observe(tank);
 
     /* 3. Быстрое добавление */
     screen.appendChild(quickBar());
@@ -2997,6 +3062,8 @@ async function restoreFlow(file) {
     ['Сон', `${summary.sleep || 0} ${plural(summary.sleep || 0, 'запись', 'записи', 'записей')}`],
     ['Шаги', `${summary.steps || 0} ${plural(summary.steps || 0, 'день', 'дня', 'дней')}`],
     ['Велосипед', `${summary.bike || 0} ${plural(summary.bike || 0, 'поездка', 'поездки', 'поездок')}`],
+    ['Обхват талии', `${summary.waist || 0} ${plural(summary.waist || 0, 'измерение', 'измерения', 'измерений')}`],
+    ['Тренировки', `${summary.workouts || 0} ${plural(summary.workouts || 0, 'запись', 'записи', 'записей')}`],
   ];
   if (full) rows.push(['Документы анализов (PDF/фото)', full.attachments.length], ['Документы врачей и визитов', (full.visitAttachments || []).length]);
   const schemaLine = info.migrated ? `${info.schemaVersion} → будет обновлена до ${CURRENT_SCHEMA_VERSION}` : String(info.schemaVersion);
@@ -4166,6 +4233,371 @@ async function SleepLogScreen(param) {
 }
 
 /* =========================================================
+   Обхват талии (#/metric/waist) — модуль раздела «Показатели» (services/waist.js, ключ waist_log).
+   Шапка: «Назад» · «Обхват талии» · «+». Периоды НЕД · МЕС · 6 МЕС · ГОД (те же календарные
+   окна и переключатель, что у статистики воды), крупно — последнее измерение, линейный график
+   периода (ui/charts.js lineChart: шкала Y по данным, не от нуля), «Последнее» и «Изменение»
+   (последнее − первое измерение периода, без оценки), «Журнал измерений ›» → «Все журналы».
+   Пустое состояние — без «0 см». Период и смещение ‹ › — в записи истории (saveEntryUi).
+   ========================================================= */
+const WAIST_KIND_LABEL = { week: 'НЕД', month: 'МЕС', '6m': '6 МЕС', year: 'ГОД' };
+
+/* Добавить (current == null) или изменить / перенести / удалить измерение.
+   Дата занята → «Заменить?» (за день одно измерение). → { date } | { deleted: true, date } | null */
+async function editWaist({ date = dateKey(), current = null } = {}) {
+  const today = dateKey();
+  let v = { date, value: current ? fmtCm(current.cm) : '' };
+  for (;;) {
+    let raw = null;
+    const choice = await showDialog({
+      title: current ? 'Обхват талии' : 'Новое измерение',
+      body: `
+        <label class="field__label" for="ws-d">Дата</label>
+        <input class="input" type="date" id="ws-d" value="${esc(v.date)}" max="${esc(today)}">
+        <label class="field__label" for="ws-v" style="margin-top:10px">Обхват талии, см</label>
+        <input class="input" type="text" id="ws-v" inputmode="decimal" autocomplete="off" value="${esc(v.value)}" placeholder="92,5">
+        <p class="dialog__muted" style="margin:8px 0 0">За день хранится одно измерение. Можно указать любую прошлую дату.</p>
+      `,
+      actions: [
+        { label: 'Отмена', value: false },
+        ...(current ? [{ label: 'Удалить', value: 'delete', kind: 'danger' }] : []),
+        { label: 'Сохранить', value: true, kind: 'primary', onClick: () => { raw = { date: $('#ws-d').value, value: $('#ws-v').value }; } },
+      ],
+      cancelValue: false,
+    });
+    if (choice === 'delete') return (await deleteWaist(date, current)) ? { deleted: true, date } : null;
+    if (!choice || !raw) return null;
+    const n = normalizeWaistInput(raw, { today });
+    if (!n.ok) { await alertDialog('Измерение не сохранено', actErrorsHtml(n.errors)); v = raw; continue; }
+    const from = current ? date : null;
+    try {
+      await Storage.saveWaist(n.value, { from });
+    } catch (err) {
+      if (!(err instanceof EntryStoreError)) throw err;
+      if (err.code !== 'DUPLICATE_DATE') { await alertDialog(err.code === 'NOT_FOUND' ? 'Измерение не найдено' : 'Измерение не сохранено', `<p>${esc(err.message)}</p>`); return null; }
+      const old = err.existing || {};
+      const replace = await showDialog({
+        title: 'За эту дату уже есть измерение',
+        body: `<p>${esc(fmtDate(n.value.date))}: <b>${esc(fmtWaist(old.cm))}</b>.</p><p>Изменить его на <b>${esc(fmtWaist(n.value.cm))}</b>?</p><p class="dialog__muted">Второго измерения за ту же дату не будет.</p>`,
+        actions: [{ label: 'Отмена', value: false }, { label: 'Изменить', value: true, kind: 'primary' }],
+      });
+      if (!replace) return null;
+      try { await Storage.saveWaist(n.value, { from, overwrite: true }); } catch (e2) { await alertDialog('Измерение не сохранено', `<p>${esc(e2.message)}</p>`); return null; }
+    }
+    flash(from && from !== n.value.date ? `Перенесено на ${fmtDate(n.value.date)}` : from ? 'Сохранено ✓' : `${fmtWaist(n.value.cm)} · ${fmtDate(n.value.date)}`);
+    return { date: n.value.date };
+  }
+}
+async function deleteWaist(date, entry) {
+  const ok = await showDialog({
+    title: 'Удалить измерение?',
+    body: `<p>${esc(fmtDate(date))}: <b>${esc(fmtWaist(entry && entry.cm))}</b>.</p><p class="dialog__muted">Будет удалено измерение только этого дня.</p>`,
+    actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+  });
+  if (!ok) return false;
+  if (!(await Storage.removeWaist(date))) { await alertDialog('Измерение не найдено', '<p>Данные изменились. Ничего не удалено.</p>'); return false; }
+  flash('Удалено');
+  return true;
+}
+
+/* шапка внутреннего экрана с кнопкой «+» справа (как «Сон» с кнопкой настроек) */
+function addHeader(title, { fallback, addLabel, onAdd }) {
+  const header = el(`
+    <header class="header header--nav sleep-header">
+      <div class="sleep-header__row">
+        <h1 class="header__title"></h1>
+        <button class="sleep-gear hdr-add" type="button" aria-label="${esc(addLabel)}">${homeIcon('plus')}</button>
+      </div>
+    </header>
+  `);
+  $('.header__title', header).textContent = title;
+  $('.hdr-add', header).addEventListener('click', onAdd);
+  header.prepend(BackButton({ fallback }));
+  return header;
+}
+
+async function WaistScreen() {
+  const saved = readEntryUi('waist');
+  let ui = saved && typeof saved === 'object' && WAIST_PERIOD_KINDS.includes(saved.k)
+    ? { kind: saved.k, offset: Math.min(0, Math.trunc(saved.o) || 0) }
+    : { kind: 'month', offset: 0 };
+  let segFrom = null;
+  let log = {};
+  const screen = el('<div class="waist"></div>');
+  const body = el('<div></div>');
+  const add = async () => { const r = await editWaist({ date: dateKey() }); if (r) { ui = { ...ui, offset: 0 }; await reload(); } };
+  screen.append(addHeader('Обхват талии', { fallback: 'metrics', addLabel: 'Добавить измерение', onAdd: add }), body);
+
+  async function reload() { log = await Storage.getWaistLog(); paint(); }
+
+  function paint() {
+    saveEntryUi('waist', { k: ui.kind, o: ui.offset });
+    const today = dateKey();
+    const latest = latestWaist(log, today);
+    body.innerHTML = '';
+    if (!latest) {
+      const empty = el(`
+        <section class="med-empty waist-empty">
+          <span class="med-empty__icon" aria-hidden="true">${homeIcon('waist')}</span>
+          <h2 class="med-empty__title">Пока нет измерений</h2>
+          <p class="med-empty__text">Записывайте обхват талии за сегодня или любую прошлую дату — здесь появятся график и изменение за период.</p>
+          <button class="btn-primary btn-primary--brand med-empty__add waist-first" type="button">${homeIcon('plus')}<span>Добавить первое измерение</span></button>
+        </section>
+      `);
+      $('.waist-first', empty).addEventListener('click', add);
+      body.appendChild(empty);
+      return;
+    }
+    const P = waistPeriod(log, ui.kind, ui.offset, today);
+    const win = P.win;
+    const stats = el('<section class="section hstats waist-stats" aria-label="Обхват талии: динамика"></section>');
+    const segFromNow = segFrom;
+    segFrom = null;
+    stats.appendChild(PeriodSelector({
+      kinds: WAIST_PERIOD_KINDS.map((k) => ({ id: k, label: WAIST_KIND_LABEL[k], title: PERIOD_NAME[k] })),
+      active: win.kind,
+      onChange: (k) => { segFrom = ui.kind; ui = { kind: k, offset: 0 }; paint(); },
+      prev: segFromNow,
+    }));
+    stats.appendChild(MetricHeader({ caption: 'Последнее измерение', value: fmtCm(latest.cm), unit: 'см', range: fmtDate(latest.date) }));
+
+    const card = el(`
+      <div class="card waist-card">
+        <div class="waist-period"><span class="waist-period__range" aria-live="polite"></span></div>
+        <div class="waist-chart"></div>
+      </div>
+    `);
+    $('.waist-period__range', card).textContent = win.range;
+    const shift = (d) => { ui = { ...ui, offset: Math.min(0, ui.offset + d) }; paint(); };
+    $('.waist-period', card).appendChild(PeriodNavigator({ hasNext: win.hasNext, onPrev: () => shift(-1), onNext: () => shift(1) }));
+    const chartBox = $('.waist-chart', card);
+    if (!P.points.length) {
+      chartBox.appendChild(el('<p class="empty waist-chart__empty">Нет измерений за этот период</p>'));
+    } else {
+      const xLabels = win.kind === 'week' || win.kind === '6m' || win.kind === 'year'
+        ? win.buckets.map((b) => ({ day: dayNum(b.start) + (win.kind === 'week' ? 0 : 14), label: b.label }))
+        : null;
+      chartBox.appendChild(lineChart({
+        range: { start: dayNum(win.start), end: dayNum(win.end) }, fit: false, xLabels, minSpan: 2,
+        series: [{ key: 'waist', label: 'Обхват талии', color: 'var(--viz-1)', points: P.points.map((p) => ({ day: dayNum(p.date), value: p.cm })) }],
+        ariaLabel: `Обхват талии, ${win.range}: ${P.points.length} ${plural(P.points.length, 'измерение', 'измерения', 'измерений')}. Выберите точку, чтобы увидеть значение и дату.`,
+        readout: (day) => {
+          const p = P.points.find((x) => dayNum(x.date) === day);
+          return p ? `<span class="chart__rv">${esc(fmtWaist(p.cm))}</span><span class="chart__rd">${esc(fmtDate(p.date))}</span>` : '';
+        },
+      }));
+    }
+    const changeSub = P.change != null ? `${fmtDate(P.first.date)} → ${fmtDate(P.last.date)}` : P.points.length === 1 ? 'в периоде одно измерение' : 'нет измерений в периоде';
+    card.appendChild(el(`
+      <div class="sgrid waist-grid">
+        <div class="sgrid__item"><div class="sgrid__label">Последнее</div><div class="sgrid__val waist-last">${esc(P.last ? fmtWaist(P.last.cm) : '—')}</div><div class="sgrid__sub">${esc(P.last ? fmtDate(P.last.date) : 'нет измерений в периоде')}</div></div>
+        <div class="sgrid__item"><div class="sgrid__label">Изменение</div><div class="sgrid__val waist-change">${esc(fmtWaistChange(P.change))}</div><div class="sgrid__sub">${esc(changeSub)}</div></div>
+      </div>
+    `));
+    card.appendChild(el('<p class="st-note">Изменение — разница между первым и последним измерением выбранного периода.</p>'));
+    stats.appendChild(card);
+    body.appendChild(stats);
+
+    body.appendChild(el(`
+      <section class="section">
+        <div class="list-card">
+          <a class="row act-row waist-journal" href="#/journals/waist">
+            <div class="row__body"><p class="row__title">Журнал измерений</p><p class="row__sub">${Object.keys(log).length} ${plural(Object.keys(log).length, 'измерение', 'измерения', 'измерений')} · добавить, изменить, удалить</p></div>
+            <span class="row__chevron" aria-hidden="true">›</span>
+          </a>
+        </div>
+      </section>
+    `));
+  }
+
+  await reload();
+  return screen;
+}
+
+/* =========================================================
+   Тренировки (#/workouts, пункт бокового меню) — журнал Планки и «Другого упражнения»
+   (services/workouts.js, ключ workouts_log). Шаги, велосипед, сон и вода — свои разделы,
+   сюда не входят. Записи по дням (новые сверху) — те же карточки, что во «Всех журналах»;
+   запись → форма: изменить / удалить. Старые планка и «другое» из прежней «Активности»
+   перенесены сюда при запуске (Storage._migrateWorkouts).
+   ========================================================= */
+
+/* «+ Добавить тренировку»: сначала тип, затем форма. → дата | null */
+async function addWorkoutFlow(date = dateKey()) {
+  const kind = await showDialog({
+    title: 'Добавить тренировку',
+    body: '<p class="dialog__muted" style="margin:0">Выберите тип тренировки.</p>',
+    actions: [
+      { label: WORKOUT_TITLES.plank, value: 'plank', kind: 'primary' },
+      { label: WORKOUT_TITLES.other, value: 'other', kind: 'primary' },
+      { label: 'Отмена', value: false },
+    ],
+    stack: true,
+    cancelValue: false,
+  });
+  return kind ? editWorkout(null, { kind, date }) : null;
+}
+
+/* Форма тренировки: новая (kind, date) или правка w (дата, поля, заметка; тип не меняется).
+   Ошибка ввода → форма снова с введёнными значениями. → дата | { deleted: true } | null */
+async function editWorkout(w, { kind = w ? w.kind : 'plank', date = dateKey() } = {}) {
+  const today = dateKey();
+  const names = [...new Set([...WORKOUT_NAME_SUGGESTIONS, ...(await Storage.getWorkouts()).filter((x) => x.kind === 'other').map((x) => x.name)])];
+  let v = w
+    ? { date: w.date, sets: w.sets ?? '', seconds: w.seconds ?? '', name: w.name || '', minutes: w.minutes ?? '', note: w.note || '' }
+    : { date, sets: '', seconds: '', name: '', minutes: '', note: '' };
+  const plankHint = (sets, seconds) => {
+    const a = parseWorkoutInt(sets), b = parseWorkoutInt(seconds);
+    return Number.isInteger(a) && Number.isInteger(b) && a > 0 && b > 0 ? `Всего: ${a} × ${b} = ${a * b} сек${a * b >= 60 ? ` (${fmtSeconds(a * b)})` : ''}` : '';
+  };
+  for (;;) {
+    let raw = null;
+    const fields = kind === 'plank'
+      ? `<label class="field__label" for="wo-sets" style="margin-top:10px">Количество подходов</label>
+         <input class="input" type="text" id="wo-sets" inputmode="numeric" autocomplete="off" value="${esc(v.sets)}" placeholder="3">
+         <label class="field__label" for="wo-sec" style="margin-top:10px">Секунд в подходе</label>
+         <input class="input" type="text" id="wo-sec" inputmode="numeric" autocomplete="off" value="${esc(v.seconds)}" placeholder="60">
+         <p class="dialog__muted wo-total" id="wo-total" aria-live="polite" style="margin:6px 0 0">${esc(plankHint(v.sets, v.seconds))}</p>`
+      : `<label class="field__label" for="wo-name" style="margin-top:10px">Название упражнения</label>
+         <input class="input" type="text" id="wo-name" list="wo-names" maxlength="${WORKOUT_NAME_MAX}" autocomplete="off" value="${esc(v.name)}" placeholder="Отжимания">
+         <datalist id="wo-names">${names.map((n) => `<option value="${esc(n)}"></option>`).join('')}</datalist>
+         <label class="field__label" for="wo-min" style="margin-top:10px">Длительность, минут</label>
+         <input class="input" type="text" id="wo-min" inputmode="numeric" autocomplete="off" value="${esc(v.minutes)}" placeholder="15">`;
+    const pending = showDialog({
+      title: w ? workoutTitle(w) : kind === 'plank' ? 'Планка' : 'Другое упражнение',
+      body: `
+        <label class="field__label" for="wo-d">Дата</label>
+        <input class="input" type="date" id="wo-d" value="${esc(v.date)}" max="${esc(today)}">
+        ${fields}
+        <label class="field__label" for="wo-note" style="margin-top:10px">Заметка (необязательно)</label>
+        <input class="input" type="text" id="wo-note" maxlength="${WORKOUT_NOTE_MAX}" value="${esc(v.note)}">
+      `,
+      actions: [
+        { label: 'Отмена', value: false },
+        ...(w ? [{ label: 'Удалить', value: 'delete', kind: 'danger' }] : []),
+        {
+          label: 'Сохранить', value: true, kind: 'primary',
+          onClick: () => {
+            raw = { kind, date: $('#wo-d').value, note: $('#wo-note').value };
+            if (kind === 'plank') Object.assign(raw, { sets: $('#wo-sets').value, seconds: $('#wo-sec').value });
+            else Object.assign(raw, { name: $('#wo-name').value, minutes: $('#wo-min').value });
+          },
+        },
+      ],
+      cancelValue: false,
+    });
+    if (kind === 'plank') {
+      const upd = () => { $('#wo-total').textContent = plankHint($('#wo-sets').value, $('#wo-sec').value); };
+      $('#wo-sets').addEventListener('input', upd);
+      $('#wo-sec').addEventListener('input', upd);
+    }
+    const choice = await pending;
+    if (choice === 'delete') return (await deleteWorkout(w)) ? { deleted: true } : null;
+    if (!choice || !raw) return null;
+    const n = normalizeWorkoutInput(raw, { today });
+    if (!n.ok) { await alertDialog('Тренировка не сохранена', actErrorsHtml(n.errors)); v = { ...v, ...raw }; continue; }
+    try {
+      if (w) {
+        if (!(await Storage.updateWorkout(w.id, n.value))) { await alertDialog('Тренировка не найдена', '<p>Данные изменились, пока была открыта форма. Ничего не изменено.</p>'); return null; }
+      } else {
+        await Storage.addWorkout(n.value);
+      }
+    } catch (err) {
+      if (!(err instanceof EntryStoreError)) throw err;
+      await alertDialog('Тренировка не сохранена', `<p>${esc(err.message)}</p>`);
+      return null;
+    }
+    flash(w && w.date !== n.value.date ? `Перенесено на ${fmtDate(n.value.date)}` : w ? 'Сохранено ✓' : `${workoutTitle(n.value)} · ${fmtDate(n.value.date)}`);
+    return n.value.date;
+  }
+}
+async function deleteWorkout(w) {
+  const ok = await showDialog({
+    title: 'Удалить тренировку?',
+    body: `<p>${esc(fmtDate(w.date))}: <b>${esc(workoutTitle(w))}</b>, ${esc(workoutValue(w))}.</p><p class="dialog__muted">Будет удалена только эта запись.</p>`,
+    actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+  });
+  if (!ok) return false;
+  if (!(await Storage.removeWorkout(w.id))) { await alertDialog('Тренировка не найдена', '<p>Данные изменились. Ничего не удалено.</p>'); return false; }
+  flash('Удалено');
+  return true;
+}
+
+async function WorkoutsScreen() {
+  const today = dateKey();
+  const ui = readEntryUi('workouts');
+  let limit = ui && Number.isInteger(ui.limit) && ui.limit > 0 ? ui.limit : JOURNAL_PAGE_DAYS;
+  const types = [journalType('workout')];
+  const screen = el('<div class="workouts"></div>');
+  screen.appendChild(backHeader('Тренировки', { fallback: 'home' }));
+  const tools = el('<div class="jtools"></div>');
+  const list = el('<div class="jlist"></div>');
+  screen.append(tools, list);
+  let groups = [];
+  const remember = () => saveEntryUi('workouts', { limit });
+
+  async function reload() {
+    groups = groupJournal(buildJournal({ workouts: await Storage.getWorkouts() }, {}, types), { today });
+    paint();
+  }
+  /* после правки / удаления / добавления — перечитать на месте (та же прокрутка) */
+  async function after(res) {
+    if (!res) return;
+    const y = window.scrollY;
+    await reload();
+    const d = typeof res === 'string' ? res : null;
+    const i = d ? groups.findIndex((g) => g.date === d) : -1;
+    if (i >= limit) { limit = i + 1; paint(); }
+    window.scrollTo(0, y);
+  }
+  const addNew = async () => after(await addWorkoutFlow(today));
+
+  function paint() {
+    remember();
+    tools.innerHTML = '';
+    list.innerHTML = '';
+    if (!groups.length) {
+      const empty = el(`
+        <section class="med-empty workouts-empty">
+          <span class="med-empty__icon" aria-hidden="true">${homeIcon('workout')}</span>
+          <h2 class="med-empty__title">Пока нет тренировок</h2>
+          <p class="med-empty__text">Планка или любое упражнение — за сегодня или прошлую дату.</p>
+          <button class="btn-primary btn-primary--brand med-empty__add workouts-first" type="button">${homeIcon('plus')}<span>Добавить первую тренировку</span></button>
+        </section>
+      `);
+      $('.workouts-first', empty).addEventListener('click', addNew);
+      list.appendChild(empty);
+      return;
+    }
+    const addBtn = el(`<button class="btn-primary btn-primary--brand jtools__add workouts-add" type="button">${homeIcon('plus')}<span>Добавить тренировку</span></button>`);
+    addBtn.addEventListener('click', addNew);
+    tools.appendChild(addBtn);
+    const shown = visibleDays(groups, limit);
+    shown.forEach((g) => {
+      const sec = el(`
+        <section class="jgroup" data-date="${g.date}">
+          <h2 class="jgroup__head"><span class="jgroup__day"></span> <span class="jgroup__sum"><span class="jgroup__dot" aria-hidden="true">•</span> <span class="jgroup__val"></span></span></h2>
+          <div class="jcards"></div>
+        </section>
+      `);
+      $('.jgroup__day', sec).textContent = g.label;
+      $('.jgroup__val', sec).textContent = g.summary;
+      g.items.forEach((it) => $('.jcards', sec).appendChild(journalCard(it, async (x) => after(await editWorkout(x.ref.workout)))));
+      list.appendChild(sec);
+    });
+    if (shown.length < groups.length) {
+      const rest = groups.length - shown.length;
+      const more = el(`<button class="btn-ghost jmore" type="button">Показать ещё · ${rest} ${plural(rest, 'день', 'дня', 'дней')}</button>`);
+      more.addEventListener('click', () => { limit += JOURNAL_PAGE_DAYS; paint(); });
+      list.appendChild(more);
+    }
+  }
+
+  await reload();
+  return screen;
+}
+
+/* =========================================================
    Все журналы (#/journals[/<тип>[/ГГГГ-ММ-ДД]]) — единый журнал всех записей.
    Данные — те же ключи Storage, что у разделов: services/journals.js превращает их при чтении
    в одинаковые элементы (отдельного хранилища нет). Здесь — только общий UI и действия по типу:
@@ -4278,6 +4710,14 @@ const JOURNAL_ACTIONS = {
     open: (it) => editRide(it.ref.ride, it.ref.date, { withDelete: true }),
   },
 };
+JOURNAL_ACTIONS.waist = {
+  add: (date) => editWaist({ date }),
+  open: (it) => editWaist({ date: it.ref.date, current: it.ref.entry }),
+};
+JOURNAL_ACTIONS.workout = {
+  add: (date) => addWorkoutFlow(date),
+  open: (it) => editWorkout(it.ref.workout),
+};
 POINT_JOURNAL_KEYS.forEach((k) => {
   JOURNAL_ACTIONS[k] = {
     add: (date) => editPointMetric(k, { date }),
@@ -4287,11 +4727,11 @@ POINT_JOURNAL_KEYS.forEach((k) => {
 
 /* Все элементы журнала из уже прочитанных данных (Главная читает их сама) или из Storage */
 async function loadJournalItems() {
-  const [metricsLog, waterGoal, sleep, sleepSettings, steps, bike] = await Promise.all([
+  const [metricsLog, waterGoal, sleep, sleepSettings, steps, bike, waist, workouts] = await Promise.all([
     Storage.getMetricsLog(), Storage.getWaterGoal(), Storage.getSleepEntries(), Storage.getSleepSettings(),
-    Storage.getDailyActivityLog('steps'), Storage.getBikeRides(),
+    Storage.getDailyActivityLog('steps'), Storage.getBikeRides(), Storage.getWaistLog(), Storage.getWorkouts(),
   ]);
-  return buildJournal({ metricsLog, sleep, steps, bike }, { waterGoal, sleepGoal: sleepSettings.goalMinutes });
+  return buildJournal({ metricsLog, sleep, steps, bike, waist, workouts }, { waterGoal, sleepGoal: sleepSettings.goalMinutes });
 }
 
 /* Кольцо прогресса (цель дня): доля до 100 %, сверх цели — полное кольцо */
@@ -5984,6 +6424,7 @@ const DRAWER_SECTIONS = [
     { route: 'metric/water', icon: '💧', title: 'Вода' },
     { route: 'steps', icon: '👟', title: 'Шаги' },
     { route: 'bike', icon: '🚴', title: 'Велосипед' },
+    { route: 'workouts', icon: '🏋️', title: 'Тренировки' },
     { route: 'visits', icon: '🩺', title: 'Врачи и визиты' },
   ],
   [
@@ -6126,9 +6567,11 @@ function resolve() {
   if (h.startsWith('test-history/')) return { fn: () => TestHistoryScreen(safeDecode(h.slice(13))), tab: 'tests', main: false };
   if (h === 'water-log' || h.startsWith('water-log/')) return { fn: () => WaterLogScreen(h.slice(10)), tab: 'metrics', main: false };
   if (h === 'journals' || h.startsWith('journals/')) return { fn: () => JournalsScreen(h.slice(9)), tab: null, main: false };
+  if (h === 'workouts') return { fn: WorkoutsScreen, tab: null, main: false };
   if (h.startsWith('metric/')) {
     const k = h.slice(7);
     if (k === 'water') return { fn: WaterScreen, tab: 'metrics', main: true };
+    if (k === 'waist') return { fn: WaistScreen, tab: 'metrics', main: false }; // справа в шапке «+», аватара нет
     if (METRICS[k]) return { fn: () => MetricScreen(k), tab: 'metrics', main: true };
   }
   if (SCREENS[h]) return { fn: SCREENS[h], tab: TAB_ROUTES.includes(h) ? h : null, main: TAB_ROUTES.includes(h) };

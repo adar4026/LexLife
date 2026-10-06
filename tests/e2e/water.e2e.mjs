@@ -8,7 +8,11 @@
      • выбор столбца: подсказка с датой и значением, заголовок уступает ей место, касание вне — снять;
      • изменение записи воды (быстрое добавление) — график и среднее обновляются, период тот же;
      • «Назад» из журнала — тот же период и смещение;
-     • нет горизонтальной прокрутки, подписи оси не обрезаны, подписи X не наезжают; обе темы.
+     • нет горизонтальной прокрутки, подписи оси не обрезаны, подписи X не наезжают; обе темы;
+     • резервуар hero (.wtank): уровень = выпито / цель (0…1); шкала — от верха кнопки цели (0 %)
+       до верха заголовка «💧 Вода» (100 %); вода только в hero (от верха экрана до низа кнопки
+       цели), не перехватывает касания, плавно поднимается после записи,
+       reduced motion без движения, подписи поверх воды контрастны в обеих темах.
 
    Только на localhost (отдельный origin с синтетическими данными). Перед запуском сохраняет
    затрагиваемые ключи этого origin, после — возвращает их.
@@ -204,6 +208,106 @@ export async function run({ keep = false } = {}) {
     }
     const seg = $$('.hseg__btn').map((b) => b.getBoundingClientRect().height);
     check('7a. сегменты одной высоты, компактные (28–34px)', seg.every((x) => Math.abs(x - seg[0]) < 0.5 && x >= 28 && x <= 34), seg.join(','));
+
+    /* ---------- 8. резервуар воды в hero ---------- */
+    const setToday = async (ml) => {
+      const m = JSON.parse(localStorage.getItem('metrics_log'));
+      m.water[today] = { total: ml, entries: ml ? [{ t: '09:00', ml }] : [] };
+      localStorage.setItem('metrics_log', JSON.stringify(m));
+      await go('#/metric/water');
+      await waitFor(() => $('.wtank .water-hero'), 'резервуар');
+      window.scrollTo(0, 0);
+      document.querySelector('.screen')?.scrollTo(0, 0);
+      await sleep(60);
+    };
+    const tankGeo = () => {
+      const t = $('.wtank').getBoundingClientRect();
+      const w = $('.wtank__water').getBoundingClientRect();
+      const waveH = parseFloat(getComputedStyle($('.wtank')).getPropertyValue('--wave-h'));
+      const low = $('.wtank > .btn-ghost, .wtank > .goal-editor').getBoundingClientRect().top; // 0 %
+      const high = $('.wtank .header__title').getBoundingClientRect().top; // 100 %
+      return { t, w, waveH, low, high, mid: w.top + waveH / 2, lvl: Number($('.wtank').style.getPropertyValue('--lvl')) };
+    };
+    for (const [ml, lv] of [[0, 0], [312, 0.12], [1300, 0.5], [2600, 1], [3900, 1]]) {
+      await setToday(ml);
+      const g = tankGeo();
+      const fill = (g.low - g.mid) / (g.low - g.high);
+      const geoOk = lv === 0 ? g.w.top >= g.t.bottom - 0.5 : Math.abs(fill - lv) < 0.005;
+      check(`8a·${ml} мл. уровень ${Math.round(lv * 100)} % (цель ${GOAL}): от верха кнопки цели (0 %) до заголовка «Вода» (100 %)`, g.lvl === lv && geoOk && $('.wtank').classList.contains('is-wet') === lv > 0,
+        `--lvl=${g.lvl} fill=${fill.toFixed(3)} волна=${g.mid.toFixed(1)} кнопка=${g.low.toFixed(1)} заголовок=${g.high.toFixed(1)}`);
+    }
+    await setToday(312);
+    check('8a·. 12 %: вода видна над кнопкой цели', tankGeo().mid < tankGeo().low - 10);
+    $('.wtank > .btn-ghost').click();
+    await waitFor(() => $('.wtank > .goal-editor'), 'редактор цели');
+    await sleep(80);
+    const ge = tankGeo();
+    check('8a·. с открытым редактором цели шкала — от его верха', Math.abs((ge.low - ge.mid) / (ge.low - ge.high) - 0.12) < 0.005, `${ge.mid.toFixed(1)} / ${ge.low.toFixed(1)}…${ge.high.toFixed(1)}`);
+    await setToday(1300);
+    const tank = $('.wtank');
+    const tr = tank.getBoundingClientRect();
+    const goalBtn = [...tank.children].find((n) => n.matches('.btn-ghost'));
+    check('8b. в резервуаре: шапка, кольцо, «осталось / цель», кнопка цели; ниже — всё остальное',
+      $('#screen > div > .wtank:first-child') && tank.querySelector(':scope > .header--nav') && tank.querySelector(':scope > .water-hero .wring') && goalBtn && /Редактировать цель/.test(txt(goalBtn))
+        && !tank.querySelector('.wqbar, .hstats, .plan-row, .stat-row') && tank.nextElementSibling?.matches('.wqbar'));
+    check('8c. резервуар — от верха экрана до низа кнопки цели, во всю ширину, вода не выходит за него',
+      Math.abs(tr.top) < 1 && Math.abs(tr.bottom - goalBtn.getBoundingClientRect().bottom) < 1 && tr.left <= 0.5 && Math.abs(tr.right - Math.min(window.innerWidth, $('.app').getBoundingClientRect().right)) < 1
+        && getComputedStyle(tank).overflow === 'hidden' && document.documentElement.scrollWidth <= window.innerWidth,
+      `${tr.top.toFixed(1)}…${tr.bottom.toFixed(1)} / кнопка ${goalBtn.getBoundingClientRect().bottom.toFixed(1)}; ${tr.left}…${tr.right}`);
+    const ringR = $('.wring').getBoundingClientRect();
+    const gbR = goalBtn.getBoundingClientRect();
+    check('8d. вода не перехватывает касания: кольцо и кнопка цели — сверху',
+      getComputedStyle($('.wtank__water')).pointerEvents === 'none'
+        && !document.elementFromPoint(ringR.left + ringR.width / 2, ringR.top + ringR.height / 2).closest('.wtank__water')
+        && document.elementFromPoint(gbR.left + gbR.width / 2, gbR.top + gbR.height / 2) === goalBtn);
+    const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const waveCs = getComputedStyle($('.wtank__wave:not(.wtank__wave--back)'));
+    const waterCs = getComputedStyle($('.wtank__water'));
+    check(`8e. движение волны ${reduce ? 'выключено (prefers-reduced-motion: reduce)' : 'медленное и только transform'}`,
+      reduce ? waveCs.animationName === 'none' && parseFloat(waterCs.transitionDuration) === 0
+        : waveCs.animationName === 'wtank-drift' && parseFloat(waveCs.animationDuration) >= 10 && waterCs.transitionProperty === 'transform',
+      `${waveCs.animationName} ${waveCs.animationDuration} / ${waterCs.transitionProperty} ${waterCs.transitionDuration}`);
+
+    /* быстрое добавление: уровень поднимается от прежнего, плавно (без reduce) */
+    const y0 = tankGeo().w.top;
+    const chip = $('.wqbar__chip');
+    const add = Number(txt(chip).replace(/[^\d]/g, ''));
+    chip.click();
+    await waitFor(() => $('.wtank') !== tank, 'перерисовка после записи');
+    const lv1 = Math.min((1300 + add) / GOAL, 1);
+    await sleep(reduce ? 120 : 300);
+    const yMid = tankGeo().w.top;
+    await sleep(reduce ? 0 : 1100);
+    const g1 = tankGeo();
+    check(`8f. +${add} мл: уровень ${Math.round(lv1 * 100)} %, ${reduce ? 'сразу' : 'плавно (промежуточное положение)'}`,
+      Math.abs(g1.lvl - lv1) < 1e-9 && g1.w.top < y0 && (reduce ? Math.abs(yMid - g1.w.top) < 0.5 : yMid < y0 - 0.5 && yMid > g1.w.top + 0.5),
+      `top ${y0.toFixed(1)} → ${yMid.toFixed(1)} → ${g1.w.top.toFixed(1)}; --lvl=${g1.lvl}`);
+
+    /* читаемость поверх воды: контраст подписей с водой (смесь цвета воды и фона) */
+    const rgb = (c) => {
+      c = c.trim();
+      if (c[0] === '#') { const h = c.length === 4 ? [...c.slice(1)].map((x) => x + x).join('') : c.slice(1); return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)); }
+      return c.match(/[\d.]+/g).slice(0, 3).map(Number);
+    };
+    const lum = (c) => { const v = c.map((x) => { x /= 255; return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4; }); return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]; };
+    const contrast = (a, b) => { const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p); return (x + 0.05) / (y + 0.05); };
+    const mix = (a, b, t) => a.map((x, i) => x * t + b[i] * (1 - t));
+    for (const theme of ['light', 'dark']) {
+      document.documentElement.dataset.theme = theme;
+      await setToday(2600);
+      const root = getComputedStyle($('.wtank'));
+      const bg = rgb(getComputedStyle(document.body).backgroundColor);
+      const water = mix(rgb(root.getPropertyValue('--water-a')), bg, Number(root.getPropertyValue('--water-alpha')));
+      const disc = mix(bg, water, 0.72);
+      const c = {
+        title: contrast(rgb(getComputedStyle($('.wtank .header__title')).color), water),
+        row: contrast(rgb(getComputedStyle($('.water-goalrow span')).color), water),
+        bold: contrast(rgb(getComputedStyle($('.water-goalrow b')).color), water),
+        val: contrast(rgb(getComputedStyle($('.wring__val')).color), disc),
+      };
+      check(`8g·${theme}. 100 %: заголовок, «осталось / цель», число в кольце читаемы (≥ 4.5:1)`, Object.values(c).every((x) => x >= 4.5),
+        Object.entries(c).map(([k, v]) => `${k} ${v.toFixed(2)}`).join(', '));
+    }
 
     return { ok: results.every((x) => x.ok), results };
   } finally {

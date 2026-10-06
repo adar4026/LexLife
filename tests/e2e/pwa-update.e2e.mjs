@@ -164,7 +164,7 @@ const pageBuildInfo = (tab) => evaluate(tab, "return (await (await fetch('build-
 
 /* Разделы, которые новая версия добавляет при первом запуске (аддитивно, без смены схемы):
    шаги / велосипед и отметка переноса старой «Активности» (services/activity.js) */
-const ADDITIVE_KEYS = ['steps_log', 'bike_log', 'activity_migration'];
+const ADDITIVE_KEYS = ['steps_log', 'bike_log', 'activity_migration', 'waist_log', 'workouts_log', 'workouts_migration'];
 /* Прежние данные байт-в-байт; новых ключей — только из ADDITIVE_KEYS; IndexedDB и push — как были */
 function sameExceptAdditive(nextJson, prevJson) {
   const a = JSON.parse(nextJson), b = JSON.parse(prevJson);
