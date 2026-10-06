@@ -4377,12 +4377,12 @@ async function JournalsScreen(param) {
     shown.forEach((g) => {
       const sec = el(`
         <section class="jgroup" id="jg-${g.date}" data-date="${g.date}">
-          <h2 class="jgroup__head"><span class="jgroup__day"></span> <span class="jgroup__dot" aria-hidden="true">•</span> <span class="jgroup__sum"></span></h2>
+          <h2 class="jgroup__head"><span class="jgroup__day"></span> <span class="jgroup__sum"><span class="jgroup__dot" aria-hidden="true">•</span> <span class="jgroup__val"></span></span></h2>
           <div class="jcards"></div>
         </section>
       `);
       $('.jgroup__day', sec).textContent = g.label;
-      $('.jgroup__sum', sec).textContent = g.summary;
+      $('.jgroup__val', sec).textContent = g.summary; // «• итог» не разрывается: длинная дата переносит итог целиком на вторую строку
       if (focus && g.date === focus) sec.classList.add('jgroup--focus');
       const box = $('.jcards', sec);
       g.items.forEach((it) => box.appendChild(journalCard(it, open)));
