@@ -39,6 +39,7 @@ import { createPushClient, SYNC_FAIL_TEXT, SERVER_FALLBACK_MS } from './services
 import { createOccurrenceStore } from './services/occurrenceStore.js';
 import { NEW_HOME_URL, PRIMARY_URL, migrationMode, deploymentRole, serverPushAllowed } from './services/deployment.js';
 import { createUpdateController, isFormRoute, hasUnsavedInput, UPDATE_MSG } from './services/swUpdate.js';
+import { buildJournal, filterJournal, groupJournal, journalFilters, journalEmptyText, journalType, visibleDays, todayJournal, parseJournalRoute, journalRoute, JOURNAL_PAGE_DAYS } from './services/journals.js';
 
 /* Документы анализов: файлы в IndexedDB (только на этом устройстве), метаданные — в health_tests */
 const Attachments = new AttachmentService(Storage, new IdbAttachmentStore());
@@ -90,6 +91,7 @@ const METRICS = {
   glucose: { key: 'glucose', name: 'Глюкоза', emoji: '🍬', unit: 'ммоль/л', kind: 'single', step: '0.1' },
 };
 const METRIC_ORDER = ['weight', 'pressure', 'pulse', 'water', 'temperature', 'spo2', 'glucose'];
+const POINT_JOURNAL_KEYS = METRIC_ORDER.filter((k) => METRICS[k].kind !== 'water'); // значение за день — «Все журналы»
 
 const fmtMl = (ml) => (ml == null ? '—' : Math.round(ml).toLocaleString('ru-RU'));
 const fmtMetric = (key, v) => {
@@ -204,6 +206,8 @@ async function HomeScreen() {
   screen.appendChild(renderHomeSleep(getSleepForDate(sleepEntries, today), sleepSettings.goalMinutes));
   const activityStores = { steps: stepsLog, bike: bikeRides };
   ACTIVITY_KEYS.forEach((k) => screen.appendChild(renderHomeActivity(k, activityStores[k], today)));
+  const journalItems = buildJournal({ metricsLog, sleep: sleepEntries, steps: stepsLog, bike: bikeRides }, { waterGoal: goal, sleepGoal: sleepSettings.goalMinutes });
+  screen.appendChild(renderTodayJournals(journalItems, today));
   const upcoming = renderUpcoming({ meds, takenToday, intakes, visits, now });
   if (upcoming) screen.appendChild(upcoming);
   const attention = renderAttentionSection(tests);
@@ -727,7 +731,7 @@ function metricStats(log, p, key) {
 }
 
 function historyList(log, key) {
-  const sec = el('<section class="section"><div class="section__head"><h2 class="section__title">История</h2></div><div class="list-card"></div></section>');
+  const sec = el(`<section class="section"><div class="section__head"><h2 class="section__title">История</h2><a class="section__action metric-journal" href="#/journals/${esc(key)}">Журнал ›</a></div><div class="list-card"></div></section>`);
   const box = $('.list-card', sec);
   const days = Object.keys(log).sort((a, b) => b.localeCompare(a)).slice(0, 14);
   if (!days.length) { box.appendChild(el('<div class="empty">Нет записей</div>')); return sec; }
@@ -1083,7 +1087,7 @@ async function WaterScreen() {
 
   /* Журнал приёмов за сегодня (с удалением) */
   function journal(entries, day) {
-    const sec = el('<section class="section"><div class="section__head"><h2 class="section__title">Сегодня · приёмы</h2><button class="section__action" type="button" data-route="water-log">Журнал ›</button></div><div class="list-card" id="jbox"></div></section>');
+    const sec = el('<section class="section"><div class="section__head"><h2 class="section__title">Сегодня · приёмы</h2><button class="section__action" type="button" data-route="journals/water">Журнал ›</button></div><div class="list-card" id="jbox"></div></section>');
     $('.section__action', sec).addEventListener('click', onRouteClick);
     const box = $('#jbox', sec);
     if (!entries.length) { box.appendChild(el('<div class="empty">Пока нет приёмов</div>')); return sec; }
@@ -1824,7 +1828,7 @@ async function SleepScreen() {
     const head = el(`
       <div class="section__head sleep-history__head">
         <h2 class="section__title" id="sl-hist-title">История</h2>
-        <span class="sleep-history__acts"><a class="section__action sleep-journal" href="#/sleep-log/${esc(ym)}">Журнал ›</a><a class="med-add" href="#/sleep/new" aria-label="Добавить запись сна">${homeIcon('plus')}<span>Добавить</span></a></span>
+        <span class="sleep-history__acts"><a class="section__action sleep-journal" href="#/journals/sleep">Журнал ›</a><a class="med-add" href="#/sleep/new" aria-label="Добавить запись сна">${homeIcon('plus')}<span>Добавить</span></a></span>
       </div>
     `);
     const nav = el(`
@@ -1915,9 +1919,10 @@ async function SleepFormScreen(id, presetDate = null) {
   const [existing, settings] = await Promise.all([id ? Storage.getSleepEntry(id) : null, Storage.getSleepSettings()]);
   const screen = el('<div class="med-form sleep-form"></div>');
   const route = location.hash;
-  /* открыта из журнала сна — после сохранения / удаления возвращается в журнал, иначе — в «Сон» */
+  /* открыта из журнала сна, «Всех журналов» или Главной — после сохранения / удаления возвращается
+     туда же (тот же фильтр и прокрутка — из записи истории), иначе — в «Сон» */
   const from = prevRoute() || '';
-  const backTo = from.startsWith('#/sleep-log') ? from.slice(2) : 'sleep';
+  const backTo = /^#\/(?:sleep-log|journals)(?:\/|$)|^#\/home$/.test(from) ? from.slice(2) : 'sleep';
   const leave = () => { sleepDraft = null; goBack(backTo); };
   screen.appendChild(backHeader(id ? 'Запись сна' : 'Новая запись сна', { onBack: leave }));
   if (id && !existing) {
@@ -3471,15 +3476,88 @@ function journalFocus(screen, prefix, focusDay, hasDay) {
   if (focusDay) setTimeout(() => { const n = document.getElementById(`${prefix}-${focusDay}`); if (n) n.scrollIntoView({ block: 'start' }); }, 60);
 }
 
+/* Запись воды: подпись источника, форма, добавление, правка (в т.ч. перенос на другую дату) и удаление.
+   Общие для журнала воды (#/water-log) и «Всех журналов» — один и тот же редактор. */
+const waterSrcLabel = (e) => {
+  const drink = e.drink && e.drink !== 'Вода' ? ` · ${esc(e.drink)}${e.hydrationMl ? ` (${fmtMl(e.hydrationMl)} мл напитка)` : ''}` : '';
+  return `${isWaterMinderKey(e.key) ? 'WaterMinder' : 'вручную'}${drink}`;
+};
+/* Форма записи: дату, фактическое время и объём задаёт пользователь.
+   withDelete — третья кнопка «Удалить» (→ 'delete'). → значения | 'delete' | null */
+async function waterEntryForm(title, submit, v, { withDelete = false } = {}) {
+  const today = dateKey();
+  let vals = null;
+  const choice = await showDialog({
+    title,
+    body: `
+      <label class="field__label" for="wl-d">Дата</label>
+      <input class="input" type="date" id="wl-d" value="${esc(v.date)}" max="${esc(today)}">
+      <label class="field__label" for="wl-t" style="margin-top:10px">Время</label>
+      <input class="input" type="time" id="wl-t" value="${esc(v.t)}">
+      <label class="field__label" for="wl-ml" style="margin-top:10px">Объём, мл</label>
+      <input class="input" type="number" id="wl-ml" min="1" max="5000" step="1" inputmode="numeric" value="${esc(v.ml)}">
+    `,
+    actions: [
+      { label: 'Отмена', value: false },
+      ...(withDelete ? [{ label: 'Удалить', value: 'delete', kind: 'danger' }] : []),
+      { label: submit, value: true, kind: 'primary', onClick: () => { vals = { date: $('#wl-d').value, t: $('#wl-t').value, ml: Number($('#wl-ml').value) }; } },
+    ],
+    cancelValue: false,
+  });
+  if (choice === 'delete') return 'delete';
+  if (!choice || !vals) return null;
+  if (!WL_DATE_RE.test(vals.date) || vals.date > today || !WL_TIME_RE.test(vals.t) || !(vals.ml > 0 && vals.ml <= 5000)) {
+    await showDialog({ title: 'Запись не сохранена', body: '<p>Укажите дату не позже сегодняшней, время ЧЧ:ММ и объём от 1 до 5000 мл.</p>', actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+    return null;
+  }
+  vals.ml = Math.round(vals.ml);
+  return vals;
+}
+/* Новая запись на дату date (по умолчанию — сегодня, текущее время). → дата записи | null */
+async function addWaterEntryDialog(date = dateKey()) {
+  const vals = await waterEntryForm('Новая запись', 'Добавить', { date, t: hhmmNow(), ml: 250 });
+  if (!vals) return null;
+  await Storage.addWaterEntry(vals.ml, vals.date, vals.t);
+  flash(`+${fmtMl(vals.ml)} мл · ${fmtDate(vals.date)}`);
+  return vals.date;
+}
+/* Правка записи e (индекс i) дня d. withDelete — в форме есть «Удалить» (подтверждение — deleteWaterEntry).
+   → { date } — куда смотреть после правки | { deleted } | null — отменено */
+async function editWaterEntry(d, e, i, { withDelete = false, dayTotal = null } = {}) {
+  const vals = await waterEntryForm('Редактировать запись', 'Сохранить', { date: d, t: e.t, ml: e.ml }, { withDelete });
+  if (vals === 'delete') return (await deleteWaterEntry(d, e, i, dayTotal ?? (await Storage.getWater(d)))) ? { deleted: true, date: d } : null;
+  if (!vals) return null;
+  const ok = await Storage.updateWaterEntry(d, i, { t: e.t, ml: e.ml, key: e.key ?? null }, vals);
+  if (!ok) {
+    await showDialog({ title: 'Запись не найдена', body: '<p>Данные изменились, пока была открыта форма. Ничего не изменено.</p>', actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+  } else {
+    flash(vals.date !== d ? `Перенесено на ${fmtDate(vals.date)}` : 'Сохранено ✓');
+  }
+  return { date: vals.date };
+}
+/* Удаление одной записи (с подтверждением). → true — подтверждено (удалено или уже нет), false — отменено */
+async function deleteWaterEntry(d, e, i, dayTotal) {
+  const ok = await showDialog({
+    title: 'Удалить запись?',
+    body: `<p>${esc(fmtDate(d))}, <b>${esc(e.t)} · ${fmtMl(e.ml)} мл</b> (${waterSrcLabel(e)}).</p><p class="dialog__muted">Будет удалена только эта запись. Итог дня станет ${fmtMl(Math.max(0, dayTotal - e.ml))} мл.</p>`,
+    actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+  });
+  if (!ok) return false;
+  const done = await Storage.removeWaterEntry(i, d, { t: e.t, ml: e.ml, key: e.key ?? null });
+  if (!done) {
+    await showDialog({ title: 'Запись не найдена', body: '<p>Данные изменились. Ничего не удалено.</p>', actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
+  } else {
+    flash('Удалено');
+  }
+  return true;
+}
+
 async function WaterLogScreen(param) {
   const screen = el('<div></div>');
   const today = dateKey();
   let { month, focusDay } = journalState(param, today);
   const hasWater = (o) => !!o && (((o.entries || []).length > 0) || (o.total || 0) > 0);
-  const srcLabel = (e) => {
-    const drink = e.drink && e.drink !== 'Вода' ? ` · ${esc(e.drink)}${e.hydrationMl ? ` (${fmtMl(e.hydrationMl)} мл напитка)` : ''}` : '';
-    return `${isWaterMinderKey(e.key) ? 'WaterMinder' : 'вручную'}${drink}`;
-  };
+  const srcLabel = waterSrcLabel;
   const go = (m, d = null) => {
     month = m;
     focusDay = d;
@@ -3522,69 +3600,18 @@ async function WaterLogScreen(param) {
     });
   }
 
-  /* Форма записи: дату, фактическое время и объём задаёт пользователь */
-  async function entryForm(title, submit, v) {
-    let vals = null;
-    const ok = await showDialog({
-      title,
-      body: `
-        <label class="field__label" for="wl-d">Дата</label>
-        <input class="input" type="date" id="wl-d" value="${esc(v.date)}" max="${esc(today)}">
-        <label class="field__label" for="wl-t" style="margin-top:10px">Время</label>
-        <input class="input" type="time" id="wl-t" value="${esc(v.t)}">
-        <label class="field__label" for="wl-ml" style="margin-top:10px">Объём, мл</label>
-        <input class="input" type="number" id="wl-ml" min="1" max="5000" step="1" inputmode="numeric" value="${esc(v.ml)}">
-      `,
-      actions: [
-        { label: 'Отмена', value: false },
-        { label: submit, value: true, kind: 'primary', onClick: () => { vals = { date: $('#wl-d').value, t: $('#wl-t').value, ml: Number($('#wl-ml').value) }; } },
-      ],
-    });
-    if (!ok || !vals) return null;
-    if (!WL_DATE_RE.test(vals.date) || vals.date > today || !WL_TIME_RE.test(vals.t) || !(vals.ml > 0 && vals.ml <= 5000)) {
-      await showDialog({ title: 'Запись не сохранена', body: '<p>Укажите дату не позже сегодняшней, время ЧЧ:ММ и объём от 1 до 5000 мл.</p>', actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
-      return null;
-    }
-    vals.ml = Math.round(vals.ml);
-    return vals;
-  }
-
   async function addEntry() {
-    const now = new Date();
-    const t = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    const vals = await entryForm('Новая запись', 'Добавить', { date: focusDay || today, t, ml: 250 });
-    if (!vals) return;
-    await Storage.addWaterEntry(vals.ml, vals.date, vals.t);
-    flash(`+${fmtMl(vals.ml)} мл · ${fmtDate(vals.date)}`);
-    go(vals.date.slice(0, 7), vals.date);
+    const saved = await addWaterEntryDialog(focusDay || today);
+    if (saved) go(saved.slice(0, 7), saved);
   }
 
   async function editEntry(d, e, i) {
-    const vals = await entryForm('Редактировать запись', 'Сохранить', { date: d, t: e.t, ml: e.ml });
-    if (!vals) return;
-    const ok = await Storage.updateWaterEntry(d, i, { t: e.t, ml: e.ml, key: e.key ?? null }, vals);
-    if (!ok) {
-      await showDialog({ title: 'Запись не найдена', body: '<p>Данные изменились, пока была открыта форма. Ничего не изменено.</p>', actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
-    } else {
-      flash(vals.date !== d ? `Перенесено на ${fmtDate(vals.date)}` : 'Сохранено ✓');
-    }
-    go(vals.date.slice(0, 7), vals.date);
+    const r = await editWaterEntry(d, e, i);
+    if (r) go(r.date.slice(0, 7), r.date);
   }
 
   async function deleteEntry(d, e, i, dayTotal) {
-    const ok = await showDialog({
-      title: 'Удалить запись?',
-      body: `<p>${esc(fmtDate(d))}, <b>${esc(e.t)} · ${fmtMl(e.ml)} мл</b> (${srcLabel(e)}).</p><p class="dialog__muted">Будет удалена только эта запись. Итог дня станет ${fmtMl(Math.max(0, dayTotal - e.ml))} мл.</p>`,
-      actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
-    });
-    if (!ok) return;
-    const done = await Storage.removeWaterEntry(i, d, { t: e.t, ml: e.ml, key: e.key ?? null });
-    if (!done) {
-      await showDialog({ title: 'Запись не найдена', body: '<p>Данные изменились. Ничего не удалено.</p>', actions: [{ label: 'Понятно', value: true, kind: 'primary' }] });
-    } else {
-      flash('Удалено');
-    }
-    go(month, d);
+    if (await deleteWaterEntry(d, e, i, dayTotal)) go(month, d);
   }
 
   /* Массовое исправление: удалить импортированные записи дня позже ЧЧ:ММ (ручные не трогаем) */
@@ -3675,8 +3702,9 @@ const actErrorsHtml = (errors) => `<p>${Object.values(errors).map((t) => esc(t))
    Вся ходьба дня — одним итогом; источник (вручную / прогулка / беговая дорожка) — только метка.
    Под полем — расчётные км, пересчитываются при вводе. from — дата редактируемой записи (null — новая).
    Дата уже занята → «Заменить?» (у дня один итог, дубля не бывает). Ошибка ввода → форма снова
-   с введёнными значениями. → сохранённая дата | null */
-async function editDailyActivity(metric, { date, from = null, existing = null } = {}) {
+   с введёнными значениями. withDelete (правка) — в форме есть «Удалить» (подтверждение —
+   deleteDailyActivity) → { deleted: true }. → сохранённая дата | null */
+async function editDailyActivity(metric, { date, from = null, existing = null, withDelete = false } = {}) {
   const M = ACTIVITY_METRICS[metric];
   let v = { date, value: existing ? actInputValue(metric, existing[M.field]) : '', note: existing ? existing.note || '' : '', source: (existing && existing.source) || 'manual' };
   for (;;) {
@@ -3700,11 +3728,14 @@ async function editDailyActivity(metric, { date, from = null, existing = null } 
       `,
       actions: [
         { label: 'Отмена', value: false },
+        ...(withDelete && from ? [{ label: 'Удалить', value: 'delete', kind: 'danger' }] : []),
         { label: from ? 'Сохранить' : 'Добавить', value: true, kind: 'primary', onClick: () => { raw = { date: $('#jr-d').value, value: $('#jr-v').value, source: $('#jr-src').value, note: $('#jr-note').value }; } },
       ],
+      cancelValue: false,
     });
     $('#jr-v').addEventListener('input', (e) => { $('#jr-km').textContent = kmHint(e.target.value); });
     const ok = await pending;
+    if (ok === 'delete') return (await deleteDailyActivity(metric, from, existing)) ? { deleted: true } : null;
     if (!ok || !raw) return null;
     const n = normalizeDailyInput(metric, raw, { today: dateKey() });
     if (!n.ok) { await alertDialog('Запись не сохранена', actErrorsHtml(n.errors)); v = raw; continue; }
@@ -3742,8 +3773,9 @@ async function deleteDailyActivity(metric, date, entry) {
   flash('Удалено');
   return true;
 }
-/* Поездка: добавить (presetDate) или изменить ride — время, км, минуты, заметка, дата (перенос). → дата | null */
-async function editRide(ride, presetDate = dateKey()) {
+/* Поездка: добавить (presetDate) или изменить ride — время, км, минуты, заметка, дата (перенос).
+   withDelete (правка) — в форме есть «Удалить» (подтверждение — deleteRide) → { deleted: true }. → дата | null */
+async function editRide(ride, presetDate = dateKey(), { withDelete = false } = {}) {
   const today = dateKey();
   let v = ride
     ? { date: ride.date, time: ride.time || '', km: actInputValue('bike', ride.km), minutes: ride.minutes ?? '', note: ride.note || '' }
@@ -3766,9 +3798,12 @@ async function editRide(ride, presetDate = dateKey()) {
       `,
       actions: [
         { label: 'Отмена', value: false },
+        ...(withDelete && ride ? [{ label: 'Удалить', value: 'delete', kind: 'danger' }] : []),
         { label: ride ? 'Сохранить' : 'Добавить', value: true, kind: 'primary', onClick: () => { raw = { date: $('#jr-d').value, time: $('#jr-t').value, km: $('#jr-km').value, minutes: $('#jr-min').value, note: $('#jr-note').value }; } },
       ],
+      cancelValue: false,
     });
+    if (ok === 'delete') return (await deleteRide(ride)) ? { deleted: true } : null;
     if (!ok || !raw) return null;
     const n = normalizeRideInput(raw, { today });
     if (!n.ok) { await alertDialog('Поездка не сохранена', actErrorsHtml(n.errors)); v = raw; continue; }
@@ -3847,7 +3882,7 @@ async function ActivityMetricScreen(metric) {
         ${sub ? `<p class="sleep-last__meta act-day__sub">${sub}</p>` : ''}
         <div class="act-day__actions">
           <button class="btn-primary btn-primary--brand act-day__edit" type="button">${entry ? '' : homeIcon('plus')}<span>${action}</span></button>
-          <a class="btn-ghost act-day__log" href="#/${M.logRoute}/${d}">Журнал</a>
+          <a class="btn-ghost act-day__log" href="#/journals/${metric}/${d}">Журнал</a>
         </div>
       </section>
     `);
@@ -3947,7 +3982,7 @@ async function ActivityMetricScreen(metric) {
   /* 3. Последние записи → журнал на дату записи */
   function paintRecent() {
     recentSlot.innerHTML = '';
-    const head = el(`<div class="section__head"><h2 class="section__title">Последние записи</h2><a class="section__action" href="#/${M.logRoute}">Журнал ›</a></div>`);
+    const head = el(`<div class="section__head"><h2 class="section__title">Последние записи</h2><a class="section__action" href="#/journals/${metric}">Журнал ›</a></div>`);
     const box = el('<div class="list-card"></div>');
     let items;
     if (metric === 'bike') {
@@ -3958,7 +3993,7 @@ async function ActivityMetricScreen(metric) {
     if (!items.length) box.appendChild(el(`<div class="empty">Записей пока нет. Добавьте первую — за сегодня или любую прошлую дату.</div>`));
     items.forEach((x) => {
       box.appendChild(el(`
-        <a class="row act-row" href="#/${M.logRoute}/${x.date}">
+        <a class="row act-row" href="#/journals/${metric}/${x.date}">
           <div class="row__body"><p class="row__title">${esc(x.title)}</p><p class="row__sub">${esc(capFirst(sleepDayMonth(x.date, today)))}</p></div>
           <span class="row__chevron" aria-hidden="true">›</span>
         </a>
@@ -4083,6 +4118,306 @@ async function SleepLogScreen(param) {
   }
 
   await paint();
+  return screen;
+}
+
+/* =========================================================
+   Все журналы (#/journals[/<тип>[/ГГГГ-ММ-ДД]]) — единый журнал всех записей.
+   Данные — те же ключи Storage, что у разделов: services/journals.js превращает их при чтении
+   в одинаковые элементы (отдельного хранилища нет). Здесь — только общий UI и действия по типу:
+   нажатие на запись открывает существующий редактор этого типа (вода / шаги / поездка /
+   значение показателя — диалог с «Удалить»; сон — форма записи сна). После правки или удаления
+   журнал перечитывается на месте: итог дня пересчитывается, пустой день исчезает.
+   Фильтр — в адресе (#/journals/water), число показанных дней — в записи истории
+   (saveEntryUi), прокрутка — общая (history.state.y): «Назад» из формы возвращает тот же вид.
+   Раздел (Вода / Сон / Шаги / Велосипед / показатель) → «Журнал» → этот же экран с фильтром.
+   ========================================================= */
+
+/* Значение точечного показателя дня: добавить (current == null), изменить, перенести на другую
+   дату, удалить. За день одно значение (metrics_log) — занятая дата → «Заменить?».
+   → { date } | { deleted: true } | null */
+async function editPointMetric(key, { date = dateKey(), current = null } = {}) {
+  const M = METRICS[key];
+  const isP = M.kind === 'pressure';
+  const today = dateKey();
+  let v = { date, a: current == null ? '' : isP ? current.systolic : current, b: current != null && isP ? current.diastolic : '' };
+  for (;;) {
+    let raw = null;
+    const valueField = isP
+      ? `<div class="jpm__pair">
+           <label><span class="field__label">Верхнее</span><input class="input" type="text" id="jpm-a" inputmode="numeric" autocomplete="off" value="${esc(v.a)}"></label>
+           <label><span class="field__label">Нижнее</span><input class="input" type="text" id="jpm-b" inputmode="numeric" autocomplete="off" value="${esc(v.b)}"></label>
+         </div>`
+      : `<label class="field__label" for="jpm-a" style="margin-top:10px">${esc(M.name)}, ${esc(M.unit)}</label>
+         <input class="input" type="text" id="jpm-a" inputmode="decimal" autocomplete="off" value="${esc(String(v.a).replace('.', ','))}">`;
+    const choice = await showDialog({
+      title: current == null ? `${M.name}: новая запись` : M.name,
+      body: `
+        <label class="field__label" for="jpm-d">Дата</label>
+        <input class="input" type="date" id="jpm-d" value="${esc(v.date)}" max="${esc(today)}">
+        ${valueField}
+        <p class="dialog__muted" style="margin:8px 0 0">За день хранится одно значение.</p>
+      `,
+      actions: [
+        { label: 'Отмена', value: false },
+        ...(current != null ? [{ label: 'Удалить', value: 'delete', kind: 'danger' }] : []),
+        { label: current == null ? 'Добавить' : 'Сохранить', value: true, kind: 'primary', onClick: () => { raw = { date: $('#jpm-d').value, a: $('#jpm-a').value, b: isP ? $('#jpm-b').value : '' }; } },
+      ],
+      cancelValue: false,
+    });
+    if (choice === 'delete') {
+      const ok = await showDialog({
+        title: 'Удалить запись?',
+        body: `<p>${esc(fmtDate(date))}: <b>${esc(fmtMetric(key, current))} ${esc(M.unit)}</b>.</p><p class="dialog__muted">Будет удалено значение только этого дня.</p>`,
+        actions: [{ label: 'Отмена', value: false }, { label: 'Удалить', value: true, kind: 'danger' }],
+      });
+      if (!ok) return null;
+      if (!(await Storage.removeMetricValue(key, date))) { await alertDialog('Запись не найдена', '<p>Данные изменились. Ничего не удалено.</p>'); return null; }
+      flash('Удалено');
+      return { deleted: true, date };
+    }
+    if (!choice || !raw) return null;
+    const num = (x) => (String(x).trim() === '' ? NaN : Number(String(x).trim().replace(',', '.')));
+    const a = num(raw.a);
+    const b = num(raw.b);
+    const okDate = WL_DATE_RE.test(raw.date) && raw.date <= today;
+    const okVal = isP ? Number.isInteger(a) && Number.isInteger(b) && a >= 40 && a <= 300 && b >= 20 && b <= 250 : a > 0 && a < 10000;
+    if (!okDate || !okVal) {
+      await alertDialog('Запись не сохранена', `<p>Укажите дату не позже сегодняшней и ${isP ? 'давление целыми числами (верхнее 40–300, нижнее 20–250)' : 'значение больше нуля'}.</p>`);
+      v = raw;
+      continue;
+    }
+    const value = isP ? { systolic: a, diastolic: b } : Math.round(a * 100) / 100;
+    if (raw.date !== date || current == null) {
+      const busy = await Storage.getMetricValue(key, raw.date);
+      if (busy != null) {
+        const replace = await showDialog({
+          title: 'За эту дату уже есть запись',
+          body: `<p>${esc(fmtDate(raw.date))}: <b>${esc(fmtMetric(key, busy))} ${esc(M.unit)}</b>.</p><p>Заменить на <b>${esc(fmtMetric(key, value))} ${esc(M.unit)}</b>?</p>`,
+          actions: [{ label: 'Отмена', value: false }, { label: 'Заменить', value: true, kind: 'primary' }],
+        });
+        if (!replace) return null;
+      }
+    }
+    if (current == null) await Storage.setMetricValue(key, value, raw.date);
+    else if (!(await Storage.moveMetricValue(key, date, raw.date, value))) { await alertDialog('Запись не найдена', '<p>Данные изменились, пока была открыта форма. Ничего не изменено.</p>'); return null; }
+    flash(current != null && raw.date !== date ? `Перенесено на ${fmtDate(raw.date)}` : current != null ? 'Сохранено ✓' : `${fmtMetric(key, value)} ${M.unit} · ${fmtDate(raw.date)}`);
+    return { date: raw.date };
+  }
+}
+
+/* Действия по типу записи. open(item) / add(date) → что-то (запись изменена — журнал перечитать)
+   | null (отменено или открыт другой экран). month — журнал типа по месяцам (итоги месяца,
+   исправление серии WaterMinder). Новый тип — новая строка здесь и провайдер в journals.js. */
+const JOURNAL_ACTIONS = {
+  water: {
+    month: 'water-log',
+    add: (date) => addWaterEntryDialog(date),
+    open: (it) => {
+      if (it.ref.legacy) { location.hash = `#/water-log/${it.ref.date}`; return null; }
+      return editWaterEntry(it.ref.date, it.ref.entry, it.ref.index, { withDelete: true });
+    },
+  },
+  sleep: {
+    month: 'sleep-log',
+    add: (date) => { location.hash = `#/sleep/new/${date}`; return null; },
+    open: (it) => { location.hash = `#/sleep/${encodeURIComponent(it.ref.id)}`; return null; },
+  },
+  steps: {
+    month: 'steps-log',
+    add: (date) => editDailyActivity('steps', { date }),
+    open: (it) => editDailyActivity('steps', { date: it.ref.date, from: it.ref.date, existing: it.ref.entry, withDelete: true }),
+  },
+  bike: {
+    month: 'bike-log',
+    add: (date) => editRide(null, date),
+    open: (it) => editRide(it.ref.ride, it.ref.date, { withDelete: true }),
+  },
+};
+POINT_JOURNAL_KEYS.forEach((k) => {
+  JOURNAL_ACTIONS[k] = {
+    add: (date) => editPointMetric(k, { date }),
+    open: (it) => editPointMetric(k, { date: it.ref.date, current: it.ref.value }),
+  };
+});
+
+/* Все элементы журнала из уже прочитанных данных (Главная читает их сама) или из Storage */
+async function loadJournalItems() {
+  const [metricsLog, waterGoal, sleep, sleepSettings, steps, bike] = await Promise.all([
+    Storage.getMetricsLog(), Storage.getWaterGoal(), Storage.getSleepEntries(), Storage.getSleepSettings(),
+    Storage.getDailyActivityLog('steps'), Storage.getBikeRides(),
+  ]);
+  return buildJournal({ metricsLog, sleep, steps, bike }, { waterGoal, sleepGoal: sleepSettings.goalMinutes });
+}
+
+/* Кольцо прогресса (цель дня): доля до 100 %, сверх цели — полное кольцо */
+function journalRing(pct) {
+  const r = 15, c = 2 * Math.PI * r;
+  const f = Math.max(0, Math.min(pct, 100)) / 100;
+  return `<svg class="jring" viewBox="0 0 36 36" aria-hidden="true"><circle class="jring__track" cx="18" cy="18" r="${r}"/><circle class="jring__fill" cx="18" cy="18" r="${r}" stroke-dasharray="${(c * f).toFixed(2)} ${c.toFixed(2)}" transform="rotate(-90 18 18)"/></svg>`;
+}
+/* Карточка записи — одна на все типы: значок · «Название — значение» · подпись · [цель дня] */
+function journalCard(it, onOpen) {
+  const t = journalType(it.type);
+  const card = el(`
+    <button class="jcard" type="button" data-type="${esc(it.type)}" data-id="${esc(it.id)}">
+      <span class="jcard__icon jcard__icon--${esc(it.type)}">${homeIcon(t ? t.icon : 'lab')}</span>
+      <span class="jcard__body"><span class="jcard__title"></span><span class="jcard__sub"></span></span>
+      ${it.progress ? `<span class="jcard__goal"><span class="jcard__goal-text"><small></small><b></b></span>${journalRing(it.progress.pct)}</span>` : ''}
+    </button>
+  `);
+  $('.jcard__title', card).textContent = `${it.title} — ${it.value}`;
+  const sub = $('.jcard__sub', card);
+  if (it.sub) sub.textContent = it.sub; else sub.remove();
+  if (it.progress) {
+    $('.jcard__goal small', card).textContent = it.progress.label;
+    $('.jcard__goal b', card).textContent = `${it.progress.pct}%`;
+  }
+  card.setAttribute('aria-label', `${it.title} — ${it.value}${it.sub ? `, ${it.sub}` : ''}${it.progress ? `, ${it.progress.label} ${it.progress.pct}%` : ''}, ${fmtLongDate(it.date)}. Открыть запись`);
+  card.addEventListener('click', () => onOpen(it));
+  return card;
+}
+
+/* Главная: «Сегодняшние журналы» — несколько последних записей за сегодня и «Просмотреть все» */
+function renderTodayJournals(items, today) {
+  const { items: list, total } = todayJournal(items, today, 3);
+  const sec = homeSection('Сегодняшние журналы');
+  sec.classList.add('hjournals');
+  if (list.length) {
+    const box = el('<div class="jcards"></div>');
+    list.forEach((it) => box.appendChild(journalCard(it, async (x) => { if (await JOURNAL_ACTIONS[x.type].open(x)) render(); })));
+    sec.appendChild(box);
+  } else {
+    sec.appendChild(el('<p class="hsec__note hjournals__empty">Сегодня записей пока нет</p>'));
+  }
+  const more = el(`<a class="jall-btn" href="#/journals">Просмотреть все${total > list.length ? ` · ещё ${total - list.length}` : ''}</a>`);
+  sec.appendChild(more);
+  return sec;
+}
+
+async function JournalsScreen(param) {
+  const today = dateKey();
+  let { filter, focus } = parseJournalRoute(param);
+  const ui = readEntryUi('journals');
+  let limit = ui && Number.isInteger(ui.limit) && ui.limit > 0 ? ui.limit : JOURNAL_PAGE_DAYS;
+  /* возврат по истории — прокрутку восстанавливает роутер; к дате прокручиваем только при первом открытии */
+  const returning = !!(history.state && typeof history.state.y === 'number');
+  let items = await loadJournalItems();
+  let observer = null;
+
+  const screen = el('<div class="jall"></div>');
+  screen.appendChild(backHeader('Все журналы', { fallback: 'home' }));
+  const chips = el('<div class="jchips" role="toolbar" aria-label="Тип записей"></div>');
+  const tools = el('<div class="jtools"></div>');
+  const list = el('<div class="jlist"></div>');
+  screen.append(chips, tools, list);
+
+  const remember = () => saveEntryUi('journals', { limit });
+  const setRoute = () => { replaceUrl(journalRoute(filter, focus)); remember(); };
+
+  function paintChips() {
+    chips.innerHTML = '';
+    journalFilters(items, filter).forEach((f) => {
+      const b = el(`<button class="jchip" type="button" data-filter="${esc(f.id)}" aria-pressed="${f.id === filter}"></button>`);
+      b.textContent = f.label;
+      b.addEventListener('click', () => {
+        if (f.id === filter) return;
+        filter = f.id;
+        focus = null;
+        limit = JOURNAL_PAGE_DAYS;
+        setRoute();
+        paint();
+        window.scrollTo(0, 0);
+      });
+      chips.appendChild(b);
+    });
+    const active = $('.jchip[aria-pressed="true"]', chips);
+    if (active) requestAnimationFrame(() => { chips.scrollLeft = Math.max(0, active.offsetLeft - 16); });
+  }
+
+  function paintTools() {
+    tools.innerHTML = '';
+    const A = filter !== 'all' ? JOURNAL_ACTIONS[filter] : null;
+    if (!A) return;
+    const add = el('<button class="btn-primary btn-primary--brand jtools__add" type="button"></button>');
+    add.innerHTML = `${homeIcon('plus')}<span>Добавить запись</span>`;
+    add.addEventListener('click', async () => after(await A.add(focus || today)));
+    tools.appendChild(add);
+    if (A.month) tools.appendChild(el(`<a class="btn-ghost jtools__month" href="#/${A.month}">По месяцам</a>`));
+  }
+
+  /* после правки / удаления / добавления: перечитать и перерисовать на месте (та же прокрутка) */
+  async function after(res) {
+    if (!res) return;
+    const y = window.scrollY;
+    items = await loadJournalItems();
+    const d = typeof res === 'string' ? res : !res.deleted ? res.date : null;
+    /* запись добавлена / перенесена в день, который ещё не показан, — показать до него */
+    if (d) {
+      const groups = groupJournal(filterJournal(items, filter), { today });
+      const i = groups.findIndex((g) => g.date === d);
+      if (i >= limit) { limit = i + 1; remember(); }
+    }
+    paint();
+    window.scrollTo(0, y);
+  }
+
+  function paintList() {
+    if (observer) { observer.disconnect(); observer = null; }
+    list.innerHTML = '';
+    const groups = groupJournal(filterJournal(items, filter), { today });
+    if (!groups.length) {
+      list.appendChild(el(`<p class="empty jempty-all"></p>`));
+      $('.jempty-all', list).textContent = journalEmptyText(filter);
+      return;
+    }
+    const shown = visibleDays(groups, limit, focus);
+    if (shown.length > limit) { limit = shown.length; remember(); }
+    const open = async (it) => after(await JOURNAL_ACTIONS[it.type].open(it));
+    shown.forEach((g) => {
+      const sec = el(`
+        <section class="jgroup" id="jg-${g.date}" data-date="${g.date}">
+          <h2 class="jgroup__head"><span class="jgroup__day"></span> <span class="jgroup__dot" aria-hidden="true">•</span> <span class="jgroup__sum"></span></h2>
+          <div class="jcards"></div>
+        </section>
+      `);
+      $('.jgroup__day', sec).textContent = g.label;
+      $('.jgroup__sum', sec).textContent = g.summary;
+      if (focus && g.date === focus) sec.classList.add('jgroup--focus');
+      const box = $('.jcards', sec);
+      g.items.forEach((it) => box.appendChild(journalCard(it, open)));
+      list.appendChild(sec);
+    });
+    if (focus && !groups.some((g) => g.date === focus)) {
+      const note = el('<p class="empty jempty"></p>');
+      note.textContent = `${fmtDate(focus)}: записей нет.`;
+      list.prepend(note);
+    }
+    if (shown.length < groups.length) {
+      const rest = groups.length - shown.length;
+      const more = el(`<button class="btn-ghost jmore" type="button">Показать ещё · ${rest} ${plural(rest, 'день', 'дня', 'дней')}</button>`);
+      const loadMore = () => { limit += JOURNAL_PAGE_DAYS; remember(); paintList(); };
+      more.addEventListener('click', loadMore);
+      list.appendChild(more);
+      /* дальше — по мере прокрутки (кнопка остаётся запасным вариантом) */
+      if ('IntersectionObserver' in window) {
+        observer = new IntersectionObserver((es) => { if (es.some((e) => e.isIntersecting)) loadMore(); }, { rootMargin: '600px 0px' });
+        observer.observe(more);
+      }
+    }
+  }
+
+  function paint() {
+    paintChips();
+    paintTools();
+    paintList();
+  }
+
+  remember();
+  paint();
+  if (focus && !returning) {
+    setTimeout(() => { const n = document.getElementById(`jg-${focus}`); if (n && n.isConnected) n.scrollIntoView({ block: 'start' }); }, 60);
+  }
   return screen;
 }
 
@@ -5600,6 +5935,7 @@ const DRAWER_SECTIONS = [
     { route: 'stats', icon: '📈', title: 'Статистика' },
   ],
   [
+    { route: 'journals', icon: '📋', title: 'Все журналы' },
     { route: 'sleep', icon: '😴', title: 'Сон' },
     { route: 'metric/water', icon: '💧', title: 'Вода' },
     { route: 'steps', icon: '👟', title: 'Шаги' },
@@ -5745,6 +6081,7 @@ function resolve() {
   }
   if (h.startsWith('test-history/')) return { fn: () => TestHistoryScreen(safeDecode(h.slice(13))), tab: 'tests', main: false };
   if (h === 'water-log' || h.startsWith('water-log/')) return { fn: () => WaterLogScreen(h.slice(10)), tab: 'metrics', main: false };
+  if (h === 'journals' || h.startsWith('journals/')) return { fn: () => JournalsScreen(h.slice(9)), tab: null, main: false };
   if (h.startsWith('metric/')) {
     const k = h.slice(7);
     if (k === 'water') return { fn: WaterScreen, tab: 'metrics', main: true };

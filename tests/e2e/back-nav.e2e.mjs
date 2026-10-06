@@ -102,7 +102,7 @@ export async function run({ keep = false } = {}) {
       'profile', 'steps', 'bike', 'steps-log', 'bike-log', 'sleep-log', 'visits', `visit/${v.id}`, 'visit/new', `visit/${v.id}/edit`, 'settings', 'export', 'water-import', 'theme',
       'notifications', 'goals', 'calendar', 'stats', 'security', 'move', 'sleep', 'sleep/new', 'sleep/settings',
       'med/new', `test/${t.id}`, 'test/new', `test/${t.id}/edit`, 'test-history/ldl',
-      'metric/water', 'water-log', 'metric/weight', 'metric/pressure', 'metric/pulse',
+      'metric/water', 'water-log', 'metric/weight', 'metric/pressure', 'metric/pulse', 'journals', 'journals/water',
     ];
     const bad = [];
     for (const r of routes) {
@@ -213,10 +213,10 @@ export async function run({ keep = false } = {}) {
     window.scrollTo(0, 260);
     await sleep(400); // прокрутка сохраняется в запись с задержкой 250 мс
     const y0 = window.scrollY;
-    $('#screen [data-route="water-log"]').click();
-    await waitFor(() => location.hash.startsWith('#/water-log') && title() === 'Журнал воды', 'журнал воды');
+    $('#screen [data-route="journals/water"]').click();
+    await waitFor(() => location.hash === '#/journals/water' && title() === 'Все журналы', 'журнал воды');
     check('6. новый экран открывается сверху', window.scrollY < 5, `scrollY ${window.scrollY}`);
-    $('#screen [data-nav="-1"]')?.click(); // смена месяца (replaceState) не ломает возврат
+    $('#screen .jchip[data-filter="sleep"]')?.click(); // смена фильтра (replaceState) не ломает возврат
     await sleep(300);
     await back('#/metric/water');
     await sleep(200);

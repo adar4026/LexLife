@@ -12,6 +12,7 @@ const run = [
   ['visit-kinds.test.mjs', 'Asia/Tokyo'], ['visit-kinds.test.mjs', 'America/Los_Angeles'], ['visit-kinds.test.mjs', 'Europe/Madrid'], // поиск и относительное время — явные даты, но проверяем независимость от TZ процесса
   ['meds.test.mjs', 'America/Los_Angeles'], ['meds.test.mjs', 'Asia/Tokyo'], ['meds.test.mjs', 'Europe/Madrid'], // локальный день приёма
   ['sleep.test.mjs', 'Europe/Madrid'], ['sleep.test.mjs', 'America/Los_Angeles'], ['sleep.test.mjs', 'Asia/Tokyo'], ['sleep.test.mjs', 'UTC'], // день пробуждения, CET/CEST
+  ['journals.test.mjs', 'Europe/Madrid'], ['journals.test.mjs', 'America/Los_Angeles'], ['journals.test.mjs', 'Pacific/Kiritimati'], // «Все журналы»: дни записей — локальный календарь
   ['activity.test.mjs', 'Europe/Madrid'], ['activity.test.mjs', 'America/Los_Angeles'], ['activity.test.mjs', 'Asia/Tokyo'], ['activity.test.mjs', 'UTC'], // шаги/дистанция/велосипед: локальные дни, периоды, миграция
   ['history-import.test.mjs', 'Europe/Madrid'], ['history-import.test.mjs', 'America/Los_Angeles'], ['history-import.test.mjs', 'Asia/Tokyo'], // локальные даты истории
   ['water-stats-range.test.mjs'], ['water-stats-range.test.mjs', 'America/Los_Angeles'], ['water-stats-range.test.mjs', 'Asia/Tokyo'], ['water-stats-range.test.mjs', 'Pacific/Kiritimati'], // диапазон периода воды — локальный календарь
