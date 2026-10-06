@@ -922,6 +922,29 @@ export class StorageService {
     await this._write(KEYS.metricsLog, all);
     return value;
   }
+  /* Точечный показатель (вес, давление, …): исправить значение дня и/или перенести его на другой
+     день — одной записью. Значение дня назначения заменяется (вызывающий заранее спрашивает
+     «Заменить?»). → false, если исходного значения уже нет (данные изменились) */
+  async moveMetricValue(metric, fromDay, toDay, value) {
+    const all = await this.getMetricsLog();
+    const log = { ...(all[metric] || {}) };
+    if (log[fromDay] == null) return false;
+    delete log[fromDay];
+    log[toDay] = value;
+    all[metric] = log;
+    await this._write(KEYS.metricsLog, all);
+    return true;
+  }
+  /* Удалить значение точечного показателя за день. → false, если его уже нет */
+  async removeMetricValue(metric, day) {
+    const all = await this.getMetricsLog();
+    if (!all[metric] || all[metric][day] == null) return false;
+    const log = { ...all[metric] };
+    delete log[day];
+    all[metric] = log;
+    await this._write(KEYS.metricsLog, all);
+    return true;
+  }
   /* инкремент (для накопительных показателей — вода) */
   async addMetricValue(metric, amount, day = dateKey()) {
     const log = await this.getMetricLog(metric);

@@ -2517,3 +2517,164 @@ a.sleep-last:active { background: var(--surface-2); }
   .jctrl__today { padding: 0 8px; }
 }
 .jday__nokm { font-weight: 600; color: var(--text2); font-size: 14px; }
+
+/* =========================================================
+   Все журналы (#/journals) и «Сегодняшние журналы» на Главной — общая карточка записи .jcard.
+   Цвета — токены темы (--surface/--text/--text2 экранов, --hm-* типов данных); на Главной
+   карточка берёт поверхность Главной (--hm-surface). Фильтры прокручиваются сами по себе —
+   у страницы горизонтальной прокрутки нет.
+   ========================================================= */
+:root {
+  --j-card-bg: var(--surface);
+  --j-card-border: var(--border);
+  --j-water: #61c9c2;
+  --j-ring-track: rgba(242, 248, 250, 0.1);
+  --j-chip-bg: var(--surface);
+  --j-chip-on-bg: var(--text);
+  --j-chip-on-ink: var(--bg);
+}
+[data-theme="light"] {
+  --j-water: #167a8b;
+  --j-ring-track: rgba(21, 55, 91, 0.1);
+}
+.jall .header__title { font-size: 30px; letter-spacing: -0.02em; }
+
+.jchips {
+  display: flex;
+  gap: 8px;
+  margin: 6px -16px 0;
+  padding: 2px 16px 6px;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+.jchips::-webkit-scrollbar { display: none; }
+.jchip {
+  flex-shrink: 0;
+  min-height: 40px;
+  padding: 0 16px;
+  border-radius: 999px;
+  border: 1px solid var(--j-card-border);
+  background: var(--j-chip-bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.jchip[aria-pressed="true"] { background: var(--j-chip-on-bg); border-color: var(--j-chip-on-bg); color: var(--j-chip-on-ink); }
+
+.jtools { display: flex; gap: 8px; margin-top: 10px; }
+.jtools:empty { display: none; }
+.jtools__add { flex: 1.4; margin: 0; }
+.jtools__month { flex: 1; width: auto; display: flex; align-items: center; justify-content: center; min-height: 48px; padding: 0 12px; text-decoration: none; box-sizing: border-box; }
+
+.jgroup { margin-top: 26px; scroll-margin-top: calc(var(--safe-top) + 12px); }
+.jgroup__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 8px;
+  margin: 0 4px 10px;
+  font-size: 21px;
+  font-weight: 800;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.jgroup__dot { color: var(--text2); font-weight: 700; }
+.jgroup__sum { white-space: nowrap; }
+.jgroup--focus .jcards { outline: 2px solid var(--blue); outline-offset: 4px; border-radius: 22px; }
+
+.jcards { display: flex; flex-direction: column; gap: 8px; }
+.jcard {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 68px;
+  padding: 10px 12px 10px 10px;
+  border: 1px solid var(--j-card-border);
+  border-radius: 22px;
+  background: var(--j-card-bg);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 0.12s ease;
+}
+.jcard:active { transform: scale(0.985); }
+.jcard__icon {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--hm-accent);
+  background: color-mix(in srgb, var(--hm-accent) 14%, transparent);
+}
+.jcard__icon .hi { width: 21px; height: 21px; }
+.jcard__icon--water { color: var(--j-water); background: color-mix(in srgb, var(--j-water) 14%, transparent); }
+.jcard__icon--sleep { color: var(--hm-sleep); background: color-mix(in srgb, var(--hm-sleep) 14%, transparent); }
+.jcard__icon--steps { color: var(--hm-steps); background: color-mix(in srgb, var(--hm-steps) 14%, transparent); }
+.jcard__icon--bike { color: var(--hm-bike); background: color-mix(in srgb, var(--hm-bike) 14%, transparent); }
+.jcard__icon--weight { color: var(--hm-weight); background: color-mix(in srgb, var(--hm-weight) 14%, transparent); }
+.jcard__icon--pressure { color: var(--hm-bp); background: color-mix(in srgb, var(--hm-bp) 14%, transparent); }
+.jcard__icon--pulse, .jcard__icon--temperature, .jcard__icon--spo2 { color: var(--hm-pulse); background: color-mix(in srgb, var(--hm-pulse) 14%, transparent); }
+.jcard__body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.jcard__title { font-size: 15.5px; font-weight: 800; line-height: 1.25; overflow-wrap: anywhere; }
+.jcard__sub { font-size: 13.5px; font-weight: 600; color: var(--text2); line-height: 1.3; overflow-wrap: anywhere; }
+.jcard__goal { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.jcard__goal-text { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.2; }
+.jcard__goal-text small { font-size: 11px; font-weight: 700; color: var(--text2); white-space: nowrap; }
+.jcard__goal-text b { font-size: 14px; font-weight: 700; color: var(--text2); font-variant-numeric: tabular-nums; }
+.jring { width: 34px; height: 34px; flex-shrink: 0; }
+.jring circle { fill: none; stroke-width: 4; }
+.jring__track { stroke: var(--j-ring-track); }
+.jring__fill { stroke: var(--j-water); stroke-linecap: round; }
+.jcard[data-type="sleep"] .jring__fill { stroke: var(--hm-sleep); }
+
+.jmore { margin-top: 18px; }
+.jempty-all { margin-top: 24px; }
+@media (max-width: 380px) {
+  .jcard { gap: 8px; padding-right: 10px; }
+  .jcard__icon { width: 36px; height: 36px; }
+  .jcard__title { font-size: 15px; }
+  .jcard__goal-text small { font-size: 10.5px; }
+  .jring { width: 30px; height: 30px; }
+  .jgroup__head { font-size: 19px; }
+}
+
+/* Главная: «Сегодняшние журналы» */
+.home .jcard { background: var(--hm-surface); border-color: var(--hm-soft-border); color: var(--hm-ink); }
+.home .jcard__sub, .home .jcard__goal-text small, .home .jcard__goal-text b { color: var(--hm-muted); }
+.hjournals__empty { margin: 0 4px 2px; font-size: 14px; }
+.jall-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 52px;
+  margin-top: 10px;
+  border-radius: 22px;
+  background: color-mix(in srgb, var(--hm-accent) 16%, transparent);
+  color: var(--hm-accent);
+  font-size: 17px;
+  font-weight: 800;
+  text-decoration: none;
+  touch-action: manipulation;
+}
+.jall-btn:active { filter: brightness(0.95); }
+
+/* значение показателя в диалоге: верхнее / нижнее давление рядом */
+.jpm__pair { display: flex; gap: 8px; margin-top: 10px; }
+.jpm__pair label { flex: 1; min-width: 0; }
+.jpm__pair .input { width: 100%; box-sizing: border-box; }
+
+/* диалог правки с «Удалить»: «Отмена · Сохранить» в ряд, «Удалить» — отдельной строкой ниже */
+.dialog__actions:not(.dialog__actions--stack):has(> .dialog__btn:nth-child(3)):has(> .dialog__btn--danger) { flex-wrap: wrap; }
+.dialog__actions:not(.dialog__actions--stack):has(> .dialog__btn:nth-child(3)) > .dialog__btn--danger { order: 3; flex-basis: 100%; }

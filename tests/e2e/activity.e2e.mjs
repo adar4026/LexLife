@@ -11,7 +11,8 @@
        повтор той же даты шагов → «Заменить?» без дубля, перенос записи на другую дату;
      • велосипед: две поездки за день — итог дня 19,5 км; удаление поездки; перенос поездки;
      • «Назад» из журнала возвращает экран с тем же периодом (общая навигация);
-     • вода и сон — тот же журнал («Журнал ›», «Сегодня»); форма сна из журнала возвращается в журнал;
+     • «Журнал ›» разделов → «Все журналы» с фильтром; «По месяцам» — журнал по месяцам («Сегодня»);
+       форма сна из журнала возвращается в журнал;
      • перенос старой «Активности» (activity_days) при запуске; вода и сон не изменились;
      • нет горизонтальной прокрутки.
 
@@ -173,6 +174,9 @@ export async function run({ keep = false } = {}) {
 
     /* ---------- 4. журнал шагов: прошлая дата, добавить, повтор даты → «Заменить?», правка, перенос, удаление ---------- */
     $('.act-recent .section__action').click();
+    await waitFor(() => location.hash === '#/journals/steps' && $('.jchip[aria-pressed="true"]'), '«Все журналы» с фильтром «Шаги»');
+    check('4·. «Журнал ›» → «Все журналы» с фильтром «Шаги»', txt($('.header__title')) === 'Все журналы' && txt($('.jchip[aria-pressed="true"]')) === 'Шаги');
+    $('.jtools__month').click(); // журнал по месяцам — итоги месяца, переход к дате
     await waitFor(() => location.hash.startsWith('#/steps-log') && $('#jr-add'), 'журнал шагов');
     check('4a. журнал: «Журнал шагов», панель с «Сегодня», месяцем и датой', txt($('.header__title')) === 'Журнал шагов' && $('#jr-month') && $('#jr-goto') && $('.jctrl__today'));
     type($('#jr-goto'), past);
@@ -204,7 +208,10 @@ export async function run({ keep = false } = {}) {
     await waitFor(() => location.hash === `#/steps-log/${today}` && $('.jctrl__today')?.disabled, '«Сегодня»');
     check('4g. «Сегодня» — текущий месяц и сегодняшняя дата', $('#jr-month').value === today.slice(0, 7) && $('.jctrl__today').disabled);
 
-    /* ---------- 5. «Назад» — экран шагов с тем же периодом (Год) ---------- */
+    /* ---------- 5. «Назад» — «Все журналы», ещё «Назад» — экран шагов с тем же периодом (Год) ---------- */
+    $('.back-btn').click();
+    await waitFor(() => location.hash === '#/journals/steps' && $('.jchip[aria-pressed="true"]'), 'возврат в «Все журналы»');
+    await sleep(1100); // повторное нажатие «Назад» раньше 1 с игнорируется (js/ui/backNav.js)
     $('.back-btn').click();
     await waitFor(() => location.hash === '#/steps' && $('.act-stats'), 'возврат на экран шагов');
     await sleep(200);
@@ -255,16 +262,20 @@ export async function run({ keep = false } = {}) {
       /Среднее в день/.test(stepTiles) && /Лучший день/.test(stepTiles) && /Минимум/.test(stepTiles) && /Дней с данными/.test(stepTiles) && /Всего за период\s*[\d ]+ шаг\S*\s*≈ [\d ]+,\d км · сумма/.test(stepTiles) && !!$('#st-steps .chart'), stepTiles);
     check('6j. велосипед в «Статистике»: поездка без дистанции — отдельно, не 0 км', /дистанция не указана/.test(txt($('#st-bike'))) && !/\b0(,0)? км/.test(txt($('#st-bike'))), txt($('#st-bike')));
 
-    /* ---------- 7. вода и сон — тот же журнал ---------- */
+    /* ---------- 7. вода и сон — «Журнал ›» → «Все журналы» с фильтром; «По месяцам» — тот же журнал по месяцам ---------- */
     await go('#/metric/water');
-    await waitFor(() => $('[data-route="water-log"]'), 'вода');
-    check('7a. вода: ссылка «Журнал ›»', txt($('[data-route="water-log"]')) === 'Журнал ›');
-    $('[data-route="water-log"]').click();
+    await waitFor(() => $('[data-route="journals/water"]'), 'вода');
+    check('7a. вода: ссылка «Журнал ›»', txt($('[data-route="journals/water"]')) === 'Журнал ›');
+    $('[data-route="journals/water"]').click();
+    await waitFor(() => location.hash === '#/journals/water' && $('.jtools__month'), '«Все журналы» с фильтром «Вода»');
+    $('.jtools__month').click();
     await waitFor(() => location.hash.startsWith('#/water-log') && $('#wl-add'), 'журнал воды');
     check('7b. журнал воды — та же панель (Сегодня, месяц, дата)', !!$('.jctrl__today') && !!$('#wl-month') && !!$('#wl-goto') && !!$(`#wl-${yesterday}`) && txt($(`#wl-${yesterday} .jday__total`)) === '1 500 мл');
     await go('#/sleep');
     await waitFor(() => $('.sleep-journal'), 'сон');
     $('.sleep-journal').click();
+    await waitFor(() => location.hash === '#/journals/sleep' && $('.jtools__month'), '«Все журналы» с фильтром «Сон»');
+    $('.jtools__month').click();
     await waitFor(() => location.hash.startsWith('#/sleep-log') && $('#jr-add'), 'журнал сна');
     check('7c. журнал сна: запись за вчера, 7 ч 30 мин', /7 ч 30 мин/.test(txt($(`#jr-${yesterday}`))), txt($('.jday')));
     type($('#jr-goto'), addDay(today, -5));
